@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoResearch</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">AR</div>
+          <div><strong>AutoResearch</strong><span>ChatGPT 科研执行后端</span></div>
+      </div>
+      <button class="new-button" id="newProject">＋ 新建研究</button>
+      <div class="section-label">研究项目</div>
+      <div id="projectList" class="project-list"></div>
+      <div class="sidebar-foot">
+        <button class="ghost" id="settingsButton">⚙ 设置与连接</button>
+        <div class="health"><i id="healthDot"></i><span id="healthText">正在连接本地服务</span></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">CHATGPT × AUTORESEARCH</div>
+          <h1 id="pageTitle">把一个想法，变成可复现实验</h1>
+        </div>
+        <div class="top-actions">
+          <button class="ghost" id="openCode" disabled>在 VS Code 中打开</button>
+          <button class="primary small" id="syncGit" disabled>同步 GitHub</button>
+        </div>
+      </header>
+
+      <section id="createView" class="create-view">
+        <div class="hero-card">
+          <div class="hero-copy">
+            <span class="pill">ChatGPT 思考 · AutoResearch 执行</span>
+            <h2>今天想验证什么？</h2>
+            <p>推荐让 ChatGPT 当前对话负责问题分析与科研思考；需要保存笔记、生成代码、检索资源或使用 AutoDL 时，再调用 AutoResearch。</p>
+          </div>
+          <form id="researchForm">
+            <label for="topic">研究题目 / 想法</label>
+            <textarea id="topic" required minlength="3" placeholder="例如：如何用不确定性采样降低小样本医学图像分割的标注成本？"></textarea>
+            <div class="form-grid">
+              <div>
+                <label for="workflowMode">工作方式</label>
+                <select id="workflowMode">
+                  <option value="chatgpt" selected>ChatGPT 协作 · 推荐</option>
+                  <option value="autonomous">AutoResearch 全自动</option>
+                </select>
+              </div>
+              <div>
+                <label for="notes">约束与补充（可选）</label>
+                <input id="notes" placeholder="数据规模、框架、显存或指标要求">
+              </div>
+              <div class="autonomous-option">
+                <label for="maxSources">来源上限</label>
+                <select id="maxSources">
+                  <option value="12">12 条 · 快速</option>
+                  <option value="20" selected>20 条 · 标准</option>
+                  <option value="40">40 条 · 深入</option>
+                </select>
+              </div>
+            </div>
+            <label class="check autonomous-option"><input type="checkbox" id="downloadPapers"> 下载最多 3 篇可公开访问的 arXiv PDF</label>
+            <div class="submit-row">
+              <span id="modelHint">ChatGPT 负责推理，AutoResearch 等待工具调用</span>
+              <button class="primary" id="startResearch" type="submit">创建协作项目 <b>→</b></button>
+            </div>
+          </form>
+        </div>
+        <div class="feature-grid">
+          <article><span>01</span><h3>ChatGPT 原生思考</h3><p>科研讨论和结果分析使用当前 ChatGPT 对话与所选模型，不消耗 OpenRouter。</p></article>
+          <article><span>02</span><h3>AutoResearch 执行</h3><p>需要时调用工具检索资料、保存代码、连接 AutoDL，并把状态持续写入工作台。</p></article>
+          <article><span>03</span><h3>密钥不出本机</h3><p>ChatGPT 看不到 OpenRouter Key、AutoDL Token 或 SSH 密码；付费和执行操作仍需确认。</p></article>
+        </div>
+        <section class="chatgpt-connect panel">
+          <div>
+            <span class="kicker">CHATGPT CONNECTION</span>
+            <h3>一键配置 ChatGPT 桌面版连接</h3>
+            <p>首次使用会打开安全配置向导；完成账号授权后，以后只需点击“启动 ChatGPT 连接”并保持弹出的窗口运行。</p>
+          </div>
+          <div class="endpoint-box"><code id="mcpEndpoint">http://127.0.0.1:8765/mcp</code><button class="ghost" id="copyMcp" type="button">复制地址</button></div>
+          <div class="connection-steps" aria-live="polite">
+            <span class="ready" id="localMcpStatus">✓ 本地 MCP 已就绪</span>
+            <span id="tunnelInstallStatus">○ tunnel-client 待检查</span>
+            <span id="tunnelConfigStatus">○ Tunnel 待配置</span>
+            <span id="tunnelRunStatus">○ Tunnel 未运行</span>
+            <span>○ ChatGPT 开发者模式需在账号内确认</span>
+          </div>
+          <div class="connection-actions">
+            <button class="ghost" id="setupChatgpt" type="button">首次配置连接</button>
+            <button class="primary small" id="startChatgpt" type="button">启动 ChatGPT 连接</button>
+            <a href="https://developers.openai.com/api/docs/guides/secure-mcp-tunnels" target="_blank" rel="noreferrer">官方说明 ↗</a>
+          </div>
+        </section>
+      </section>
+
+      <section id="projectView" class="project-view hidden">
+        <div class="project-heading">
+          <div>
+            <span class="status-badge" id="statusBadge">排队中</span>
+            <h2 id="projectTopic"></h2>
+            <p id="projectSummary">研究代理准备中…</p>
+            <div class="project-id">项目 ID <code id="projectId"></code><button id="copyProjectId" type="button">复制给 ChatGPT</button></div>
+          </div>
+          <div class="progress-ring" id="progressRing"><span id="progressText">0%</span></div>
+        </div>
+
+        <div class="pipeline" id="pipeline">
+          <div data-phase="planning"><i>1</i><span>科研思考</span></div>
+          <div data-phase="searching"><i>2</i><span>资源检索</span></div>
+          <div data-phase="synthesizing"><i>3</i><span>方案形成</span></div>
+          <div data-phase="generating"><i>4</i><span>代码落盘</span></div>
+          <div data-phase="ready"><i>5</i><span>实验与分析</span></div>
+        </div>
+
+        <div class="dashboard-grid">
+          <section class="panel activity-panel">
+            <div class="panel-title"><div><span class="kicker">AGENT LOG</span><h3>研究进展</h3></div><span class="live-dot">LIVE</span></div>
+            <div id="eventList" class="event-list"><div class="empty">等待代理开始工作…</div></div>
+          </section>
+          <section class="panel source-panel">
+            <div class="panel-title"><div><span class="kicker">EVIDENCE</span><h3>论文与代码</h3></div><span id="sourceCount" class="count">0</span></div>
+            <div id="sourceList" class="source-list"><div class="empty">检索后会在这里显示来源</div></div>
+          </section>
+        </div>
+
+        <section class="panel experiment-panel">
+          <div class="panel-title">
+            <div><span class="kicker">COMPUTE</span><h3>AutoDL 远程实验</h3></div>
+            <button class="ghost" id="toggleExperiment">配置实验</button>
+          </div>
+          <div class="compute-summary">
+            <div><span>GPU 顺序</span><strong id="gpuOrder">4090 → 5090</strong></div>
+            <div><span>运行策略</span><strong>SSH 守护进程</strong></div>
+            <div><span>监控与改进</span><strong id="monitorPolicy">每 30 秒 · 最多 3 轮</strong></div>
+            <div><span>实验状态</span><strong id="experimentStatus">尚未启动</strong></div>
+          </div>
+          <form id="experimentForm" class="experiment-form hidden">
+            <div class="form-grid three">
+              <div><label for="instanceUuid">AutoDL 实例 UUID</label><input id="instanceUuid" placeholder="pro-xxxxxxxxxxxx"></div>
+              <div><label for="sshHost">SSH 主机</label><input id="sshHost" required placeholder="connect.region.autodl.com"></div>
+              <div><label for="sshPort">SSH 端口</label><input id="sshPort" required type="number" value="22"></div>
+              <div><label for="sshUser">SSH 用户</label><input id="sshUser" value="root"></div>
+              <div><label for="sshPassword">SSH 密码（仅保存在本次任务内存）</label><input id="sshPassword" type="password"></div>
+              <div><label for="maxIterations">最大实验轮数</label><input id="maxIterations" type="number" min="1" max="10" value="1"></div>
+            </div>
+            <label for="remoteCommand">实验命令</label>
+            <input id="remoteCommand" value="python experiment.py">
+            <div class="experiment-actions">
+              <label class="check"><input type="checkbox" id="allowRelease"> 克隆后仍忙时，允许释放替代实例并重建</label>
+              <div>
+                <button type="button" class="ghost" id="loadSsh">从实例读取 SSH</button>
+                <button type="button" class="ghost" id="createInstance">创建计费实例</button>
+                <button class="primary" type="submit">确认并启动实验</button>
+              </div>
+            </div>
+          </form>
+          <div id="experimentResults" class="experiment-results"><div class="empty compact">实验状态、指标和日志会显示在这里</div></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="settingsDialog">
+    <form id="settingsForm">
+      <div class="dialog-head"><div><span class="kicker">LOCAL ONLY</span><h2>设置与连接</h2></div><button type="button" class="icon-button close-settings" aria-label="关闭设置">×</button></div>
+      <p class="dialog-note">密钥只写入本机 <code>.env</code>，不会通过 API 回显，也不会进入 Git。</p>
+      <div class="settings-section">
+        <h3>OpenRouter</h3>
+        <label>API Key <input id="settingOpenRouterKey" type="password" placeholder="留空表示不修改"></label>
+        <label>模型 <input id="settingModel" placeholder="openrouter/free"></label>
+      </div>
+      <div class="settings-section">
+        <h3>AutoDL Pro API</h3>
+        <label>开发者 Token <input id="settingAutoDLToken" type="password" placeholder="控制台 → 账号 → 设置"></label>
+        <div class="form-grid">
+          <label>镜像 UUID <input id="settingImageUuid" placeholder="image-xxxxxxxx"></label>
+          <label>GPU 规格优先级 <input id="settingGpuSpecs" placeholder="v-48g,5090"></label>
+        </div>
+      </div>
+      <div class="settings-section">
+        <h3>GitHub</h3>
+        <label>远端仓库 <input id="settingRemote" placeholder="https://github.com/owner/repo.git"></label>
+      </div>
+      <div class="settings-section">
+        <h3>ChatGPT 协作</h3>
+        <p class="settings-help">MCP 服务随软件启动：<code>http://127.0.0.1:8765/mcp</code>。运行时 API key 使用 Windows DPAPI 加密保存在当前用户配置中，不会写入项目或 Git。</p>
+        <div class="settings-connect-actions">
+          <button type="button" class="ghost" id="settingsSetupChatgpt">打开首次配置向导</button>
+          <button type="button" class="ghost" id="settingsStartChatgpt">启动连接</button>
+          <span id="settingsTunnelStatus">正在检查 Tunnel…</span>
+        </div>
+      </div>
+      <div id="settingsStatus" class="form-status" role="status" aria-live="polite"></div>
+      <div class="dialog-actions"><button type="button" class="ghost close-settings">取消</button><button type="submit" class="primary" id="saveSettings">保存设置</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
