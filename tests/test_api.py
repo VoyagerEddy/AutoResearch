@@ -26,13 +26,61 @@ def test_chatgpt_connection_launch_requires_confirmation(tmp_path: Path) -> None
             json={"action": "Setup", "confirm_launch": False},
         )
         assert response.status_code == 400
-        assert "确认" in response.json()["detail"]
+        assert "confirmation" in response.json()["detail"].lower()
 
 
 def test_autodl_creation_requires_billable_confirmation(tmp_path: Path) -> None:
     with TestClient(create_app(Settings.load(tmp_path))) as client:
         response = client.post("/api/autodl/instances", json={})
         assert response.status_code == 400
+
+
+def test_experiment_readiness_exposes_blockers_and_handles_missing_project(tmp_path: Path) -> None:
+    with TestClient(create_app(Settings.load(tmp_path))) as client:
+        created = client.post("/api/chatgpt/projects", json={"topic": "readiness study"}).json()
+        project_id = created["project"]["id"]
+        result = client.get(f"/api/projects/{project_id}/readiness").json()
+        assert result["ready"] is False
+        assert result["blocking_issues"][0]["code"] == "manifest"
+        assert result["execution_status"] == "not_executed_by_readiness_check"
+        assert client.get("/api/projects/missing/readiness").status_code == 404
+
+
+def test_uncertain_autodl_creation_has_actionable_error_code(tmp_path, monkeypatch) -> None:
+    from autoresearch.services.autodl import AutoDLClient, AutoDLCreateUncertain
+
+    async def create(*args):
+        raise AutoDLCreateUncertain("Creation result unknown; check the instance list first")
+
+    monkeypatch.setattr(AutoDLClient, "create_preferred", create)
+    with TestClient(create_app(Settings.load(tmp_path))) as client:
+        response = client.post("/api/autodl/instances", json={"confirm_billable": True})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "autodl_create_uncertain"
+
+
+def test_autodl_preflight_reports_missing_configuration_without_confirming(tmp_path: Path) -> None:
+    settings = Settings.load(tmp_path).with_overrides(autodl_token="", autodl_image_uuid="")
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/api/autodl/preflight?verify_api=true")
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ready"] is False
+        assert result["network_checked"] is False
+        assert {issue["code"] for issue in result["blocking_issues"]} == {
+            "missing_token", "missing_image",
+        }
+
+
+def test_autodl_preflight_supports_image_override_and_redacts_token(tmp_path: Path) -> None:
+    settings = Settings.load(tmp_path).with_overrides(
+        autodl_token="private-autodl-token", autodl_image_uuid=""
+    )
+    with TestClient(create_app(settings)) as client:
+        result = client.get("/api/autodl/preflight?image_uuid=image-override").json()
+    assert result["ready"] is True
+    assert result["verified"] is False
+    assert "private-autodl-token" not in str(result)
 
 
 def test_settings_patch_is_visible_immediately(tmp_path: Path) -> None:
@@ -88,4 +136,4 @@ def test_experiment_api_requires_execution_confirmation(tmp_path: Path) -> None:
             },
         )
         assert response.status_code == 400
-        assert "确认" in response.json()["detail"]
+        assert "confirmation" in response.json()["detail"]

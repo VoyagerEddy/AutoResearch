@@ -31,7 +31,7 @@ from .domain import (
 from .experiments import ExperimentManager
 from .mcp_server import create_mcp_server
 from .orchestrator import ResearchOrchestrator
-from .services.autodl import AutoDLClient, AutoDLError, extract_ssh
+from .services.autodl import AutoDLClient, AutoDLCreateUncertain, AutoDLError, extract_ssh
 from .services.desktop import DesktopBridge
 from .services.github_sync import GitSync, GitSyncError
 from .services.llm import LLMError, OpenRouterClient
@@ -94,14 +94,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/chatgpt/connection")
     async def get_chatgpt_connection() -> dict[str, Any]:
-        return connection_status(state.settings.root)
+        return await asyncio.to_thread(connection_status, state.settings.root)
 
     @app.post("/api/chatgpt/connection/launch", status_code=202)
     async def launch_chatgpt_connection(
         request: ChatGPTTunnelLaunchRequest,
     ) -> dict[str, str]:
         if not request.confirm_launch:
-            raise HTTPException(status_code=400, detail="启动本机连接窗口前必须确认")
+            raise HTTPException(status_code=400, detail="Confirmation is required before opening the local connection window")
         try:
             launch_tunnel_console(state.settings.root, request.action)
         except OSError as exc:
@@ -182,7 +182,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_project(project_id: str) -> dict[str, Any]:
         project = state.db.get_project(project_id)
         if not project:
-            raise HTTPException(status_code=404, detail="研究项目不存在")
+            raise HTTPException(status_code=404, detail="Research project not found")
         return project.model_dump()
 
     @app.get("/api/projects/{project_id}/status")
@@ -195,26 +195,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/projects/{project_id}/experiments")
     async def list_project_experiments(project_id: str) -> list[dict[str, Any]]:
         if not state.db.get_project(project_id):
-            raise HTTPException(status_code=404, detail="研究项目不存在")
+            raise HTTPException(status_code=404, detail="Research project not found")
         return state.db.list_experiments(project_id)
+
+    @app.get("/api/projects/{project_id}/readiness")
+    async def get_experiment_readiness(project_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(state.chatgpt.experiment_readiness, project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project_id}/events")
     async def get_events(project_id: str, after: int = 0) -> list[dict[str, Any]]:
         if not state.db.get_project(project_id):
-            raise HTTPException(status_code=404, detail="研究项目不存在")
+            raise HTTPException(status_code=404, detail="Research project not found")
         return state.db.list_events(project_id, max(0, after))
 
     @app.get("/api/projects/{project_id}/sources")
     async def get_sources(project_id: str) -> list[dict[str, Any]]:
         if not state.db.get_project(project_id):
-            raise HTTPException(status_code=404, detail="研究项目不存在")
+            raise HTTPException(status_code=404, detail="Research project not found")
         return [source.model_dump() for source in state.db.list_sources(project_id)]
 
     @app.get("/api/projects/{project_id}/manifest")
     async def get_manifest(project_id: str) -> dict[str, Any]:
         project = state.db.get_project(project_id)
         if not project:
-            raise HTTPException(status_code=404, detail="研究项目不存在")
+            raise HTTPException(status_code=404, detail="Research project not found")
         path = Path(project.workspace) / "generated" / "experiment_manifest.json"
         if not path.exists():
             return {}
@@ -230,17 +237,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def open_project(project_id: str) -> dict[str, bool]:
         project = state.db.get_project(project_id)
         if not project:
-            raise HTTPException(status_code=404, detail="研究项目不存在")
+            raise HTTPException(status_code=404, detail="Research project not found")
         try:
             DesktopBridge.open_vscode(Path(project.workspace))
         except OSError as exc:
-            raise HTTPException(status_code=503, detail="无法启动 VS Code，请确认 code 命令可用") from exc
+            raise HTTPException(status_code=503, detail="Could not start VS Code; ensure the 'code' command is available") from exc
         return {"opened": True}
+
+    @app.get("/api/autodl/preflight")
+    async def autodl_preflight(
+        verify_api: bool = False, image_uuid: str | None = None
+    ) -> dict[str, Any]:
+        return await state.chatgpt.autodl_readiness(verify_api=verify_api, image_uuid=image_uuid)
 
     @app.post("/api/autodl/instances", status_code=202)
     async def create_autodl(request: AutoDLCreateRequest) -> dict[str, Any]:
         if not request.confirm_billable:
-            raise HTTPException(status_code=400, detail="创建按量计费实例前必须确认费用")
+            raise HTTPException(status_code=400, detail="Cost confirmation is required before provisioning a pay-as-you-go instance")
         client = AutoDLClient(state.settings)
         try:
             choice = await client.create_preferred(request)
@@ -249,6 +262,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "gpu_spec": choice.gpu_spec,
                 "status": "creating",
             }
+        except AutoDLCreateUncertain as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "autodl_create_uncertain", "message": str(exc)},
+            ) from exc
+        except AutoDLError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         finally:
@@ -297,7 +317,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_experiment(experiment_id: str) -> dict[str, Any]:
         experiment = state.db.get_experiment(experiment_id)
         if not experiment:
-            raise HTTPException(status_code=404, detail="实验不存在")
+            raise HTTPException(status_code=404, detail="Experiment not found")
         return experiment
 
     @app.post("/api/git/sync")
@@ -307,7 +327,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.project_id:
             project = state.db.get_project(request.project_id)
             if not project:
-                raise HTTPException(status_code=404, detail="研究项目不存在")
+                raise HTTPException(status_code=404, detail="Research project not found")
             root = Path(project.workspace) / "generated"
             if request.branch == "main":
                 branch = f"research/{request.project_id}"

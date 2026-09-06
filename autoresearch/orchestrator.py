@@ -43,14 +43,14 @@ class ResearchOrchestrator:
         store = ArtifactStore(workspace)
         searcher = ResearchSearch(self.settings)
         try:
-            self._phase(project_id, "planning", 8, "正在把科研想法拆成可检索的问题")
+            self._phase(project_id, "planning", 8, "Breaking the research idea into searchable questions")
             plan = await self._plan(request)
             store.write_json("research/plan.json", plan)
             queries = [str(q)[:300] for q in plan.get("queries", []) if str(q).strip()]
             if not queries:
                 queries = [request.topic]
 
-            self._phase(project_id, "searching", 25, "正在检索论文与开源代码")
+            self._phase(project_id, "searching", 25, "Searching papers and open-source code")
             sources = await searcher.search(queries, request.max_sources)
             self.db.replace_sources(project_id, sources)
             store.write_json(
@@ -59,7 +59,7 @@ class ResearchOrchestrator:
             self.db.add_event(
                 project_id,
                 "searching",
-                f"已去重并保存 {len(sources)} 条论文/代码来源",
+                f"Deduplicated and saved {len(sources)} paper/code sources",
                 details={"source_count": len(sources)},
             )
             if request.download_papers:
@@ -67,14 +67,14 @@ class ResearchOrchestrator:
                     sources, workspace / "research" / "papers"
                 )
                 self.db.add_event(
-                    project_id, "searching", f"已下载 {len(downloaded)} 篇开放 PDF"
+                    project_id, "searching", f"Downloaded {len(downloaded)} open-access PDFs"
                 )
 
-            self._phase(project_id, "synthesizing", 52, "正在综合证据并形成算法方案")
+            self._phase(project_id, "synthesizing", 52, "Synthesizing evidence into an algorithm plan")
             report = await self._synthesize(request, plan, sources)
             store.write_text("RESEARCH.md", report)
 
-            self._phase(project_id, "generating", 74, "正在生成可复现实验代码")
+            self._phase(project_id, "generating", 74, "Generating reproducible experiment code")
             bundle = await self._generate(request, report, sources)
             files = bundle.get("files")
             if not isinstance(files, list) or not files:
@@ -104,7 +104,7 @@ class ResearchOrchestrator:
             self.db.add_event(
                 project_id,
                 "ready",
-                f"研究方案和 {len(written)} 个实验文件已经就绪",
+                f"The research plan and {len(written)} experiment files are ready",
                 details={"workspace": str(workspace)},
             )
         except Exception as exc:
@@ -116,7 +116,7 @@ class ResearchOrchestrator:
                 error=str(exc)[:4000],
             )
             self.db.add_event(
-                project_id, "failed", f"研究流程失败：{exc}", level="error"
+                project_id, "failed", f"Research workflow failed: {exc}", level="error"
             )
         finally:
             await searcher.close()
@@ -124,21 +124,21 @@ class ResearchOrchestrator:
     async def _plan(self, request: ResearchRequest) -> dict[str, Any]:
         fallback = {
             "objective": request.topic,
-            "hypotheses": ["建立可复现基线并与一个改进方法比较"],
+            "hypotheses": ["Establish a reproducible baseline and compare it with one improvement"],
             "queries": [request.topic, f"{request.topic} benchmark", f"{request.topic} github"],
-            "evaluation": ["明确数据划分", "报告均值和方差", "固定随机种子"],
+            "evaluation": ["Define the data split", "Report mean and variance", "Fix random seeds"],
         }
         if not self.settings.openrouter_api_key:
             return fallback
-        prompt = f"""你是严谨的科研规划员。将题目转成可验证的研究计划。
-题目：{request.topic}
-补充要求：{request.notes or '无'}
-只返回 JSON 对象，字段：objective(string)、hypotheses(string[])、queries(string[]，3到5条英文检索式)、evaluation(string[])。"""
+        prompt = f"""You are a rigorous research planner. Turn the topic into a testable research plan.
+Topic: {request.topic}
+Additional requirements: {request.notes or 'None'}
+Return only a JSON object with these fields: objective (string), hypotheses (string[]), queries (string[] with 3 to 5 English search queries), and evaluation (string[])."""
         try:
             async with OpenRouterClient(self.settings) as llm:
                 return await llm.chat_json(
                     [
-                        {"role": "system", "content": "你的输出必须是严格 JSON，不编造实验结果。"},
+                        {"role": "system", "content": "Your output must be strict JSON. Do not fabricate experimental results."},
                         {"role": "user", "content": prompt},
                     ],
                     model=request.model,
@@ -151,20 +151,20 @@ class ResearchOrchestrator:
     ) -> str:
         digest = _source_digest(sources)
         if self.settings.openrouter_api_key:
-            prompt = f"""围绕下面的研究题目和真实检索结果撰写中文研究方案。
-题目：{request.topic}
-计划：{json.dumps(plan, ensure_ascii=False)}
-来源：
+            prompt = f"""Write an English research plan based on the topic and retrieved sources below.
+Topic: {request.topic}
+Plan: {json.dumps(plan, ensure_ascii=False)}
+Sources:
 {digest}
 
-要求：包含问题定义、相关工作（用 [S1] 形式引用）、可证伪假设、算法设计、数据与基线、评估指标、消融实验、风险和复现步骤。不得声称尚未运行的结果已经发生。"""
+Requirements: include the problem definition, related work with [S1]-style citations, falsifiable hypotheses, algorithm design, data and baselines, evaluation metrics, ablation studies, risks, and reproduction steps. Do not claim results from experiments that have not been run."""
             try:
                 async with OpenRouterClient(self.settings) as llm:
                     return await llm.chat(
                         [
                             {
                                 "role": "system",
-                                "content": "你是科研负责人，只基于提供的来源，清楚区分事实、推断与待验证假设。",
+                                "content": "You are the research lead. Use only the supplied sources and clearly distinguish facts, inferences, and hypotheses that still require testing.",
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -176,24 +176,24 @@ class ResearchOrchestrator:
         bibliography = "\n".join(
             f"- [S{index}] [{source.title}]({source.url}) — {source.provider}"
             for index, source in enumerate(sources, 1)
-        ) or "- 暂未检索到来源；运行前需要人工补充文献。"
+        ) or "- No sources were retrieved. Add literature manually before running the study."
         return f"""# {request.topic}
 
-## 研究目标
+## Research Objective
 
 {plan.get('objective', request.topic)}
 
-## 假设与评估
+## Hypotheses and Evaluation
 
 """ + "\n".join(f"- {item}" for item in plan.get("hypotheses", [])) + f"""
 
-## 实施原则
+## Implementation Principles
 
-- 先运行确定性基线，再改变一个变量进行对照。
-- 固定随机种子，保存配置、环境和指标。
-- 当前文档是实验计划，不代表已有实验结论。
+- Run a deterministic baseline first, then change one variable for comparison.
+- Fix random seeds and save the configuration, environment, and metrics.
+- This document is an experiment plan; it does not represent completed findings.
 
-## 检索来源
+## Retrieved Sources
 
 {bibliography}
 """
@@ -204,29 +204,29 @@ class ResearchOrchestrator:
         fallback = fallback_code_bundle(request.topic)
         if not self.settings.openrouter_api_key:
             return fallback
-        prompt = f"""根据研究方案生成一个最小但可运行、可复现的 Python 实验项目。
-研究方案：
+        prompt = f"""Generate a minimal, runnable, and reproducible Python experiment project from the research plan.
+Research plan:
 {report[:24000]}
 
-只返回严格 JSON：
+Return strict JSON only:
 {{
-  "summary": "实现摘要",
-  "files": [{{"path": "相对路径", "content": "完整文件内容"}}],
+  "summary": "Implementation summary",
+  "files": [{{"path": "relative/path", "content": "complete file content"}}],
   "experiment": {{
-    "setup_commands": ["安全、非交互的安装命令"],
-    "dataset_commands": ["可重复执行的数据下载命令"],
-    "run_command": "主实验命令",
+    "setup_commands": ["safe, non-interactive installation commands"],
+    "dataset_commands": ["idempotent dataset download commands"],
+    "run_command": "main experiment command",
     "metrics_file": "results/metrics.json"
   }}
 }}
-必须包含 README.md、requirements.txt、experiment.py 或等价入口、测试/校验脚本和 .gitignore。不得写入密钥，不得使用绝对路径，不得伪造实验数值。"""
+Include README.md, requirements.txt, experiment.py or an equivalent entry point, a test or validation script, and .gitignore. Do not write secrets, use absolute paths, or fabricate experiment values."""
         try:
             async with OpenRouterClient(self.settings) as llm:
                 return await llm.chat_json(
                     [
                         {
                             "role": "system",
-                            "content": "你是机器学习工程师。输出完整文件，不输出补丁或 Markdown 代码围栏。",
+                            "content": "You are a machine-learning engineer. Return complete files, not patches or Markdown code fences.",
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -246,7 +246,7 @@ class ResearchOrchestrator:
         if not self.settings.openrouter_api_key:
             store.write_text(
                 f"reports/{experiment_id}-iteration-{iteration}.md",
-                "# 实验分析\n\n没有配置 OpenRouter Key；已保留日志与指标，请人工分析。\n",
+                "# Experiment Analysis\n\nNo OpenRouter key is configured. Logs and metrics were preserved for manual analysis.\n",
             )
             return False
         generated = Path(project.workspace) / "generated"
@@ -254,37 +254,37 @@ class ResearchOrchestrator:
         for path in generated.rglob("*"):
             if path.is_file() and path.stat().st_size < 200_000:
                 inventory.append(str(path.relative_to(generated)))
-        prompt = f"""分析实验结果并提出一次保守的算法改进。
-题目：{project.topic}
-迭代：{iteration}
-结果：{json.dumps(result, ensure_ascii=False)[:16000]}
-当前文件：{inventory}
+        prompt = f"""Analyze the experiment results and propose one conservative algorithm improvement.
+Topic: {project.topic}
+Iteration: {iteration}
+Results: {json.dumps(result, ensure_ascii=False)[:16000]}
+Current files: {inventory}
 
-只返回 JSON：{{"analysis":"Markdown 分析","should_continue":true/false,"files":[{{"path":"相对路径","content":"需要替换的完整文件"}}]}}。
-如果结果不充分或实验失败，should_continue=false。不能修改依赖以外的系统环境，不能写密钥。"""
+Return JSON only: {{"analysis":"Markdown analysis","should_continue":true/false,"files":[{{"path":"relative/path","content":"complete replacement file content"}}]}}.
+Set should_continue=false if the results are insufficient or the experiment failed. Do not modify the system environment beyond dependencies, and do not write secrets."""
         try:
             async with OpenRouterClient(self.settings) as llm:
                 answer = await llm.chat_json(
                     [
-                        {"role": "system", "content": "一次只改变少量变量，避免根据单次噪声过拟合。"},
+                        {"role": "system", "content": "Change only a small number of variables at a time and avoid overfitting to noise from a single run."},
                         {"role": "user", "content": prompt},
                     ],
                     model=project.model or None,
                     max_tokens=10000,
                 )
         except LLMError as exc:
-            self.db.add_event(project_id, "analyzing", f"模型分析失败：{exc}", level="warning")
+            self.db.add_event(project_id, "analyzing", f"Model analysis failed: {exc}", level="warning")
             return False
         store.write_text(
             f"reports/{experiment_id}-iteration-{iteration}.md",
-            str(answer.get("analysis", "没有返回分析。")),
+            str(answer.get("analysis", "No analysis was returned.")),
         )
         files = answer.get("files")
         if not answer.get("should_continue") or not isinstance(files, list) or not files:
             return False
         store.materialize_files(files, "generated")
         store.materialize_files(files, f"iterations/iteration-{iteration + 1}")
-        self.db.add_event(project_id, "improving", "已根据结果生成下一轮算法改进")
+        self.db.add_event(project_id, "improving", "Generated the next algorithm improvement from the results")
         return True
 
 
@@ -298,4 +298,3 @@ def _source_digest(sources: list[Source]) -> str:
             f"Abstract: {source.abstract[:1200]}"
         )
     return "\n\n".join(chunks)[:36000]
-

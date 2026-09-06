@@ -77,7 +77,7 @@ def test_remote_experiment_requires_explicit_confirmation(tmp_path: Path) -> Non
         project_id,
         CodeSaveRequest(files=[CodeFile(path="experiment.py", content="print('ok')")]),
     )
-    with pytest.raises(ValueError, match="确认"):
+    with pytest.raises(ValueError, match="confirmation"):
         bridge.experiments.start(
             ExperimentStartRequest(
                 project_id=project_id,
@@ -96,6 +96,8 @@ async def test_mcp_exposes_chatgpt_collaboration_tools(tmp_path: Path) -> None:
         assert {
             "create_research_project",
             "save_experiment_code",
+            "check_autodl_readiness",
+            "check_experiment_readiness",
             "get_autodl_instance_status",
             "start_autodl_experiment",
             "get_experiment_result",
@@ -104,6 +106,8 @@ async def test_mcp_exposes_chatgpt_collaboration_tools(tmp_path: Path) -> None:
         assert by_name["start_autodl_experiment"].annotations.destructive_hint is True
         assert by_name["create_autodl_instance"].annotations.destructive_hint is True
         assert "confirm_execute" in by_name["start_autodl_experiment"].input_schema["required"]
+        assert by_name["check_autodl_readiness"].annotations.read_only_hint is True
+        assert by_name["check_autodl_readiness"].annotations.destructive_hint is False
 
         created = await client.call_tool(
             "create_research_project",
@@ -111,3 +115,23 @@ async def test_mcp_exposes_chatgpt_collaboration_tools(tmp_path: Path) -> None:
         )
         assert created.structured_content is not None
         assert created.structured_content["project"]["phase"] == "chatgpt_thinking"
+        readiness = await client.call_tool("check_experiment_readiness", {
+            "project_id": created.structured_content["project"]["id"]
+        })
+        assert readiness.structured_content["ready"] is False
+        assert by_name["check_experiment_readiness"].annotations.read_only_hint is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_readiness_reports_both_missing_settings(tmp_path: Path) -> None:
+    settings = Settings.load(tmp_path).with_overrides(autodl_token="", autodl_image_uuid="")
+    app = create_app(settings)
+    async with Client(app.state.mcp_server, raise_exceptions=True) as client:
+        response = await client.call_tool("check_autodl_readiness", {"verify_api": True})
+    result = response.structured_content
+    assert result is not None
+    assert result["ready"] is False
+    assert result["network_checked"] is False
+    assert {issue["code"] for issue in result["blocking_issues"]} == {
+        "missing_token", "missing_image",
+    }

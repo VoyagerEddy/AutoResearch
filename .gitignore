@@ -9,6 +9,6 @@ data/
 workspaces/
 results/
 *.log
-AutoResearch 需求.txt
+AutoResearch*.txt
 .local/
 tools/tunnel-client*

@@ -1,6 +1,6 @@
-# 架构
+# Architecture
 
-AutoResearch 借鉴 agent harness 的可替换能力设计，但保持单机 MVP 的部署复杂度。核心编排器只负责阶段推进和持久化，各外部能力放在 `autoresearch/services/`：
+AutoResearch borrows the replaceable-capability structure of an agent harness while keeping the deployment complexity of a single-machine MVP. The core orchestrator advances and persists phases. External capabilities live under `autoresearch/services/`:
 
 ```text
 ChatGPT native model → Secure MCP Tunnel → /mcp → ChatGPTBridge
@@ -10,38 +10,38 @@ ChatGPT native model → Secure MCP Tunnel → /mcp → ChatGPTBridge
                                                    ├→ ExperimentManager → AutoDL / SSH
                                                    └→ SQLite event log
 
-Chrome UI → FastAPI → ResearchOrchestrator → OpenRouter
-                            ├──────────────→ Search providers
-                            ├──────────────→ ArtifactStore
-                            └──────────────→ SQLite event log
+Web UI → FastAPI → ResearchOrchestrator → OpenRouter
+                          ├──────────────→ Search providers
+                          ├──────────────→ ArtifactStore
+                          └──────────────→ SQLite event log
 
 ExperimentManager → SSHRunner → AutoDL instance
-                 ├→ AutoDL Pro API (provision/recovery)
+                 ├→ AutoDL Pro API (provisioning/recovery)
                  ├→ result analysis / bounded improvement
                  └→ GitSync (code only)
 ```
 
-## 持久事实
+## Durable state
 
-SQLite 的 `projects`、`events`、`sources` 和 `experiments` 是 UI 和状态恢复的事实来源。事件是只追加日志，项目表保留当前投影。这与 harness 的“模型可见事实应可重建”原则一致。
+SQLite tables `projects`, `events`, `sources`, and `experiments` are the source of truth for the UI and state recovery. Events form an append-only log; the projects table retains the current projection.
 
-ChatGPT 和网页共享同一个 `AppState`、SQLite 数据库和工作区。MCP 工具的结果返回项目 ID 与网页深链接；网页每隔 2.5 秒重新读取事件和实验表，所以通过 ChatGPT 发起的操作也会显示在现有工作台中。
+ChatGPT and the web UI share one `AppState`, SQLite database, and workspace. MCP results include a project ID and dashboard deep link. The UI reloads events and experiments every 2.5 seconds, so operations started through ChatGPT appear in the same workbench.
 
-## 能力边界
+## Capability boundaries
 
-- `OpenRouterClient`：模型请求、免费模型发现、JSON 提取和有限重试。
-- `ResearchSearch`：论文与代码检索、去重、受限 PDF 下载。
-- `ArtifactStore`：模型文件落盘，阻止绝对路径、`..`、敏感文件名和过大输出。
-- `AutoDLClient`：官方 Pro API；GPU 规格顺序由配置注入。
-- `SSHRunner`：GPU 检查、受控目录上传、守护进程和指标读取。
-- `GitSync`：仅允许 github.com 远端，拒绝 URL 内嵌 Token。
-- `DesktopBridge`：明确寻找 Chrome，调用 VS Code CLI。
-- `ChatGPTBridge`：把 ChatGPT 工具调用映射到既有数据库、产物、检索、AutoDL 与实验服务；不保存 ChatGPT 对话，也不调用 OpenAI API。
-- `MCPServer`：在同一 FastAPI 进程的 `/mcp` 暴露 Streamable HTTP 工具，使用准确的只读、写入、开放网络和远程执行注解。
+- `OpenRouterClient`: model requests, free-model discovery, JSON extraction, and bounded retry.
+- `ResearchSearch`: paper and code search, deduplication, and restricted PDF downloads.
+- `ArtifactStore`: safe model-output writes with rejection of absolute paths, traversal, sensitive filenames, conflicts, and oversized bundles.
+- `AutoDLClient`: official Pro API with configuration-driven GPU preference.
+- `SSHRunner`: GPU inspection, controlled directory upload, daemonized execution, and metric reads.
+- `GitSync`: GitHub remotes only; embedded URL tokens are rejected.
+- `DesktopBridge`: explicit Chrome discovery and VS Code CLI invocation.
+- `ChatGPTBridge`: maps ChatGPT tool calls to the existing database, artifacts, search, AutoDL, and experiment services. It stores no ChatGPT conversation and calls no OpenAI API.
+- `MCPServer`: exposes Streamable HTTP tools at `/mcp` in the FastAPI process, with accurate read, write, open-network, and remote-execution annotations.
 
-服务均可通过构造器替换或在测试中模拟。后续可把搜索器、模型提供商和算力提供商升级成入口点插件，而无需改动工作流数据模型。
+Services are constructor-injected or mockable in tests. Search, model, and compute providers can later become entry-point plugins without changing the workflow data model.
 
-## 状态机
+## State machines
 
 ```text
 queued → planning → searching → synthesizing → generating → ready
@@ -53,4 +53,4 @@ chatgpt_thinking → searching → chatgpt_thinking → generating/ready
                                 chatgpt_analysis ← experiment
 ```
 
-任何阶段异常进入 `failed` 或 `experiment_failed`，错误同时写入项目快照和事件日志。
+Any phase error transitions to `failed` or `experiment_failed`, and the error is persisted in both the project snapshot and event log.

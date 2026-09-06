@@ -21,6 +21,7 @@ from .domain import (
 )
 from .experiments import ExperimentManager
 from .services.artifacts import ArtifactStore, safe_slug
+from .services.experiment_readiness import inspect_experiment
 from .services.autodl import AutoDLClient, AutoDLError, extract_ssh
 from .services.llm import LLMError, OpenRouterClient
 from .services.search import ResearchSearch
@@ -50,21 +51,21 @@ class ChatGPTBridge:
         store = ArtifactStore(Path(project.workspace))
         brief = f"# {project.topic}\n\n"
         if request.notes:
-            brief += f"## 初始约束\n\n{request.notes}\n"
+            brief += f"## Initial constraints\n\n{request.notes}\n"
         else:
-            brief += "由 ChatGPT 对话负责科研推理；研究笔记、代码和实验由 AutoResearch 持久化。\n"
+            brief += "ChatGPT owns research reasoning; AutoResearch persists notes, code, and experiments.\n"
         store.write_text("research/chatgpt-brief.md", brief)
         self.db.update_project(
             project.id,
             status="running",
             phase="chatgpt_thinking",
             progress=10,
-            summary="ChatGPT 正在进行科研思考；AutoResearch 等待保存笔记、代码或启动实验。",
+            summary="ChatGPT is handling research reasoning; AutoResearch is ready to save notes or code and start experiments.",
         )
         self.db.add_event(
             project.id,
             "chatgpt_thinking",
-            "已建立 ChatGPT 协作研究，等待对话中的下一步操作",
+            "Created a ChatGPT collaborative research project and awaiting the next action",
             details={"source": "chatgpt"},
         )
         return self.status(project.id)
@@ -90,12 +91,12 @@ class ChatGPTBridge:
             status="running",
             phase="chatgpt_thinking",
             progress=max(project.progress, 20),
-            summary=f"已保存 ChatGPT 研究笔记：{request.title}",
+            summary=f"Saved ChatGPT research note: {request.title}",
         )
         self.db.add_event(
             project_id,
             "chatgpt_thinking",
-            f"ChatGPT 已保存研究笔记《{request.title}》",
+            f"ChatGPT saved research note '{request.title}'",
             details={"path": relative},
         )
         return {"project_id": project_id, "path": relative, "dashboard_url": self._dashboard(project_id)}
@@ -107,7 +108,7 @@ class ChatGPTBridge:
         written = store.materialize_files(files, "generated")
         if request.experiment_manifest:
             store.write_json("generated/experiment_manifest.json", request.experiment_manifest)
-        summary = request.summary.strip() or f"ChatGPT 已保存 {len(written)} 个代码文件"
+        summary = request.summary.strip() or f"ChatGPT saved {len(written)} code file(s)"
         self.db.update_project(
             project_id,
             status="ready",
@@ -120,7 +121,7 @@ class ChatGPTBridge:
         self.db.add_event(
             project_id,
             "ready",
-            f"ChatGPT 已将 {len(written)} 个代码文件保存到实验工作区",
+            f"ChatGPT saved {len(written)} code file(s) to the experiment workspace",
             details={"files": relative, "producer": "chatgpt"},
         )
         return {
@@ -135,14 +136,14 @@ class ChatGPTBridge:
     ) -> dict[str, Any]:
         project = self._project(project_id)
         if not self.settings.openrouter_api_key:
-            raise LLMError("尚未配置 OpenRouter API Key，无法调用 AutoResearch 大模型生成代码")
+            raise LLMError("OpenRouter API key is not configured; AutoResearch cannot delegate code generation")
         self.db.update_project(
             project_id, status="running", phase="generating", progress=74, error=""
         )
         self.db.add_event(
             project_id,
             "generating",
-            "ChatGPT 已把代码实现任务交给 AutoResearch 大模型",
+            "ChatGPT delegated code implementation to the AutoResearch model",
             details={"model": request.model or self.settings.openrouter_model},
         )
         store = ArtifactStore(Path(project.workspace))
@@ -152,34 +153,34 @@ class ChatGPTBridge:
             f"[S{index}] {source.title}\n{source.url}\n{source.abstract[:900]}"
             for index, source in enumerate(sources, 1)
         )[:24_000]
-        prompt = f"""ChatGPT 已经完成科研思考。请只负责把方案实现成最小、可运行、可复现的 Python 实验项目。
-研究题目：{project.topic}
-ChatGPT 的实现要求：{request.instructions}
-已保存研究上下文：
+        prompt = f"""ChatGPT has completed the research reasoning. Implement the plan as a minimal, runnable, and reproducible Python experiment project.
+Research topic: {project.topic}
+ChatGPT implementation requirements: {request.instructions}
+Saved research context:
 {context[:36_000]}
 
-已保存来源：
-{source_digest or '暂无来源'}
+Saved sources:
+{source_digest or 'No sources saved'}
 
-只返回严格 JSON：
+Return strict JSON only:
 {{
-  "summary": "实现摘要",
-  "files": [{{"path": "相对路径", "content": "完整文件内容"}}],
+  "summary": "Implementation summary",
+  "files": [{{"path": "relative/path", "content": "complete file content"}}],
   "experiment": {{
-    "setup_commands": ["安全、非交互的安装命令"],
+    "setup_commands": ["safe, non-interactive installation commands"],
     "dataset_commands": [],
     "run_command": "python experiment.py",
     "metrics_file": "results/metrics.json"
   }}
 }}
-必须包含 README.md、requirements.txt、可运行入口、测试或校验脚本和 .gitignore。不得写入密钥、绝对路径或伪造实验结果。"""
+Include README.md, requirements.txt, a runnable entry point, a test or validation script, and .gitignore. Do not write secrets, absolute paths, or fabricated experiment results."""
         try:
             async with OpenRouterClient(self.settings) as llm:
                 bundle = await llm.chat_json(
                     [
                         {
                             "role": "system",
-                            "content": "你是 AutoResearch 实验工程师。保留 ChatGPT 的研究决策，只实现代码。输出完整文件而非补丁。",
+                            "content": "You are an AutoResearch experiment engineer. Preserve ChatGPT's research decisions and implement code only. Return complete files, not patches.",
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -188,7 +189,7 @@ ChatGPT 的实现要求：{request.instructions}
                 )
             files = bundle.get("files")
             if not isinstance(files, list) or not files:
-                raise LLMError("AutoResearch 大模型没有返回代码文件")
+                raise LLMError("The AutoResearch model returned no code files")
             written = store.materialize_files(files, "generated")
             manifest = bundle.get("experiment")
             store.write_json(
@@ -215,11 +216,11 @@ ChatGPT 的实现要求：{request.instructions}
             self.db.add_event(
                 project_id,
                 "generating",
-                f"AutoResearch 代码生成失败：{exc}",
+                f"AutoResearch code generation failed: {exc}",
                 level="error",
             )
             raise
-        summary = str(bundle.get("summary") or f"AutoResearch 已生成 {len(written)} 个实验文件")[:2000]
+        summary = str(bundle.get("summary") or f"AutoResearch generated {len(written)} experiment file(s)")[:2000]
         self.db.update_project(
             project_id,
             status="ready",
@@ -233,7 +234,7 @@ ChatGPT 的实现要求：{request.instructions}
         self.db.add_event(
             project_id,
             "ready",
-            f"AutoResearch 大模型已生成 {len(written)} 个实验文件",
+            f"AutoResearch model generated {len(written)} experiment file(s)",
             details={"files": relative, "producer": "openrouter"},
         )
         return {
@@ -250,11 +251,11 @@ ChatGPT 的实现要求：{request.instructions}
         project = self._project(project_id)
         queries = [query.strip()[:300] for query in request.queries if query.strip()]
         if not queries:
-            raise ValueError("至少需要一个非空检索式")
+            raise ValueError("At least one nonempty search query is required")
         self.db.update_project(
             project_id, status="running", phase="searching", progress=30, error=""
         )
-        self.db.add_event(project_id, "searching", "ChatGPT 已请求 AutoResearch 检索科研资源")
+        self.db.add_event(project_id, "searching", "ChatGPT requested an AutoResearch source search")
         searcher = ResearchSearch(self.settings)
         try:
             found = await searcher.search(queries, request.max_sources)
@@ -281,12 +282,12 @@ ChatGPT 的实现要求：{request.instructions}
             status="running",
             phase="chatgpt_thinking",
             progress=max(project.progress, 45),
-            summary=f"已保存 {len(sources)} 条来源，等待 ChatGPT 继续分析。",
+            summary=f"Saved {len(sources)} sources and waiting for ChatGPT to continue the analysis.",
         )
         self.db.add_event(
             project_id,
             "chatgpt_thinking",
-            f"已保存 {len(sources)} 条来源并交回 ChatGPT 分析",
+            f"Saved {len(sources)} sources and returned them to ChatGPT for analysis",
             details={"source_count": len(sources), "downloaded_pdfs": len(downloaded)},
         )
         return {
@@ -303,12 +304,12 @@ ChatGPT 的实现要求：{request.instructions}
         project = self._project(project_id)
         suffix = request.experiment_id or safe_slug(request.analysis[:80])
         relative = f"reports/chatgpt-analysis-{safe_slug(suffix, 36)}.md"
-        body = "# ChatGPT 实验分析\n\n"
+        body = "# ChatGPT Experiment Analysis\n\n"
         if request.experiment_id:
-            body += f"实验 ID：`{request.experiment_id}`\n\n"
+            body += f"Experiment ID: `{request.experiment_id}`\n\n"
         body += request.analysis.rstrip() + "\n"
         if request.recommendations:
-            body += "\n## 下一步建议\n\n" + "\n".join(
+            body += "\n## Next Steps\n\n" + "\n".join(
                 f"- {item}" for item in request.recommendations
             ) + "\n"
         ArtifactStore(Path(project.workspace)).write_text(relative, body)
@@ -317,13 +318,13 @@ ChatGPT 的实现要求：{request.instructions}
             status="ready",
             phase="chatgpt_analysis",
             progress=100,
-            summary="实验结果已由 ChatGPT 分析并保存。",
+            summary="ChatGPT analyzed and saved the experiment results.",
             error="",
         )
         self.db.add_event(
             project_id,
             "chatgpt_analysis",
-            "ChatGPT 已分析实验结果并保存结论",
+            "ChatGPT analyzed the experiment results and saved the conclusions",
             details={"path": relative, "experiment_id": request.experiment_id or ""},
         )
         return {"project_id": project_id, "path": relative, "dashboard_url": self._dashboard(project_id)}
@@ -342,20 +343,34 @@ ChatGPT 的实现要求：{request.instructions}
         collaborative = (Path(project.workspace) / "research" / "chatgpt-brief.md").is_file()
         return {
             "project": project_data,
-            "reasoning_owner": "ChatGPT 当前对话" if collaborative else "AutoResearch/OpenRouter",
+            "reasoning_owner": "Current ChatGPT conversation" if collaborative else "AutoResearch/OpenRouter",
             "execution_model": project.model or self.settings.openrouter_model,
             "sources": [item.model_dump() for item in self.db.list_sources(project_id)],
             "experiments": experiments,
             "recent_events": self.db.list_events(project_id)[-30:],
             "artifacts": store.list_files(),
+            "experiment_readiness": self.experiment_readiness(project_id),
             "dashboard_url": self._dashboard(project_id),
         }
+
+    def experiment_readiness(self, project_id: str) -> dict[str, Any]:
+        project = self._project(project_id)
+        return {"project_id": project_id, **inspect_experiment(Path(project.workspace))}
+
+    async def autodl_readiness(
+        self, *, verify_api: bool = False, image_uuid: str | None = None
+    ) -> dict[str, Any]:
+        client = AutoDLClient(self.settings)
+        try:
+            return await client.preflight(verify_api=verify_api, image_uuid=image_uuid)
+        finally:
+            await client.close()
 
     async def create_autodl_instance(
         self, request: AutoDLCreateRequest, project_id: str | None = None
     ) -> dict[str, Any]:
         if not request.confirm_billable:
-            raise ValueError("创建按量计费 AutoDL 实例前必须取得用户明确确认")
+            raise ValueError("Explicit user confirmation is required before creating a billable AutoDL instance")
         if project_id:
             self._project(project_id)
         client = AutoDLClient(self.settings)
@@ -365,13 +380,13 @@ ChatGPT 的实现要求：{request.instructions}
                 "instance_uuid": choice.instance_uuid,
                 "gpu_spec": choice.gpu_spec,
                 "status": "creating",
-                "message": "实例正在创建。计费与生命周期仍由 AutoDL 控制台管理。",
+                "message": "The instance is being created. Billing and lifecycle management remain in the AutoDL console.",
             }
             if project_id:
                 self.db.add_event(
                     project_id,
                     "autodl",
-                    f"已创建 AutoDL 计费实例 {choice.instance_uuid}（{choice.gpu_spec}）",
+                    f"Created billable AutoDL instance {choice.instance_uuid} ({choice.gpu_spec})",
                     details={"instance_uuid": choice.instance_uuid, "gpu_spec": choice.gpu_spec},
                 )
                 result["dashboard_url"] = self._dashboard(project_id)
@@ -390,7 +405,7 @@ ChatGPT 的实现要求：{request.instructions}
                 "instance_uuid": instance_uuid,
                 "status": status,
                 "ssh_ready": ssh_ready,
-                "message": "ssh_ready 为 true 后可以启动实验；连接凭据不会返回 ChatGPT。",
+                "message": "The experiment can start when ssh_ready is true. Connection credentials are never returned to ChatGPT.",
             }
         finally:
             await client.close()
@@ -399,17 +414,17 @@ ChatGPT 的实现要求：{request.instructions}
         self, request: AutoDLExperimentRequest
     ) -> dict[str, Any]:
         if not request.confirm_execute:
-            raise ValueError("上传并执行代码前必须取得用户明确确认")
+            raise ValueError("Explicit user confirmation is required before uploading and executing code")
         self._project(request.project_id)
         client = AutoDLClient(self.settings)
         try:
             status = await client.status(request.instance_uuid)
             if status != "running":
-                raise AutoDLError(f"AutoDL 实例尚未运行（当前状态：{status}）")
+                raise AutoDLError(f"The AutoDL instance is not running (current status: {status})")
             snapshot = await client.snapshot(request.instance_uuid)
             ssh = extract_ssh(snapshot)
             if not ssh:
-                raise AutoDLError("AutoDL 响应中没有可用 SSH 信息")
+                raise AutoDLError("The AutoDL response contains no usable SSH information")
         finally:
             await client.close()
         experiment = ExperimentStartRequest(
@@ -434,17 +449,17 @@ ChatGPT 的实现要求：{request.instructions}
     def experiment_result(self, experiment_id: str) -> dict[str, Any]:
         experiment = self.db.get_experiment(experiment_id)
         if not experiment:
-            raise ValueError("实验不存在")
+            raise ValueError("Experiment not found")
         return {
             **experiment,
             "dashboard_url": self._dashboard(str(experiment["project_id"])),
-            "analysis_hint": "请由 ChatGPT 基于 metrics、exit_code 和 log_tail 分析；如要持久化结论，请调用 record_chatgpt_analysis。",
+            "analysis_hint": "Ask ChatGPT to analyze metrics, exit_code, and log_tail. Call record_chatgpt_analysis to persist the conclusions.",
         }
 
     def _project(self, project_id: str):
         project = self.db.get_project(project_id)
         if not project:
-            raise ValueError("研究项目不存在")
+            raise ValueError("Research project not found")
         return project
 
     def _dashboard(self, project_id: str) -> str:

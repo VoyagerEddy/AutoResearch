@@ -23,7 +23,7 @@ class GitSync:
             return value
         if re.match(r"^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$", value):
             return value
-        raise GitSyncError("只允许 github.com 的 HTTPS 或 SSH 仓库地址，且地址中不能包含 Token")
+        raise GitSyncError("Only GitHub HTTPS or SSH repository URLs are allowed, and URLs must not contain tokens")
 
     def _run(self, args: list[str], *, check: bool = True) -> str:
         result = subprocess.run(
@@ -42,7 +42,7 @@ class GitSync:
     def sync(self, remote: str, branch: str, message: str) -> dict[str, Any]:
         remote = self.validate_remote(remote)
         if not self.root.exists():
-            raise GitSyncError(f"同步目录不存在：{self.root}")
+            raise GitSyncError(f"Sync directory does not exist: {self.root}")
         if not (self.root / ".git").exists():
             self._run(["init", "-b", branch])
         self._run(["config", "user.name", "AutoResearch"])

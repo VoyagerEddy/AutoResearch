@@ -149,7 +149,7 @@ class ExperimentStartRequest(BaseModel):
     @classmethod
     def validate_remote_dir(cls, value: str) -> str:
         if not value.startswith("/") or any(part == ".." for part in value.split("/")):
-            raise ValueError("remote_dir 必须是无 .. 的 Linux 绝对路径")
+            raise ValueError("remote_dir must be an absolute Linux path without '..'")
         return value.rstrip("/") or "/"
 
 
@@ -167,7 +167,7 @@ class AutoDLExperimentRequest(BaseModel):
     @classmethod
     def validate_remote_dir(cls, value: str) -> str:
         if not value.startswith("/") or any(part == ".." for part in value.split("/")):
-            raise ValueError("remote_dir 必须是无 .. 的 Linux 绝对路径")
+            raise ValueError("remote_dir must be an absolute Linux path without '..'")
         return value.rstrip("/") or "/"
 
 

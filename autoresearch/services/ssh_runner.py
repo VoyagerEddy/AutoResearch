@@ -52,7 +52,7 @@ class SSHRunner:
         try:
             client.connect(**kwargs)
         except (paramiko.SSHException, socket.error, OSError) as exc:
-            raise RemoteExecutionError(f"SSH 连接失败：{exc}") from exc
+            raise RemoteExecutionError(f"SSH connection failed: {exc}") from exc
         self.client = client
         return self
 
@@ -63,7 +63,7 @@ class SSHRunner:
 
     def execute(self, command: str, timeout: int = 120) -> tuple[int, str, str]:
         if not self.client:
-            raise RemoteExecutionError("SSH 尚未连接")
+            raise RemoteExecutionError("SSH is not connected")
         try:
             _, stdout, stderr = self.client.exec_command(command, timeout=timeout)
             code = stdout.channel.recv_exit_status()
@@ -73,7 +73,7 @@ class SSHRunner:
                 stderr.read().decode("utf-8", errors="replace"),
             )
         except (paramiko.SSHException, socket.error, OSError) as exc:
-            raise RemoteExecutionError(f"远程命令失败：{exc}") from exc
+            raise RemoteExecutionError(f"Remote command failed: {exc}") from exc
 
     def gpu_processes(self) -> list[dict[str, int]]:
         command = (
@@ -90,10 +90,10 @@ class SSHRunner:
 
     def upload_tree(self, local_dir: Path, remote_dir: str) -> int:
         if not self.client:
-            raise RemoteExecutionError("SSH 尚未连接")
+            raise RemoteExecutionError("SSH is not connected")
         local_root = local_dir.resolve()
         if not local_root.is_dir():
-            raise RemoteExecutionError(f"本地实验目录不存在：{local_root}")
+            raise RemoteExecutionError(f"Local experiment directory does not exist: {local_root}")
         self.execute(f"mkdir -p {shlex.quote(remote_dir)}")
         count = 0
         with self.client.open_sftp() as sftp:
@@ -120,13 +120,13 @@ class SSHRunner:
             try:
                 attrs = sftp.stat(current)
                 if not stat.S_ISDIR(attrs.st_mode):
-                    raise RemoteExecutionError(f"远程路径不是目录：{current}")
+                    raise RemoteExecutionError(f"Remote path is not a directory: {current}")
             except FileNotFoundError:
                 sftp.mkdir(current)
 
     def start(self, remote_dir: str, command: str) -> int:
         if not self.client:
-            raise RemoteExecutionError("SSH 尚未连接")
+            raise RemoteExecutionError("SSH is not connected")
         script = (
             "#!/usr/bin/env bash\n"
             "set -uo pipefail\n"
@@ -149,7 +149,7 @@ class SSHRunner:
         )
         code, stdout, stderr = self.execute(launch)
         if code != 0 or not stdout.strip().splitlines()[-1].isdigit():
-            raise RemoteExecutionError(f"启动实验失败：{stderr or stdout}")
+            raise RemoteExecutionError(f"Failed to start experiment: {stderr or stdout}")
         return int(stdout.strip().splitlines()[-1])
 
     def status(self, remote_dir: str, pid: int) -> RemoteStatus:
@@ -173,12 +173,12 @@ class SSHRunner:
 
     def read_json(self, remote_path: str, max_bytes: int = 2_000_000) -> dict[str, Any]:
         if not self.client:
-            raise RemoteExecutionError("SSH 尚未连接")
+            raise RemoteExecutionError("SSH is not connected")
         with self.client.open_sftp() as sftp:
             try:
                 attrs = sftp.stat(remote_path)
                 if attrs.st_size > max_bytes:
-                    raise RemoteExecutionError("指标文件超过大小限制")
+                    raise RemoteExecutionError("Metrics file exceeds the size limit")
                 with sftp.open(remote_path, "r") as handle:
                     data = handle.read(max_bytes + 1)
             except FileNotFoundError:
@@ -190,4 +190,3 @@ class SSHRunner:
         except json.JSONDecodeError:
             return {}
         return value if isinstance(value, dict) else {"value": value}
-

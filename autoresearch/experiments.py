@@ -15,6 +15,23 @@ from .services.github_sync import GitSync, GitSyncError
 from .services.ssh_runner import RemoteExecutionError, SSHRunner
 
 
+def execution_succeeded(exit_code: int | None, metrics: dict[str, Any]) -> bool:
+    """A preflight report is never evidence that an experiment executed."""
+    if exit_code != 0:
+        return False
+    if metrics.get("runner") != "autoresearch":
+        return True  # Preserve legacy exit-code behavior; no scientific claim.
+    steps = metrics.get("steps")
+    return (
+        metrics.get("execute") is True
+        and metrics.get("status") == "succeeded"
+        and metrics.get("exit_code") == 0
+        and isinstance(steps, list) and bool(steps)
+        and all(isinstance(step, dict) and step.get("status") == "succeeded"
+                and step.get("exit_code") == 0 for step in steps)
+    )
+
+
 class ExperimentManager:
     def __init__(
         self, db: Database, settings: Settings, orchestrator: ResearchOrchestrator
@@ -29,13 +46,13 @@ class ExperimentManager:
 
     def start(self, request: ExperimentStartRequest) -> str:
         if not request.confirm_execute:
-            raise ValueError("上传并执行远程代码前必须明确确认")
+            raise ValueError("Explicit confirmation is required before uploading and executing remote code")
         project = self.db.get_project(request.project_id)
         if not project:
-            raise ValueError("研究项目不存在")
+            raise ValueError("Research project not found")
         generated = Path(project.workspace) / "generated"
         if not generated.is_dir():
-            raise ValueError("实验代码尚未生成")
+            raise ValueError("Experiment code has not been generated")
         experiment_id = self.db.create_experiment(
             request.project_id,
             request.remote_dir,
@@ -70,7 +87,7 @@ class ExperimentManager:
                 self.db.add_event(
                     request.project_id,
                     "experiment",
-                    f"正在上传第 {iteration} 轮实验代码",
+                    f"Uploading experiment code for iteration {iteration}",
                 )
                 pid = await asyncio.to_thread(
                     self._upload_and_start,
@@ -83,7 +100,7 @@ class ExperimentManager:
                 self.db.add_event(
                     request.project_id,
                     "experiment",
-                    f"远程实验已启动（PID {pid}）",
+                    f"Remote experiment started (PID {pid})",
                 )
                 status = await self._monitor(
                     connection, request.remote_dir, pid, request.project_id
@@ -98,12 +115,13 @@ class ExperimentManager:
                     "log_tail": status.log_tail[-20000:],
                     "metrics": metrics,
                     "iteration": iteration,
+                    "execution_succeeded": execution_succeeded(status.exit_code, metrics),
                 }
                 self.db.update_experiment(experiment_id, status="analyzing", result=result)
                 self.db.add_event(
-                    request.project_id, "analyzing", f"第 {iteration} 轮实验完成，正在分析"
+                    request.project_id, "analyzing", f"Experiment iteration {iteration} finished; analyzing results"
                 )
-                if status.exit_code != 0:
+                if not result["execution_succeeded"]:
                     break
                 if iteration >= request.max_iterations:
                     break
@@ -115,23 +133,23 @@ class ExperimentManager:
 
             final = self.db.get_experiment(experiment_id) or {}
             final_result = final.get("result") or {}
-            succeeded = final_result.get("exit_code") == 0
+            succeeded = final_result.get("execution_succeeded") is True
             self.db.update_experiment(
                 experiment_id,
                 status="completed" if succeeded else "failed",
-                error="" if succeeded else "远程实验返回非零状态或状态丢失",
+                error="" if succeeded else "Experiment did not complete, returned a nonzero status, or only ran preflight; inspect the logs and run summary",
             )
             self.db.update_project(
                 request.project_id,
                 status="ready" if succeeded else "failed",
                 phase="completed" if succeeded else "experiment_failed",
                 progress=100,
-                error="" if succeeded else "远程实验失败，请检查日志",
+                error="" if succeeded else "Remote experiment failed; inspect the logs",
             )
             self.db.add_event(
                 request.project_id,
                 "completed" if succeeded else "experiment_failed",
-                "实验循环已完成" if succeeded else "实验失败，已停止自动迭代",
+                "Experiment loop completed" if succeeded else "Experiment failed; automatic iteration stopped",
                 level="info" if succeeded else "error",
             )
             if succeeded and self.settings.github_remote_url:
@@ -144,7 +162,7 @@ class ExperimentManager:
                 request.project_id, status="failed", phase="experiment_failed", error=str(exc)[:4000]
             )
             self.db.add_event(
-                request.project_id, "experiment_failed", f"实验编排失败：{exc}", level="error"
+                request.project_id, "experiment_failed", f"Experiment orchestration failed: {exc}", level="error"
             )
 
     async def _ensure_idle_gpu(
@@ -160,20 +178,20 @@ class ExperimentManager:
         self.db.add_event(
             project_id,
             "gpu_check",
-            f"检测到 GPU 已被 {len(processes)} 个计算进程占用",
+            f"GPU is occupied by {len(processes)} compute process(es)",
             level="warning",
             details={"processes": processes},
         )
         if not request.recover_busy_gpu:
-            raise RemoteExecutionError("GPU 已被占用，且未启用自动恢复")
+            raise RemoteExecutionError("GPU is busy and automatic recovery is disabled")
         if not instance_uuid or not self.settings.autodl_token:
-            raise RemoteExecutionError("自动恢复需要 instance_uuid 和 AutoDL 开发者 Token")
+            raise RemoteExecutionError("Automatic recovery requires instance_uuid and an AutoDL developer token")
         autodl = AutoDLClient(self.settings)
         try:
             image_uuid = await autodl.save_image(instance_uuid, f"autoresearch-{project_id}")
             if not image_uuid:
-                raise AutoDLError("AutoDL 未返回克隆镜像 UUID")
-            self.db.add_event(project_id, "gpu_recovery", "正在保存实例镜像并克隆到新实例")
+                raise AutoDLError("AutoDL did not return a clone image UUID")
+            self.db.add_event(project_id, "gpu_recovery", "Saving the instance image and provisioning a clone")
             await autodl.wait_image(image_uuid)
             clone = await autodl.create_preferred(
                 AutoDLCreateRequest(image_uuid=image_uuid, instance_name=f"AutoResearch-{project_id}-clone")
@@ -181,29 +199,29 @@ class ExperimentManager:
             snapshot = await autodl.wait_running(clone.instance_uuid)
             ssh = extract_ssh(snapshot)
             if not ssh:
-                raise AutoDLError("新实例已启动，但响应中没有可识别的 SSH 信息")
+                raise AutoDLError("The new instance started, but the response contained no usable SSH details")
             cloned_connection = SSHConnection(**ssh)
             clone_processes = await asyncio.to_thread(self._gpu_processes, cloned_connection)
             if not clone_processes:
                 return cloned_connection, clone.instance_uuid
             self.db.add_event(
-                project_id, "gpu_recovery", "克隆实例 GPU 仍被占用", level="warning"
+                project_id, "gpu_recovery", "The cloned instance GPU is still busy", level="warning"
             )
             if not request.allow_release_replacement:
-                raise AutoDLError("克隆实例 GPU 仍忙；释放实例需要在启动实验时明确授权")
+                raise AutoDLError("The cloned instance GPU is still busy; releasing it requires explicit authorization when starting the experiment")
             await autodl.power_off(clone.instance_uuid)
             await autodl.release(clone.instance_uuid)
-            self.db.add_event(project_id, "gpu_recovery", "已释放忙碌的克隆实例，正在全新创建")
+            self.db.add_event(project_id, "gpu_recovery", "Released the busy clone and provisioning a fresh instance")
             fresh = await autodl.create_preferred(
                 AutoDLCreateRequest(instance_name=f"AutoResearch-{project_id}-fresh")
             )
             fresh_snapshot = await autodl.wait_running(fresh.instance_uuid)
             fresh_ssh = extract_ssh(fresh_snapshot)
             if not fresh_ssh:
-                raise AutoDLError("全新实例响应中没有可识别的 SSH 信息")
+                raise AutoDLError("The fresh instance response contained no usable SSH details")
             fresh_connection = SSHConnection(**fresh_ssh)
             if await asyncio.to_thread(self._gpu_processes, fresh_connection):
-                raise AutoDLError("全新实例 GPU 仍被占用，已停止以避免无限创建实例")
+                raise AutoDLError("The fresh instance GPU is still busy; stopped to prevent unbounded provisioning")
             return fresh_connection, fresh.instance_uuid
         finally:
             await autodl.close()
@@ -228,7 +246,7 @@ class ExperimentManager:
             status = await asyncio.to_thread(self._status, connection, remote_dir, pid)
             if not status.running:
                 return status
-            self.db.add_event(project_id, "experiment", "远程实验仍在运行")
+            self.db.add_event(project_id, "experiment", "Remote experiment is still running")
             await asyncio.sleep(self.settings.monitor_seconds)
 
     @staticmethod
@@ -248,8 +266,8 @@ class ExperimentManager:
                 f"research/{project_id}",
                 f"feat: update research experiment {project_id}",
             )
-            self.db.add_event(project_id, "github", "实验代码已同步到 GitHub")
+            self.db.add_event(project_id, "github", "Experiment code synced to GitHub")
         except GitSyncError as exc:
             self.db.add_event(
-                project_id, "github", f"GitHub 自动同步失败：{exc}", level="warning"
+                project_id, "github", f"Automatic GitHub sync failed: {exc}", level="warning"
             )

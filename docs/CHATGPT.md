@@ -1,73 +1,79 @@
-# 在 ChatGPT 中使用 AutoResearch
+# Using AutoResearch from ChatGPT
 
-## 分工
+## Responsibilities
 
-- ChatGPT 桌面端：科研讨论、问题拆解、假设判断、方案取舍、结果分析。
-- AutoResearch：项目持久化、文献与代码检索、代码落盘、OpenRouter 代码生成、AutoDL 实例和远程实验、状态与结果展示。
-- OpenRouter：只在调用 `generate_experiment_code` 或使用网页中的全自动模式时使用。
+- ChatGPT desktop: research discussion, problem decomposition, hypothesis evaluation, design choices, and result analysis.
+- AutoResearch: project persistence, paper and code search, artifact writes, delegated OpenRouter code generation, AutoDL instances and remote experiments, and status/result display.
+- OpenRouter: used only by `generate_experiment_code` and autonomous web workflows.
 
-这套方式不会把 ChatGPT 对话改成 OpenAI API 请求，也不需要在 AutoResearch 中填写 OpenAI API Key。
+This workflow does not convert the ChatGPT conversation into OpenAI API requests, and AutoResearch needs no OpenAI API key.
 
-## 一次性连接
+## One-time connection
 
-1. 双击项目根目录的 `start.cmd`，确认网页显示“本地服务与 ChatGPT 工具已就绪”。
-2. 点击首页“首次配置连接”，或双击根目录的 `setup-chatgpt.cmd`。向导会检查本机服务并打开 [OpenAI Platform 的 tunnel settings](https://platform.openai.com/settings/organization/tunnels)。
-3. 在登录账号中创建 Secure MCP Tunnel，取得 `tunnel_id` 与运行时 API key，并从 Platform 页面下载 Windows 版 `tunnel-client.exe`。这三项属于账号权限操作，不能由本地软件代替。
-4. 回到向导，输入下载文件路径、`tunnel_id` 和运行时 API key。向导会自动执行以下 HTTP MCP 配置，并运行 `doctor`：
+1. Run `start.cmd` from the repository root and confirm that the web page reports the local service and ChatGPT tools as ready.
+2. Select **Set up connection** on the home page, or run `setup-chatgpt.cmd`. The assistant checks the local service and opens [OpenAI Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels).
+3. In the signed-in account, create a Secure MCP Tunnel, obtain the `tunnel_id` and runtime API key, and download `tunnel-client.exe` for Windows. These are account-level operations and cannot be performed by the local app.
+4. Return to the assistant and enter the downloaded file path, `tunnel_id`, and runtime API key. It configures the HTTP MCP endpoint and runs `doctor`:
 
    ```text
    --mcp-server-url http://127.0.0.1:8765/mcp
    ```
 
-5. 运行时 API key 会通过 Windows DPAPI 加密保存到当前 Windows 用户的本地应用配置目录；原始 key 不会写入本项目、`.env` 或 Git。
-6. 在 ChatGPT 打开“设置 → Security and login”，启用 Developer mode。开发者模式是否可用取决于账号和工作区策略。
-7. 前往 [ChatGPT Plugins](https://chatgpt.com/plugins)，点击加号，连接方式选择 Tunnel，再选择或填写 `tunnel_id`，创建 AutoResearch 连接。
-8. 新建 ChatGPT 对话，从工具菜单启用 AutoResearch 连接。
-9. 以后双击 `start-chatgpt.cmd`；它会检查并启动 AutoResearch，再保持 Tunnel 运行。不要在使用期间关闭这个窗口。
+5. The runtime API key is encrypted with Windows DPAPI for the current Windows user. Plaintext is never written to this project, `.env`, or Git.
+6. In ChatGPT, open **Settings → Security and login** and enable Developer mode. Availability depends on account and workspace policy.
+7. Open [ChatGPT Plugins](https://chatgpt.com/plugins), select the plus button, choose Tunnel, select or enter the `tunnel_id`, and create the AutoResearch connection.
+8. Start a new ChatGPT conversation and enable AutoResearch from the tools menu.
+9. On later runs, start `start-chatgpt.cmd`. It checks and starts AutoResearch, then keeps Tunnel running. Leave that window open while using ChatGPT.
 
-也可以在 AutoResearch 首页或“设置与连接”窗口里直接启动首次配置向导和日常连接窗口。网页每 5 秒更新 Tunnel 状态。
+The same setup and connection actions are available from the AutoResearch home page and settings dialog. The page refreshes Tunnel status every five seconds.
 
-本机 MCP 服务地址仍是 `http://127.0.0.1:8765/mcp`。这个地址可用于 MCP Inspector 本地检查，但不能直接填入 ChatGPT 的公网 URL 连接框。
+The local endpoint remains `http://127.0.0.1:8765/mcp`. It works with MCP Inspector for local checks but cannot be entered directly as a public ChatGPT connector URL.
 
-官方参考：[Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)、[连接并测试插件](https://developers.openai.com/plugins/deploy/connect-chatgpt)。
+Official references: [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) and [Connect and test a plugin](https://developers.openai.com/plugins/deploy/connect-chatgpt).
 
-## 建议的对话流程
+## Suggested conversation flow
 
-可以在 ChatGPT 中直接说：
+Initial request:
 
-> 我们研究“小样本医学图像分割中的不确定性采样”。你负责科研思考；请创建 AutoResearch 协作项目，把关键研究计划保存进去。需要实验代码时委托 AutoResearch 的 OpenRouter 模型生成，先不要创建 AutoDL 实例。
+> We are studying uncertainty sampling for few-shot medical image segmentation. Handle the scientific reasoning, create an AutoResearch collaboration project, and save the key research plan. Delegate experiment code to AutoResearch's OpenRouter model when needed, but do not provision an AutoDL instance yet.
 
-代码生成后：
+After code generation:
 
-> 读取项目状态和实验清单，说明即将执行的代码与命令。得到我确认后，再创建 AutoDL 实例并启动实验。
+> Read the project state and experiment manifest, then explain the code and command to be executed. After I confirm them, provision an AutoDL instance and start the experiment.
 
-实验完成后：
+After completion:
 
-> 读取实验指标和日志，分析失败原因、可信结论与下一轮变量控制，并把分析保存回 AutoResearch。
+> Read the experiment metrics and logs. Analyze failure causes, supported conclusions, and controls for the next iteration, then save the analysis to AutoResearch.
 
-## 工具清单
+## Tool reference
 
-| 工具 | 用途 | 外部副作用 |
+| Tool | Purpose | External side effects |
 |---|---|---|
-| `list_research_projects` | 列出项目和网页地址 | 无 |
-| `create_research_project` | 创建 ChatGPT 协作项目 | 本地写入 |
-| `get_research_status` | 读取状态、事件、来源、产物和实验 | 无 |
-| `read_project_artifact` | 读取非敏感文本产物 | 无 |
-| `save_research_note` | 保存 ChatGPT 的研究计划或阶段结论 | 本地写入 |
-| `search_research_sources` | 跨论文数据库和 GitHub 检索并保存来源 | 网络请求、本地写入 |
-| `save_experiment_code` | 保存 ChatGPT 已生成的完整代码文件 | 本地写入 |
-| `generate_experiment_code` | 调用 AutoResearch 的 OpenRouter 模型生成并保存代码 | 模型 API 请求、本地写入 |
-| `create_autodl_instance` | 创建计费 AutoDL Pro 实例 | 可能立即计费，必须确认 |
-| `get_autodl_instance_status` | 检查实例和 SSH 是否就绪，不返回凭据 | AutoDL 只读请求 |
-| `start_autodl_experiment` | 内部取得 SSH、上传代码并运行命令 | 远程执行，必须确认 |
-| `get_experiment_result` | 读取状态、退出码、指标和日志末尾 | 无 |
-| `record_chatgpt_analysis` | 保存 ChatGPT 的结果分析和建议 | 本地写入 |
+| `list_research_projects` | List projects and dashboard links | None |
+| `create_research_project` | Create a ChatGPT collaboration project | Local write |
+| `get_research_status` | Read state, events, sources, artifacts, and experiments | None |
+| `read_project_artifact` | Read a nonsensitive text artifact | None |
+| `save_research_note` | Save a ChatGPT research plan or conclusion | Local write |
+| `search_research_sources` | Search paper databases and GitHub, then persist sources | Network requests and local writes |
+| `save_experiment_code` | Store complete code files written by ChatGPT | Local write |
+| `generate_experiment_code` | Use the AutoResearch OpenRouter model to generate and store code | Model API request and local writes |
+| `check_autodl_readiness` | Check token, image, and GPU settings; optionally authenticate read-only | Local read by default; network read when `verify_api` is set; never provisions |
+| `check_experiment_readiness` | Check entry points, data paths, and metric declarations | Local read only; never executes |
+| `create_autodl_instance` | Provision a billable AutoDL Pro instance | May bill immediately; requires confirmation |
+| `get_autodl_instance_status` | Check instance and SSH readiness without returning credentials | Read-only AutoDL request |
+| `start_autodl_experiment` | Retrieve SSH internally, upload code, and execute a command | Remote execution; requires confirmation |
+| `get_experiment_result` | Read status, exit code, metrics, and log tail | None |
+| `record_chatgpt_analysis` | Save ChatGPT result analysis and recommendations | Local write |
 
-## 安全说明
+## Safety notes
 
-- 不要在 ChatGPT 对话中粘贴 OpenRouter Key、AutoDL Token 或 SSH 密码。
-- ChatGPT 工具拿不到这些密钥；AutoResearch 只从本机 `.env` 读取。
-- 创建 AutoDL 必须在当前对话明确确认费用，远程执行必须先审阅代码和命令并再次确认。
-- Secure MCP Tunnel 的运行时 API key 应只配置在 `tunnel-client` 的安全运行环境中，不要写进本项目或聊天。
-- 配置向导只在进程环境中把解密后的 key 提供给 `tunnel-client`；磁盘上的副本由 Windows 当前用户 DPAPI 保护。
-- AutoResearch 网页和 MCP 服务默认只监听 `127.0.0.1`。不要改成 `0.0.0.0`，除非已经配置认证与防火墙。
+- Code paths passed to `save_experiment_code` are relative to the project's `generated/` directory, such as `tidyvoice/wespeaker/models/example.py`; do not prefix them with `generated/`. The complete bundle is validated before any write, so invalid paths, conflicts, or oversized content cannot cause partial replacement.
+- A saved code package has not necessarily been executed. After `check_autodl_readiness`, still verify data, weights, dependencies, and the experiment entry point.
+- Connection status checks process existence and Tunnel health/readiness separately. A running process is not reported as connected until readiness passes. Windows process probes do not send termination signals.
+- If provisioning times out or returns an invalid response, inspect the AutoDL instance list first. AutoResearch does not automatically retry with another GPU when creation status is uncertain.
+- Do not paste OpenRouter keys, AutoDL tokens, or SSH passwords into ChatGPT conversations.
+- ChatGPT tools cannot retrieve these secrets; AutoResearch reads them from local `.env` configuration.
+- AutoDL provisioning requires explicit cost approval in the current conversation. Remote execution requires review of the code and command followed by explicit approval.
+- Keep the Secure MCP Tunnel runtime key only in the secure `tunnel-client` environment, never in this repository or a chat.
+- The setup assistant passes the decrypted key to `tunnel-client` only through process environment. The stored copy is protected by Windows DPAPI for the current user.
+- AutoResearch listens on `127.0.0.1` by default. Do not bind to `0.0.0.0` without authentication and firewall controls.

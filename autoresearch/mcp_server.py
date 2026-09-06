@@ -54,22 +54,24 @@ REMOTE_EXECUTION = ToolAnnotations(
 def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
     server = MCPServer(
         name="autoresearch-local",
-        title="AutoResearch 科研执行器",
-        description="为 ChatGPT 保存科研代码、检索资源、调用 AutoDL 并返回实验状态与结果。",
+        title="AutoResearch Experiment Executor",
+        description="Stores research code, retrieves sources, invokes AutoDL, and returns experiment status and results for ChatGPT.",
         version="0.2.0",
         instructions=(
-            "ChatGPT 负责科研推理和结果分析，AutoResearch 负责持久化与执行。"
-            "先 list_research_projects 或 create_research_project，再用项目 ID 调用其他工具。"
-            "ChatGPT 已写好代码时调用 save_experiment_code；要委托 AutoResearch/OpenRouter 实现时调用 generate_experiment_code。"
-            "调用 AutoDL 计费或远程执行前必须取得用户明确确认并把 confirm 参数设为 true；"
-            "不要在对话中索要或回显 AutoDL Token、SSH 密码或 OpenRouter Key。"
+            "ChatGPT owns research reasoning and result analysis; AutoResearch handles persistence and execution. "
+            "Call list_research_projects or create_research_project first, then reuse the project ID with other tools. "
+            "Call save_experiment_code when ChatGPT has written the code; call generate_experiment_code to delegate implementation to AutoResearch/OpenRouter. "
+            "Before using AutoDL, call check_autodl_readiness; it never creates billable resources. "
+            "Then call check_experiment_readiness to inspect entry points, data, and metric declarations; a passing static check does not validate scientific results. "
+            "Obtain explicit user confirmation and set the relevant confirm parameter to true before billable AutoDL actions or remote execution. "
+            "Never ask for or echo an AutoDL token, SSH password, or OpenRouter key in conversation."
         ),
     )
 
     @server.tool(
         name="list_research_projects",
-        title="列出 AutoResearch 项目",
-        description="列出 AutoResearch 中已有的科研项目、阶段、进度和网页地址。",
+        title="List AutoResearch Projects",
+        description="Lists existing AutoResearch projects, phases, progress, and dashboard URLs.",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -78,10 +80,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="create_research_project",
-        title="创建 ChatGPT 协作研究",
+        title="Create a ChatGPT Collaborative Study",
         description=(
-            "当用户想让当前 ChatGPT 对话负责科研思考、并让 AutoResearch 保存状态和产物时创建项目。"
-            "返回 project_id，后续工具都应复用它。"
+            "Creates a project when the current ChatGPT conversation owns research reasoning and AutoResearch stores state and artifacts. "
+            "Returns a project_id that subsequent tools should reuse."
         ),
         annotations=LOCAL_WRITE,
         structured_output=True,
@@ -91,10 +93,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="get_research_status",
-        title="读取研究状态",
+        title="Get Research Status",
         description=(
-            "读取一个研究项目的阶段、事件、来源、文件清单、实验及结果。"
-            "用于在 ChatGPT 中继续科研分析或向用户汇报。"
+            "Returns a research project's phase, events, sources, artifact inventory, experiments, and results. "
+            "Use it to continue analysis in ChatGPT or report progress to the user."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -103,9 +105,22 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
         return bridge.status(project_id)
 
     @server.tool(
+        name="check_experiment_readiness",
+        title="Check Experiment Inputs and Manifest",
+        description=(
+            "Read-only inspection of the experiment manifest, code entry point, required files, and input paths, including blockers and remote unknowns. "
+            "Does not execute code, inspect remote content, or create instances; passing static checks does not validate scientific results."
+        ),
+        annotations=READ_ONLY,
+        structured_output=True,
+    )
+    def check_experiment_readiness(project_id: str) -> dict[str, Any]:
+        return bridge.experiment_readiness(project_id)
+
+    @server.tool(
         name="read_project_artifact",
-        title="读取研究产物",
-        description="读取项目文件清单中某个文本产物；不能读取 .env、Git 元数据或其他敏感路径。",
+        title="Read a Research Artifact",
+        description="Reads a text artifact from the project inventory. It cannot read .env, Git metadata, or other sensitive paths.",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -114,10 +129,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="save_research_note",
-        title="保存 ChatGPT 研究笔记",
+        title="Save a ChatGPT Research Note",
         description=(
-            "把当前 ChatGPT 对话形成的问题定义、假设、实验计划或阶段结论保存到 AutoResearch，"
-            "并在网页研究进展中显示。"
+            "Saves problem definitions, hypotheses, experiment plans, or interim conclusions from the current ChatGPT conversation in AutoResearch "
+            "and displays them in the research dashboard."
         ),
         annotations=LOCAL_WRITE,
         structured_output=True,
@@ -129,10 +144,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="search_research_sources",
-        title="检索并保存科研资源",
+        title="Search and Save Research Sources",
         description=(
-            "调用 AutoResearch 检索 arXiv、OpenAlex、Semantic Scholar 和 GitHub，"
-            "保存真实来源后交给 ChatGPT 分析。"
+            "Uses AutoResearch to search arXiv, OpenAlex, Semantic Scholar, and GitHub, "
+            "then saves real sources for ChatGPT to analyze."
         ),
         annotations=NETWORK_WRITE,
         structured_output=True,
@@ -154,10 +169,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="save_experiment_code",
-        title="保存 ChatGPT 生成的实验代码",
+        title="Save Experiment Code Generated by ChatGPT",
         description=(
-            "当 ChatGPT 已经写好代码时，将完整文件安全保存到项目 generated 目录。"
-            "files 中每项包含相对 path 和完整 content；可同时保存 experiment_manifest。"
+            "Safely saves complete files written by ChatGPT under the project's generated directory. "
+            "Each files item contains a relative path and complete content; experiment_manifest can be saved at the same time."
         ),
         annotations=LOCAL_WRITE,
         structured_output=True,
@@ -179,10 +194,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="generate_experiment_code",
-        title="委托 AutoResearch 大模型生成代码",
+        title="Delegate Code Generation to the AutoResearch Model",
         description=(
-            "只在用户希望使用 AutoResearch 配置的 OpenRouter 大模型实现实验代码时调用。"
-            "ChatGPT 保留科研推理责任，AutoResearch 模型根据已保存上下文生成并落盘代码。"
+            "Use only when the user wants the OpenRouter model configured in AutoResearch to implement experiment code. "
+            "ChatGPT retains responsibility for research reasoning while the AutoResearch model generates and saves code from the stored context."
         ),
         annotations=NETWORK_WRITE,
         structured_output=True,
@@ -195,11 +210,30 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
         )
 
     @server.tool(
-        name="create_autodl_instance",
-        title="创建 AutoDL 计费实例",
+        name="check_autodl_readiness",
+        title="Check AutoDL Experiment Readiness",
         description=(
-            "按设置中的 GPU 优先级创建 AutoDL Pro 实例。此操作可能立即产生费用；"
-            "只有用户在当前对话明确同意费用后才能把 confirm_billable 设为 true。"
+            "Checks token, image, and GPU configuration; verify_api=true also performs read-only API authentication. "
+            "Does not create instances, incur compute charges, or return secrets or instance details. "
+            "configured means local configuration is complete; verified means read-only instance API authentication succeeded and configuration is complete. "
+            "After successful online verification it queries the wallet; balance_verified separately indicates a successful balance lookup. Inventory, image availability, and coupon eligibility remain unknown."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
+        ),
+        structured_output=True,
+    )
+    async def check_autodl_readiness(
+        verify_api: bool = False, image_uuid: str | None = None
+    ) -> dict[str, Any]:
+        return await bridge.autodl_readiness(verify_api=verify_api, image_uuid=image_uuid)
+
+    @server.tool(
+        name="create_autodl_instance",
+        title="Create a Billable AutoDL Instance",
+        description=(
+            "Creates an AutoDL Pro instance according to the configured GPU priority. This action may incur charges immediately. "
+            "Set confirm_billable=true only after the user explicitly accepts the cost in the current conversation."
         ),
         annotations=BILLABLE_WRITE,
         structured_output=True,
@@ -227,10 +261,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="get_autodl_instance_status",
-        title="读取 AutoDL 实例状态",
+        title="Get AutoDL Instance Status",
         description=(
-            "检查 AutoDL 实例是否已经运行及 SSH 是否就绪，不返回主机密码或 Token。"
-            "创建实例后可重复读取，ssh_ready 为 true 时再启动实验。"
+            "Checks whether an AutoDL instance is running and SSH is ready without returning the host password or token. "
+            "Poll after creation and start the experiment only when ssh_ready is true."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=True,
@@ -245,10 +279,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="start_autodl_experiment",
-        title="在 AutoDL 上启动实验",
+        title="Start an Experiment on AutoDL",
         description=(
-            "从 AutoDL API 内部取得 SSH 连接并上传 generated 代码执行命令；密钥和密码不会返回 ChatGPT。"
-            "只有用户已审阅代码与命令并在当前对话明确同意执行后，才能把 confirm_execute 设为 true。"
+            "Obtains SSH details internally from the AutoDL API, uploads generated code, and runs the command; secrets and passwords are never returned to ChatGPT. "
+            "Set confirm_execute=true only after the user has reviewed the code and command and explicitly approved execution in the current conversation."
         ),
         annotations=REMOTE_EXECUTION,
         structured_output=True,
@@ -278,10 +312,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="get_experiment_result",
-        title="读取 AutoDL 实验结果",
+        title="Get AutoDL Experiment Results",
         description=(
-            "读取实验状态、退出码、指标和日志末尾。实验进行中可重复调用；"
-            "完成后由 ChatGPT 分析，而不是再次调用 AutoResearch 模型。"
+            "Returns experiment status, exit code, metrics, and the log tail. It can be called repeatedly while an experiment runs. "
+            "After completion, ChatGPT analyzes the results instead of invoking the AutoResearch model again."
         ),
         annotations=READ_ONLY,
         structured_output=True,
@@ -291,10 +325,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="record_chatgpt_analysis",
-        title="保存 ChatGPT 实验分析",
+        title="Save ChatGPT Experiment Analysis",
         description=(
-            "将 ChatGPT 对指标、日志、失败原因和下一步建议的分析保存为项目报告，"
-            "并在 AutoResearch 网页显示分析已完成。"
+            "Saves ChatGPT's analysis of metrics, logs, failure causes, and next steps as a project report "
+            "and marks the analysis as complete in the AutoResearch dashboard."
         ),
         annotations=LOCAL_WRITE,
         structured_output=True,

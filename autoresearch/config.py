@@ -31,7 +31,7 @@ class Settings:
     openrouter_site_url: str = "http://127.0.0.1:8765"
     autodl_token: str = ""
     autodl_image_uuid: str = ""
-    autodl_gpu_specs: tuple[str, ...] = ("v-48g", "5090")
+    autodl_gpu_specs: tuple[str, ...] = ("v-48g", "5090-p")
     autodl_cuda_from: int = 118
     github_remote_url: str = ""
     github_default_branch: str = "main"
@@ -58,7 +58,7 @@ class Settings:
 
         specs = tuple(
             item.strip()
-            for item in value("AUTODL_GPU_SPECS", "v-48g,5090").split(",")
+            for item in value("AUTODL_GPU_SPECS", "v-48g,5090-p").split(",")
             if item.strip()
         )
         settings = cls(
@@ -70,7 +70,7 @@ class Settings:
             openrouter_site_url=value("OPENROUTER_SITE_URL", "http://127.0.0.1:8765"),
             autodl_token=value("AUTODL_TOKEN"),
             autodl_image_uuid=value("AUTODL_IMAGE_UUID"),
-            autodl_gpu_specs=specs or ("v-48g", "5090"),
+            autodl_gpu_specs=specs or ("v-48g", "5090-p"),
             autodl_cuda_from=_as_int(value("AUTODL_CUDA_FROM") or None, 118),
             github_remote_url=value("GITHUB_REMOTE_URL"),
             github_default_branch=value("GITHUB_DEFAULT_BRANCH", "main"),

@@ -37,7 +37,7 @@ class OpenRouterClient:
 
     def _headers(self) -> dict[str, str]:
         if not self.settings.openrouter_api_key:
-            raise LLMError("尚未配置 OpenRouter API Key")
+            raise LLMError("OpenRouter API key is not configured")
         return {
             "Authorization": f"Bearer {self.settings.openrouter_api_key}",
             "Content-Type": "application/json",
@@ -91,13 +91,13 @@ class OpenRouterClient:
                 response.raise_for_status()
                 content = response.json()["choices"][0]["message"]["content"]
                 if not content:
-                    raise LLMError("模型返回了空内容")
+                    raise LLMError("The model returned empty content")
                 return str(content)
             except (httpx.HTTPError, KeyError, IndexError, LLMError) as exc:
                 last_error = exc
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
-        raise LLMError(f"OpenRouter 请求失败：{last_error}")
+        raise LLMError(f"OpenRouter request failed: {last_error}")
 
     async def chat_json(
         self,
@@ -123,8 +123,7 @@ def extract_json_object(content: str) -> dict[str, Any]:
     try:
         value = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise LLMError(f"模型没有返回有效 JSON：{exc}") from exc
+        raise LLMError(f"The model did not return valid JSON: {exc}") from exc
     if not isinstance(value, dict):
-        raise LLMError("模型 JSON 顶层必须是对象")
+        raise LLMError("The top level of model JSON must be an object")
     return value
-

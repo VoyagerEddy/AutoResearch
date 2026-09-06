@@ -23,6 +23,75 @@ $McpServerUrl = "http://127.0.0.1:8765/mcp"
 $PlatformUrl = "https://platform.openai.com/settings/organization/tunnels"
 $ChatGPTPluginsUrl = "https://chatgpt.com/plugins"
 
+function Write-Utf8NoBom {
+    param(
+        [string]$Path,
+        [string]$Value
+    )
+
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($Path, $Value, $utf8)
+}
+
+function Enable-WindowsUserProxy {
+    if (
+        -not [string]::IsNullOrWhiteSpace($env:HTTPS_PROXY) -or
+        -not [string]::IsNullOrWhiteSpace($env:HTTP_PROXY) -or
+        -not [string]::IsNullOrWhiteSpace($env:ALL_PROXY)
+    ) {
+        return
+    }
+
+    try {
+        $internetSettings = Get-ItemProperty `
+            -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" `
+            -Name ProxyEnable, ProxyServer `
+            -ErrorAction Stop
+    }
+    catch {
+        return
+    }
+    if ($internetSettings.ProxyEnable -ne 1) { return }
+
+    $proxyServer = [string]$internetSettings.ProxyServer
+    if ([string]::IsNullOrWhiteSpace($proxyServer)) { return }
+
+    $httpProxy = ""
+    $httpsProxy = ""
+    if ($proxyServer.Contains("=")) {
+        foreach ($entry in $proxyServer.Split(";")) {
+            $parts = $entry.Split("=", 2)
+            if ($parts.Count -ne 2) { continue }
+            switch ($parts[0].Trim().ToLowerInvariant()) {
+                "http" { $httpProxy = $parts[1].Trim() }
+                "https" { $httpsProxy = $parts[1].Trim() }
+            }
+        }
+    }
+    else {
+        $httpProxy = $proxyServer.Trim()
+        $httpsProxy = $proxyServer.Trim()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($httpsProxy)) { $httpsProxy = $httpProxy }
+    if ([string]::IsNullOrWhiteSpace($httpProxy)) { $httpProxy = $httpsProxy }
+    if ([string]::IsNullOrWhiteSpace($httpsProxy)) { return }
+
+    if ($httpsProxy -notmatch '^[a-z][a-z0-9+.-]*://') {
+        $httpsProxy = "http://$httpsProxy"
+    }
+    if ($httpProxy -notmatch '^[a-z][a-z0-9+.-]*://') {
+        $httpProxy = "http://$httpProxy"
+    }
+
+    $env:HTTPS_PROXY = $httpsProxy
+    $env:HTTP_PROXY = $httpProxy
+    $noProxyEntries = @($env:NO_PROXY, "127.0.0.1", "localhost") |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $env:NO_PROXY = ($noProxyEntries -join ",")
+    Write-Host "Using the current Windows user proxy for tunnel-client."
+}
+
 function Find-TunnelClient {
     param([string]$PreferredPath)
 
@@ -76,6 +145,7 @@ function Invoke-TunnelClient {
         [string[]]$Arguments
     )
 
+    Enable-WindowsUserProxy
     $previousKey = [Environment]::GetEnvironmentVariable("CONTROL_PLANE_API_KEY", "Process")
     $plainKey = Convert-ToPlainText $SecureApiKey
     try {
@@ -119,7 +189,11 @@ function Read-SavedApiKey {
         throw "The encrypted runtime API key is missing. Run setup-chatgpt.cmd first."
     }
     try {
-        return Get-Content -Raw -LiteralPath $SecretPath | ConvertTo-SecureString
+        $protectedValue = (Get-Content -Raw -LiteralPath $SecretPath).Trim()
+        if ([string]::IsNullOrWhiteSpace($protectedValue)) {
+            throw "Encrypted runtime API key file is empty."
+        }
+        return $protectedValue | ConvertTo-SecureString
     }
     catch {
         throw "The runtime API key cannot be decrypted by this Windows user. Run setup-chatgpt.cmd again."
@@ -140,11 +214,12 @@ function Invoke-Run {
 
     Ensure-LocalMcp
     New-Item -ItemType Directory -Path $StateDirectory -Force | Out-Null
-    @{
+    $runtimeState = @{
         pid = $PID
         profile = $Config.profile
         started_at = (Get-Date).ToUniversalTime().ToString("o")
-    } | ConvertTo-Json | Set-Content -LiteralPath $RuntimePath -Encoding UTF8
+    } | ConvertTo-Json
+    Write-Utf8NoBom -Path $RuntimePath -Value $runtimeState
 
     Write-Host ""
     Write-Host "AutoResearch MCP: $McpServerUrl"
@@ -217,14 +292,16 @@ if ($Action -eq "Setup") {
         "--mcp-server-url", $McpServerUrl
     )
 
-    $secureApiKey | ConvertFrom-SecureString | Set-Content -LiteralPath $SecretPath -Encoding UTF8
-    @{
+    $protectedApiKey = $secureApiKey | ConvertFrom-SecureString
+    Write-Utf8NoBom -Path $SecretPath -Value $protectedApiKey
+    $savedConfig = @{
         profile = $Profile
         tunnel_id = $TunnelId
         tunnel_client = $client
         mcp_server_url = $McpServerUrl
         configured_at = (Get-Date).ToUniversalTime().ToString("o")
-    } | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    } | ConvertTo-Json
+    Write-Utf8NoBom -Path $ConfigPath -Value $savedConfig
 
     $config = Read-TunnelConfig
     Invoke-Doctor -Config $config -SecureApiKey $secureApiKey

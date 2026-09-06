@@ -1,9 +1,9 @@
-const state = { projects: [], current: null, settings: null, connection: null, poller: null, connectionPoller: null, experimentId: null };
+const state = { projects: [], current: null, settings: null, connection: null, autodl: null, instanceCreating: false, creationUncertain: false, poller: null, connectionPoller: null, experimentId: null };
 const phaseLabels = {
-  queued: "排队中", planning: "问题规划", searching: "资源检索", synthesizing: "算法形成",
-  generating: "代码生成", ready: "实验就绪", experiment: "远程实验", analyzing: "结果分析",
-  completed: "已完成", failed: "失败", experiment_failed: "实验失败",
-  chatgpt_thinking: "ChatGPT 思考中", chatgpt_analysis: "ChatGPT 已分析"
+  queued: "Queued", planning: "Planning", searching: "Source Search", synthesizing: "Method Design",
+  generating: "Code Generation", ready: "Code Saved", experiment: "Remote Experiment", analyzing: "Result Analysis",
+  completed: "Completed", failed: "Failed", experiment_failed: "Experiment Failed",
+  chatgpt_thinking: "ChatGPT Reasoning", chatgpt_analysis: "ChatGPT Analysis Complete"
 };
 
 const $ = (id) => document.getElementById(id);
@@ -20,11 +20,19 @@ async function api(path, options = {}) {
     });
     let data = null;
     try { data = await response.json(); } catch (_) { data = {}; }
-    if (!response.ok) throw new Error(data.detail || `请求失败 (${response.status})`);
+    if (!response.ok) {
+      const detail = data.detail;
+      const error = new Error(typeof detail === "string" ? detail : (detail?.message || `Request failed (${response.status})`));
+      error.code = detail?.code;
+      throw error;
+    }
     return data;
   } catch (error) {
-    if (error.name === "AbortError") throw new Error("本地服务响应超时，请确认启动窗口仍在运行");
-    if (error instanceof TypeError) throw new Error("无法连接本地服务，请重新运行 start.cmd");
+    if (error.name === "AbortError" || error instanceof TypeError) {
+      const connectionError = new Error(error.name === "AbortError" ? "The local service timed out. Make sure the startup window is still running." : "Could not connect to the local service. Run start.cmd again.");
+      connectionError.code = "connection_uncertain";
+      throw connectionError;
+    }
     throw error;
   } finally { clearTimeout(timeout); }
 }
@@ -46,20 +54,21 @@ async function bootstrap() {
   try {
     const health = await api("/api/health");
     $("healthDot").classList.add("ok");
-    $("healthText").textContent = "本地服务与 ChatGPT 工具已就绪";
+    $("healthText").textContent = "Local service and ChatGPT tools are ready";
     $("mcpEndpoint").textContent = health.mcp_endpoint;
     [state.settings, state.connection] = await Promise.all([
       api("/api/settings"), api("/api/chatgpt/connection")
     ]);
     applySettings();
     renderConnection();
+    await refreshAutoDL();
     clearInterval(state.connectionPoller);
     state.connectionPoller = setInterval(refreshConnection, 5000);
     await loadProjects();
     const requested = new URLSearchParams(location.search).get("project");
     if (requested && state.projects.some((project) => project.id === requested)) await selectProject(requested);
   } catch (error) {
-    $("healthText").textContent = "本地服务不可用";
+    $("healthText").textContent = "Local service unavailable";
     toast(error.message, true);
   }
 }
@@ -71,15 +80,42 @@ function renderConnection() {
     node.classList.toggle("ready", Boolean(ready));
     node.textContent = `${ready ? "✓" : "○"} ${ready ? readyText : waitingText}`;
   };
-  setStep("tunnelInstallStatus", c.tunnel_client_installed, "tunnel-client 已安装", "tunnel-client 未安装");
-  setStep("tunnelConfigStatus", c.tunnel_configured, `Tunnel 已配置 ${c.tunnel_id_hint || ""}`, "Tunnel 待配置");
-  setStep("tunnelRunStatus", c.tunnel_running, "Tunnel 正在运行", "Tunnel 未运行");
+  setStep("tunnelInstallStatus", c.tunnel_client_installed, "tunnel-client installed", "tunnel-client not installed");
+  setStep("tunnelConfigStatus", c.tunnel_configured, `Tunnel configured ${c.tunnel_id_hint || ""}`, "Tunnel not configured");
+  setStep("tunnelRunStatus", c.tunnel_ready, "Tunnel ready", c.tunnel_process_running ? "Tunnel process running; connection not ready" : "Tunnel not running");
   $("startChatgpt").disabled = !c.tunnel_configured;
   $("settingsStartChatgpt").disabled = !c.tunnel_configured;
-  $("setupChatgpt").textContent = c.tunnel_configured ? "重新配置连接" : "首次配置连接";
-  $("settingsTunnelStatus").textContent = c.tunnel_running
-    ? "Tunnel 已连接，可在 ChatGPT 中使用"
-    : (c.tunnel_configured ? "配置已保存，Tunnel 当前未运行" : "尚未完成首次配置");
+  $("setupChatgpt").textContent = c.tunnel_configured ? "Reconfigure Connection" : "Set Up Connection";
+  $("settingsTunnelStatus").textContent = c.tunnel_ready
+    ? "Tunnel connected and available in ChatGPT"
+    : (c.tunnel_process_running ? "Process started; waiting for the Tunnel connection" : (c.tunnel_configured ? "Configuration saved; Tunnel is not running" : "Initial setup is incomplete"));
+}
+
+async function refreshAutoDL(verifyApi = false) {
+  const button = $("checkAutoDL");
+  button.disabled = true;
+  try {
+    state.autodl = await api(`/api/autodl/preflight?verify_api=${verifyApi}`, { timeoutMs: 45000 });
+    const result = state.autodl;
+    const headline = result.ready
+      ? (result.verified ? "AutoDL API connected; balance and GPU inventory are not yet verified." : "Required AutoDL settings are saved; API, balance, and GPU inventory are not yet verified.")
+      : `Cannot create an instance yet: ${result.blocking_issues.map((issue) => issue.message).join("; ")}`;
+    const messages = [headline, ...result.warnings.map((warning) => warning.message)].join("\n");
+    for (const id of ["autodlReadiness", "settingsAutoDLStatus"]) {
+      $(id).textContent = messages;
+      $(id).className = `form-status${result.ready ? "" : " error"}`;
+    }
+    $("createInstance").disabled = !result.ready || state.instanceCreating || state.creationUncertain;
+    return result;
+  } catch (error) {
+    state.autodl = null;
+    $("createInstance").disabled = true;
+    for (const id of ["autodlReadiness", "settingsAutoDLStatus"]) {
+      $(id).textContent = `Could not check AutoDL: ${error.message}`;
+      $(id).className = "form-status error";
+    }
+    return null;
+  } finally { button.disabled = false; }
 }
 
 async function refreshConnection() {
@@ -92,15 +128,15 @@ async function launchChatgptConnection(action) {
     await api("/api/chatgpt/connection/launch", {
       method: "POST", body: JSON.stringify({ action, confirm_launch: true })
     });
-    toast(action === "Setup" ? "首次配置向导已打开" : "ChatGPT 连接窗口已打开");
+    toast(action === "Setup" ? "Connection setup wizard opened" : "ChatGPT connection window opened");
     setTimeout(refreshConnection, 1500);
   } catch (error) { toast(error.message, true); }
 }
 
 function applySettings() {
   const s = state.settings || {};
-  $("gpuOrder").textContent = (s.autodl_gpu_specs || ["v-48g", "5090"]).join(" → ");
-  $("monitorPolicy").textContent = `每 ${s.monitor_seconds || 30} 秒 · 最多 ${s.max_iterations || 3} 轮`;
+  $("gpuOrder").textContent = (s.autodl_gpu_specs || ["v-48g", "5090-p"]).join(" → ");
+  $("monitorPolicy").textContent = `Every ${s.monitor_seconds || 30}s · Up to ${s.max_iterations || 3} rounds`;
   $("settingModel").value = s.openrouter_model || "openrouter/free";
   $("settingImageUuid").value = s.autodl_image_uuid || "";
   $("settingGpuSpecs").value = (s.autodl_gpu_specs || []).join(",");
@@ -113,9 +149,9 @@ function updateWorkflowMode() {
   $("researchForm").classList.toggle("collaborative", collaborative);
   document.querySelectorAll(".autonomous-option").forEach((node) => node.classList.toggle("hidden", collaborative));
   $("modelHint").textContent = collaborative
-    ? "ChatGPT 负责推理；AutoResearch 等待工具调用"
-    : (state.settings?.openrouter_configured ? `OpenRouter · ${state.settings.openrouter_model}` : "未配置 Key 时将生成离线基线");
-  $("startResearch").innerHTML = collaborative ? "创建协作项目 <b>→</b>" : "开始全自动研究 <b>→</b>";
+    ? "ChatGPT handles reasoning; AutoResearch waits for tool calls"
+    : (state.settings?.openrouter_configured ? `OpenRouter · ${state.settings.openrouter_model}` : "An offline baseline will be generated without an API key");
+  $("startResearch").innerHTML = collaborative ? "Create Collaborative Project <b>→</b>" : "Start Autonomous Research <b>→</b>";
 }
 
 async function loadProjects() {
@@ -142,13 +178,13 @@ async function selectProject(id) {
   state.experimentId = null;
   $("createView").classList.add("hidden");
   $("projectView").classList.remove("hidden");
-  $("pageTitle").textContent = "研究工作台";
+  $("pageTitle").textContent = "Research Workspace";
   $("openCode").disabled = false;
   $("syncGit").disabled = state.current.status !== "ready";
   history.replaceState(null, "", `?project=${encodeURIComponent(id)}`);
   renderProject();
   renderProjectList();
-  await Promise.all([loadEvents(), loadSources(), loadManifest(), loadExperiments()]);
+  await Promise.all([loadEvents(), loadSources(), loadManifest(), loadExperiments(), loadExperimentReadiness()]);
   beginPolling();
 }
 
@@ -157,7 +193,7 @@ function renderProject() {
   if (!p) return;
   $("projectTopic").textContent = p.topic;
   $("projectId").textContent = p.id;
-  $("projectSummary").textContent = p.error || p.summary || "研究代理正在工作，产物会持续保存到本地工作区。";
+  $("projectSummary").textContent = p.error || p.summary || "The research agent is working and continuously saving artifacts to the local workspace.";
   $("statusBadge").textContent = phaseLabels[p.phase] || p.phase;
   $("statusBadge").className = `status-badge${p.status === "failed" ? " failed" : ""}`;
   $("progressText").textContent = `${p.progress}%`;
@@ -179,7 +215,7 @@ async function loadEvents() {
   if (!state.current) return;
   const events = await api(`/api/projects/${state.current.id}/events`);
   const list = $("eventList"); list.replaceChildren();
-  if (!events.length) { list.innerHTML = '<div class="empty">等待代理开始工作…</div>'; return; }
+  if (!events.length) { list.innerHTML = '<div class="empty">Waiting for the agent to start…</div>'; return; }
   for (const event of events.slice().reverse()) {
     const row = document.createElement("div"); row.className = `event ${event.level}`;
     const dot = document.createElement("i");
@@ -195,12 +231,12 @@ async function loadSources() {
   const sources = await api(`/api/projects/${state.current.id}/sources`);
   $("sourceCount").textContent = sources.length;
   const list = $("sourceList"); list.replaceChildren();
-  if (!sources.length) { list.innerHTML = '<div class="empty">检索后会在这里显示来源</div>'; return; }
+  if (!sources.length) { list.innerHTML = '<div class="empty">Retrieved sources will appear here</div>'; return; }
   for (const source of sources) {
     const a = document.createElement("a"); a.className = "source";
     if (/^https:\/\//.test(source.url)) { a.href = source.url; a.target = "_blank"; a.rel = "noreferrer"; }
     const meta = document.createElement("div"); meta.className = "meta";
-    meta.textContent = `${source.provider} · ${source.kind === "code" ? "CODE" : (source.year || "PAPER")} · ${source.citation_count || 0} 引用/星标`;
+    meta.textContent = `${source.provider} · ${source.kind === "code" ? "CODE" : (source.year || "PAPER")} · ${source.citation_count || 0} citations/stars`;
     const title = document.createElement("h4"); title.textContent = source.title;
     const desc = document.createElement("p"); desc.textContent = source.abstract || source.url;
     a.append(meta, title, desc); list.append(a);
@@ -208,10 +244,32 @@ async function loadSources() {
 }
 
 async function loadManifest() {
-  if (!state.current || state.current.status !== "ready") return;
+  if (!state.current) return;
   const manifest = await api(`/api/projects/${state.current.id}/manifest`);
-  if (manifest.run_command) $("remoteCommand").value = manifest.run_command;
+  $("remoteCommand").value = manifest.run_command || "";
 }
+
+async function loadExperimentReadiness() {
+  if (!state.current) return;
+  const projectId = state.current.id;
+  $("checkExperimentReadiness").disabled = true;
+  try {
+    const report = await api(`/api/projects/${projectId}/readiness`);
+    if (state.current?.id !== projectId) return;
+    const details = report.blocking_issues.map((item) => `${item.path || item.code}: ${item.message}`);
+    $("experimentReadiness").textContent = report.ready
+      ? "The experiment package passed static checks. Dependencies, GPU behavior, data content, and scientific results still require execution."
+      : `Experiment readiness blocked by ${details.length} item(s):\n${details.join("\n")}`;
+    $("experimentReadiness").className = `form-status${report.ready ? "" : " error"}`;
+  } catch (error) {
+    if (state.current?.id === projectId) {
+      $("experimentReadiness").textContent = `Experiment check unavailable: ${error.message}`;
+      $("experimentReadiness").className = "form-status error";
+    }
+  } finally { $("checkExperimentReadiness").disabled = false; }
+}
+
+$("checkExperimentReadiness").onclick = loadExperimentReadiness;
 
 async function loadExperiments() {
   if (!state.current) return;
@@ -219,22 +277,22 @@ async function loadExperiments() {
   const list = $("experimentResults"); list.replaceChildren();
   if (!experiments.length) {
     state.experimentId = null;
-    list.innerHTML = '<div class="empty compact">实验状态、指标和日志会显示在这里</div>';
-    $("experimentStatus").textContent = "尚未启动";
+    list.innerHTML = '<div class="empty compact">Experiment status, metrics, and logs will appear here</div>';
+    $("experimentStatus").textContent = "Not started";
     return;
   }
   const active = experiments.find((item) => !["completed", "failed"].includes(item.status));
   state.experimentId = active ? active.id : null;
   const newest = experiments[0];
-  const statusLabels = { preparing: "准备中", uploading: "上传中", running: "运行中", analyzing: "等待分析", completed: "已完成", failed: "失败" };
+  const statusLabels = { preparing: "Preparing", uploading: "Uploading", running: "Running", analyzing: "Awaiting analysis", completed: "Completed", failed: "Failed" };
   $("experimentStatus").textContent = `${statusLabels[newest.status] || newest.status} · ${newest.id}`;
   for (const experiment of experiments) {
     const card = document.createElement("article"); card.className = `experiment-result ${experiment.status}`;
     const head = document.createElement("div"); head.className = "result-head";
-    const title = document.createElement("strong"); title.textContent = `实验 ${experiment.id}`;
+    const title = document.createElement("strong"); title.textContent = `Experiment ${experiment.id}`;
     const badge = document.createElement("span"); badge.textContent = statusLabels[experiment.status] || experiment.status;
     head.append(title, badge);
-    const meta = document.createElement("p"); meta.textContent = `第 ${experiment.iteration} 轮 · ${experiment.command}`;
+    const meta = document.createElement("p"); meta.textContent = `Round ${experiment.iteration} · ${experiment.command}`;
     card.append(head, meta);
     const result = experiment.result || {};
     if (Object.keys(result.metrics || {}).length) {
@@ -244,14 +302,14 @@ async function loadExperiments() {
     if (experiment.error) { const error = document.createElement("p"); error.className = "result-error"; error.textContent = experiment.error; card.append(error); }
     if (result.log_tail) {
       const details = document.createElement("details");
-      const summary = document.createElement("summary"); summary.textContent = "查看日志末尾";
+      const summary = document.createElement("summary"); summary.textContent = "View log tail";
       const log = document.createElement("pre"); log.textContent = String(result.log_tail).slice(-5000);
       details.append(summary, log); card.append(details);
     }
     if (["completed", "failed"].includes(experiment.status)) {
       const analyze = document.createElement("button"); analyze.type = "button"; analyze.className = "ghost analyze-result";
-      analyze.textContent = "复制 ChatGPT 分析请求";
-      analyze.onclick = () => copyText(`请调用 AutoResearch 的 get_experiment_result，分析实验 ${experiment.id}，再用 record_chatgpt_analysis 把结论保存到项目 ${experiment.project_id}。`, "分析请求已复制");
+      analyze.textContent = "Copy ChatGPT Analysis Request";
+      analyze.onclick = () => copyText(`Call AutoResearch get_experiment_result, analyze experiment ${experiment.id}, then use record_chatgpt_analysis to save the conclusions to project ${experiment.project_id}.`, "Analysis request copied");
       card.append(analyze);
     }
     list.append(card);
@@ -274,7 +332,7 @@ function beginPolling() {
 
 $("researchForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const button = event.submitter; button.disabled = true; button.textContent = "正在创建…";
+  const button = event.submitter; button.disabled = true; button.textContent = "Creating…";
   try {
     const collaborative = $("workflowMode").value === "chatgpt";
     const result = collaborative
@@ -285,7 +343,7 @@ $("researchForm").addEventListener("submit", async (event) => {
         })});
     const project = collaborative ? result.project : result;
     await loadProjects(); await selectProject(project.id);
-    if (collaborative) toast(`协作项目 ${project.id} 已创建；在 ChatGPT 中使用这个项目 ID`);
+    if (collaborative) toast(`Collaborative project ${project.id} created. Use this project ID in ChatGPT.`);
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; updateWorkflowMode(); }
 });
@@ -294,34 +352,34 @@ $("newProject").onclick = () => {
   state.current = null; clearInterval(state.poller);
   $("projectView").classList.add("hidden"); $("createView").classList.remove("hidden");
   history.replaceState(null, "", location.pathname);
-  $("pageTitle").textContent = "把一个想法，变成可复现实验";
+  $("pageTitle").textContent = "Turn an Idea into a Reproducible Experiment";
   $("openCode").disabled = true; $("syncGit").disabled = true; renderProjectList();
 };
 
 function copyText(value, message) {
   if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(value).then(() => toast(message)).catch(() => toast("复制失败，请手动选择文本", true));
-  } else { toast("当前浏览器不支持自动复制，请手动选择文本", true); }
+    navigator.clipboard.writeText(value).then(() => toast(message)).catch(() => toast("Copy failed. Select the text manually.", true));
+  } else { toast("This browser does not support automatic copying. Select the text manually.", true); }
 }
 
 $("workflowMode").addEventListener("change", updateWorkflowMode);
-$("copyMcp").onclick = () => copyText($("mcpEndpoint").textContent, "MCP 地址已复制");
-$("copyProjectId").onclick = () => copyText($("projectId").textContent, "项目 ID 已复制");
+$("copyMcp").onclick = () => copyText($("mcpEndpoint").textContent, "MCP address copied");
+$("copyProjectId").onclick = () => copyText($("projectId").textContent, "Project ID copied");
 $("setupChatgpt").onclick = () => launchChatgptConnection("Setup");
 $("startChatgpt").onclick = () => launchChatgptConnection("Run");
 $("settingsSetupChatgpt").onclick = () => launchChatgptConnection("Setup");
 $("settingsStartChatgpt").onclick = () => launchChatgptConnection("Run");
 
 $("openCode").onclick = async () => {
-  try { await api(`/api/projects/${state.current.id}/open`, { method: "POST" }); toast("已发送到 VS Code"); }
+  try { await api(`/api/projects/${state.current.id}/open`, { method: "POST" }); toast("Sent to VS Code"); }
   catch (error) { toast(error.message, true); }
 };
 
 $("syncGit").onclick = async () => {
-  if (!state.settings?.github_remote_url) { $("settingsDialog").showModal(); return toast("请先配置 GitHub 仓库", true); }
+  if (!state.settings?.github_remote_url) { $("settingsDialog").showModal(); return toast("Configure a GitHub repository first", true); }
   try {
     const result = await api("/api/git/sync", { method: "POST", body: JSON.stringify({ project_id: state.current.id }) });
-    toast(result.pushed ? "实验代码已推送到 GitHub" : "代码已提交到本地 Git");
+    toast(result.pushed ? "Experiment code pushed to GitHub" : "Code committed to local Git");
   } catch (error) { toast(error.message, true); }
 };
 
@@ -338,9 +396,9 @@ $("settingsForm").addEventListener("submit", async (event) => {
   const saveButton = $("saveSettings");
   const status = $("settingsStatus");
   saveButton.disabled = true;
-  saveButton.textContent = "保存中…";
+  saveButton.textContent = "Saving…";
   status.className = "form-status";
-  status.textContent = "正在写入本机配置…";
+  status.textContent = "Writing local configuration…";
   const payload = {
     openrouter_model: $("settingModel").value,
     autodl_image_uuid: $("settingImageUuid").value,
@@ -353,8 +411,9 @@ $("settingsForm").addEventListener("submit", async (event) => {
     state.settings = await api("/api/settings", { method: "PATCH", body: JSON.stringify(payload) });
     $("settingOpenRouterKey").value = ""; $("settingAutoDLToken").value = "";
     applySettings();
-    status.textContent = "设置已保存并立即生效。";
-    toast("设置已保存到本机");
+    await refreshAutoDL();
+    status.textContent = "Settings saved and applied immediately.";
+    toast("Settings saved locally");
     setTimeout(() => { if ($("settingsDialog").open) $("settingsDialog").close(); }, 450);
   } catch (error) {
     status.className = "form-status error";
@@ -362,35 +421,59 @@ $("settingsForm").addEventListener("submit", async (event) => {
     toast(error.message, true);
   } finally {
     saveButton.disabled = false;
-    saveButton.textContent = "保存设置";
+    saveButton.textContent = "Save Settings";
   }
 });
 
 $("toggleExperiment").onclick = () => $("experimentForm").classList.toggle("hidden");
 
+$("checkAutoDL").onclick = () => refreshAutoDL(true);
+
 $("createInstance").onclick = async () => {
-  if (!confirm("AutoDL Pro 实例启动后将按量计费。确认创建首选 GPU 实例吗？")) return;
+  if (state.instanceCreating || state.creationUncertain) return;
+  state.instanceCreating = true;
+  $("createInstance").disabled = true;
+  let creationRequested = false;
   try {
-    const result = await api("/api/autodl/instances", { method: "POST", body: JSON.stringify({ confirm_billable: true }) });
+    const readiness = await refreshAutoDL();
+    if (!readiness?.ready) return;
+    if (!confirm("AutoDL Pro instances are billed after startup. Create the preferred GPU instance?")) return;
+    creationRequested = true;
+    const result = await api("/api/autodl/instances", { method: "POST", body: JSON.stringify({ confirm_billable: true }), timeoutMs: 120000 });
+    if (typeof result.instance_uuid !== "string" || !result.instance_uuid) {
+      const error = new Error("The creation response has no instance UUID. Check the instance list first.");
+      error.code = "autodl_create_uncertain";
+      throw error;
+    }
     $("instanceUuid").value = result.instance_uuid;
-    toast(`实例 ${result.instance_uuid} 正在创建（规格 ${result.gpu_spec}）`);
-  } catch (error) { toast(error.message, true); }
+    toast(`Instance ${result.instance_uuid} is being created (${result.gpu_spec})`);
+  } catch (error) {
+    if (creationRequested && ["autodl_create_uncertain", "connection_uncertain"].includes(error.code)) {
+      state.creationUncertain = true;
+      $("createInstance").textContent = "Creation result unknown; check instances";
+      $("autodlReadiness").textContent = "The creation result is unknown and retries have stopped. Check the AutoDL console and confirm that no new instance exists before reloading this page.";
+    }
+    toast(error.message, true);
+  } finally {
+    state.instanceCreating = false;
+    $("createInstance").disabled = !state.autodl?.ready || state.creationUncertain;
+  }
 };
 
 $("loadSsh").onclick = async () => {
-  const id = $("instanceUuid").value.trim(); if (!id) return toast("请先填写实例 UUID", true);
+  const id = $("instanceUuid").value.trim(); if (!id) return toast("Enter an instance UUID first", true);
   try {
     const result = await api(`/api/autodl/instances/${encodeURIComponent(id)}`);
-    if (!result.ssh) return toast(`实例状态 ${result.status}，暂未取得 SSH 信息`, true);
+    if (!result.ssh) return toast(`Instance status: ${result.status}. SSH information is not available yet.`, true);
     $("sshHost").value = result.ssh.host || ""; $("sshPort").value = result.ssh.port || 22;
     $("sshUser").value = result.ssh.username || "root"; $("sshPassword").value = result.ssh.password || "";
-    toast("已载入 SSH 信息");
+    toast("SSH information loaded");
   } catch (error) { toast(error.message, true); }
 };
 
 $("experimentForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!confirm("即将把生成代码上传到远程主机并执行所示命令。是否继续？")) return;
+  if (!confirm("The generated code will be uploaded to the remote host and the displayed command will run. Continue?")) return;
   const payload = {
     project_id: state.current.id,
     instance_uuid: $("instanceUuid").value || null,
@@ -403,13 +486,13 @@ $("experimentForm").addEventListener("submit", async (event) => {
   };
   try {
     const result = await api("/api/experiments", { method: "POST", body: JSON.stringify(payload) });
-    state.experimentId = result.experiment_id; $("experimentStatus").textContent = "准备中"; beginPolling(); toast("实验任务已启动");
+    state.experimentId = result.experiment_id; $("experimentStatus").textContent = "Preparing"; beginPolling(); toast("Experiment started");
   } catch (error) { toast(error.message, true); }
 });
 
 async function refreshExperiment() {
   const result = await api(`/api/experiments/${state.experimentId}`);
-  const labels = { preparing: "准备中", uploading: "上传中", running: `运行中 · 第 ${result.iteration} 轮`, analyzing: "分析中", completed: "已完成", failed: "失败" };
+  const labels = { preparing: "Preparing", uploading: "Uploading", running: `Running · Round ${result.iteration}`, analyzing: "Analyzing", completed: "Completed", failed: "Failed" };
   $("experimentStatus").textContent = labels[result.status] || result.status;
   if (["completed", "failed"].includes(result.status)) {
     if (result.status === "failed" && result.error) toast(result.error, true);

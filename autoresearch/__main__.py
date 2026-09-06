@@ -11,9 +11,9 @@ from .services.desktop import DesktopBridge
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AutoResearch local research console")
-    parser.add_argument("--host", help="监听地址（默认读取 .env）")
-    parser.add_argument("--port", type=int, help="监听端口（默认读取 .env）")
-    parser.add_argument("--no-open", action="store_true", help="不要自动打开 Chrome")
+    parser.add_argument("--host", help="Bind address (defaults to .env)")
+    parser.add_argument("--port", type=int, help="Listen port (defaults to .env)")
+    parser.add_argument("--no-open", action="store_true", help="Do not open Chrome automatically")
     args = parser.parse_args()
     settings = Settings.load()
     host = args.host or settings.host
