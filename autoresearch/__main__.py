@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import threading
 
 import uvicorn
@@ -10,6 +11,11 @@ from .services.desktop import DesktopBridge
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "autodl-browser-login":
+        from .autodl_browser_cli import main as autodl_browser_main
+
+        raise SystemExit(autodl_browser_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="AutoResearch local research console")
     parser.add_argument("--host", help="Bind address (defaults to .env)")
     parser.add_argument("--port", type=int, help="Listen port (defaults to .env)")

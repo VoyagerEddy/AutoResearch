@@ -71,7 +71,7 @@ If OpenRouter is not configured or temporarily unavailable, AutoResearch creates
 
 ## AutoDL
 
-AutoResearch uses AutoDL's official [Container Instance Pro API](https://www.autodl.com/docs/instance_pro_api/). It does not store AutoDL account passwords or depend on browser login automation. The default GPU preference is:
+AutoResearch uses AutoDL's official [Container Instance Pro API](https://www.autodl.com/docs/instance_pro_api/) for normal provisioning. It does not store AutoDL account passwords. An optional Playwright adapter can use an installed Chrome or Edge browser for account setup and console workflows when API configuration is unavailable; credentials remain in process memory and the only external continuation is an SMS one-time-code callback. Its Aliyun puzzle solver uses observed piece position for closed-loop drag correction. See [`docs/AUTODL_BROWSER.md`](docs/AUTODL_BROWSER.md). The default GPU preference is:
 
 1. `v-48g`, the documented 4090-48G general-purpose specification.
 2. `5090-p`, the documented 5090-32G performance specification.

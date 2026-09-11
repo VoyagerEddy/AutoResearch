@@ -240,7 +240,7 @@ class AutoDLClient:
     async def create_preferred(self, request: AutoDLCreateRequest) -> InstanceChoice:
         readiness = await self.preflight(image_uuid=request.image_uuid)
         if not readiness["configured"]:
-            raise AutoDLError("；".join(issue["message"] for issue in readiness["blocking_issues"]))
+            raise AutoDLError("; ".join(issue["message"] for issue in readiness["blocking_issues"]))
         image_uuid = request.image_uuid or self.settings.autodl_image_uuid
         exhausted: list[str] = []
         uncertain_message = (
