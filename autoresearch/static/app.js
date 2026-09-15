@@ -429,6 +429,26 @@ $("toggleExperiment").onclick = () => $("experimentForm").classList.toggle("hidd
 
 $("checkAutoDL").onclick = () => refreshAutoDL(true);
 
+async function launchAutoDLLogin(action) {
+  const button = action === "Setup" ? $("setupAutoDLLogin") : $("openAutoDLLogin");
+  button.disabled = true;
+  try {
+    await api("/api/autodl/browser-login/launch", {
+      method: "POST",
+      body: JSON.stringify({
+        action, browser: "auto", open_page: "console", keep_open: true, confirm_launch: true
+      })
+    });
+    toast(action === "Setup"
+      ? "AutoDL encrypted login setup opened in a private console."
+      : "AutoDL automatic login opened. Complete verification in the new windows.");
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+}
+
+$("setupAutoDLLogin").onclick = () => launchAutoDLLogin("Setup");
+$("openAutoDLLogin").onclick = () => launchAutoDLLogin("Login");
+
 $("createInstance").onclick = async () => {
   if (state.instanceCreating || state.creationUncertain) return;
   state.instanceCreating = true;

@@ -182,11 +182,16 @@
         <h3>AutoDL Pro API</h3>
         <label>Developer Token <input id="settingAutoDLToken" type="password" placeholder="Console → Account → Settings"></label>
         <div class="form-grid">
-          <label>Image UUID <input id="settingImageUuid" placeholder="image-xxxxxxxx"></label>
+          <label>Image UUID (optional) <input id="settingImageUuid" placeholder="Blank uses the public PyTorch/CUDA base image"></label>
           <label>GPU Spec Priority <input id="settingGpuSpecs" placeholder="v-48g,5090-p"></label>
         </div>
         <div id="settingsAutoDLStatus" class="form-status" role="status" aria-live="polite">Checking AutoDL configuration…</div>
-        <button type="button" class="ghost" id="checkAutoDL">Check Saved API Configuration (No Charge)</button>
+        <div class="settings-connect-actions">
+          <button type="button" class="ghost" id="setupAutoDLLogin">Configure AutoDL Login</button>
+          <button type="button" class="ghost" id="openAutoDLLogin">Auto Login to AutoDL</button>
+          <button type="button" class="ghost" id="checkAutoDL">Check Saved API Configuration (No Charge)</button>
+        </div>
+        <p class="settings-help">Configure once to save the phone and password outside the repository, encrypted for the current Windows user. Later logins fill them automatically. You still complete the visible security verification and enter the SMS one-time code; neither is saved.</p>
       </div>
       <div class="settings-section">
         <h3>GitHub</h3>

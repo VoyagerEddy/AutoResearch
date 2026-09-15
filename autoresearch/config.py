@@ -8,6 +8,11 @@ from typing import Mapping
 from dotenv import dotenv_values
 
 
+# Public base image documented in AutoDL's Container Instance Pro API appendix:
+# PyTorch 2.0.0 / CUDA 11.8 / Ubuntu 20.04. A user-configured image still wins.
+DEFAULT_AUTODL_IMAGE_UUID = "base-image-l2t43iu6uk"
+
+
 def _as_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
@@ -30,7 +35,7 @@ class Settings:
     openrouter_model: str = "openrouter/free"
     openrouter_site_url: str = "http://127.0.0.1:8765"
     autodl_token: str = ""
-    autodl_image_uuid: str = ""
+    autodl_image_uuid: str = DEFAULT_AUTODL_IMAGE_UUID
     autodl_gpu_specs: tuple[str, ...] = ("v-48g", "5090-p")
     autodl_cuda_from: int = 118
     github_remote_url: str = ""
@@ -69,7 +74,10 @@ class Settings:
             openrouter_model=value("OPENROUTER_MODEL", "openrouter/free"),
             openrouter_site_url=value("OPENROUTER_SITE_URL", "http://127.0.0.1:8765"),
             autodl_token=value("AUTODL_TOKEN"),
-            autodl_image_uuid=value("AUTODL_IMAGE_UUID"),
+            # Treat an absent or accidentally blank setting as "use the public
+            # base image". This keeps a blank settings form from disabling
+            # provisioning while preserving explicit custom-image overrides.
+            autodl_image_uuid=value("AUTODL_IMAGE_UUID") or DEFAULT_AUTODL_IMAGE_UUID,
             autodl_gpu_specs=specs or ("v-48g", "5090-p"),
             autodl_cuda_from=_as_int(value("AUTODL_CUDA_FROM") or None, 118),
             github_remote_url=value("GITHUB_REMOTE_URL"),

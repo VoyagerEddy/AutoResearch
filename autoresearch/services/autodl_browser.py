@@ -526,12 +526,54 @@ class AutoDLBrowserSession:
         if playwright is not None:
             await playwright.stop()
 
+    async def login_sms(self, phone: str, otp_provider: OTPProvider) -> LoginResult:
+        """Send an SMS once, then submit the user-provided code."""
+        if not phone.strip():
+            raise ValueError("An AutoDL phone number is required")
+        if self._page is None:
+            await self.start()
+        await self.goto_autodl(AUTODL_LOGIN_URL, wait_until="domcontentloaded")
+        phone_input = await self._find_visible((*self.selectors.phone_inputs, 'input[placeholder="请输入手机号"]'))
+        await phone_input.fill(phone.strip())
+        button = await self._find_visible((*self.selectors.send_code_buttons, 'button:has-text("发送验证码")'))
+        print("Requesting an SMS verification code...")
+        await button.click()
+        deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            if await self._is_visible(self.selectors.captcha_background):
+                await self._complete_captcha(False)
+            label = await button.inner_text()
+            if any(char.isdigit() for char in label):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise AutoDLLoginError("SMS delivery was not confirmed; no automatic resend was attempted")
+        print("The page shows an SMS countdown. Enter the code received on your phone.")
+        otp = otp_provider()
+        if inspect.isawaitable(otp):
+            otp = await otp
+        normalized = str(otp).strip()
+        if not normalized.isdigit() or not 4 <= len(normalized) <= 8:
+            raise AutoDLLoginError("The SMS one-time code must contain 4 to 8 digits")
+        field = await self._find_visible((*self.selectors.otp_inputs, 'input[placeholder="请输入验证码"]'))
+        await field.fill(normalized)
+        await self._click_submit()
+        state = await self._wait_for_login_state(allow_otp=False)
+        if state == "captcha":
+            await self._complete_captcha(False)
+            state = await self._wait_for_login_state(allow_otp=False)
+        if state != "authenticated":
+            raise AutoDLLoginError("AutoDL SMS login did not reach an authenticated page")
+        self._authenticated = True
+        return LoginResult(status="authenticated", url=self.page.url)
+
     async def login(
         self,
         credentials: AutoDLCredentials,
         otp_provider: OTPProvider,
         *,
         login_url: str = AUTODL_LOGIN_URL,
+        automate_captcha: bool = True,
     ) -> LoginResult:
         """Authenticate while keeping the same page alive during the OTP callback."""
 
@@ -547,11 +589,11 @@ class AutoDLBrowserSession:
 
         state = await self._wait_for_login_state()
         if state == "captcha":
-            await self.solve_puzzle_captcha()
+            await self._complete_captcha(automate_captcha)
             state = await self._wait_for_login_state()
 
         if state == "otp":
-            await self._request_sms_code()
+            await self._request_sms_code(automate_captcha=automate_captcha)
             otp = otp_provider()
             if inspect.isawaitable(otp):
                 otp = await otp
@@ -563,7 +605,7 @@ class AutoDLBrowserSession:
             await self._click_submit()
             state = await self._wait_for_login_state(allow_otp=False)
             if state == "captcha":
-                await self.solve_puzzle_captcha()
+                await self._complete_captcha(automate_captcha)
                 state = await self._wait_for_login_state(allow_otp=False)
 
         if state != "authenticated":
@@ -660,11 +702,23 @@ class AutoDLBrowserSession:
         detail = "" if last_match is None else f" (last confidence {last_match.confidence:.3f})"
         raise PuzzleSolveError(f"Aliyun puzzle verification failed after {max_attempts} attempts{detail}")
 
-    async def _request_sms_code(self) -> None:
+    async def _complete_captcha(self, automate_captcha: bool) -> None:
+        if automate_captcha:
+            await self.solve_puzzle_captcha()
+            return
+        print("Complete the visible slider verification in the browser window.")
+        deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000.0
+        while asyncio.get_running_loop().time() < deadline:
+            if not await self._is_visible(self.selectors.captcha_background):
+                return
+            await asyncio.sleep(0.2)
+        raise AutoDLLoginError("The manual slider verification did not finish before the timeout")
+
+    async def _request_sms_code(self, *, automate_captcha: bool = True) -> None:
         button = await self._find_visible(self.selectors.send_code_buttons)
         await button.click()
         await self._find_visible((self.selectors.captcha_background,))
-        await self.solve_puzzle_captcha()
+        await self._complete_captcha(automate_captcha)
 
         deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000.0
         while asyncio.get_running_loop().time() < deadline:

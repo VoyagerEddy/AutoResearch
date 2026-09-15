@@ -4,7 +4,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from autoresearch.config import Settings
+from autoresearch.config import DEFAULT_AUTODL_IMAGE_UUID, Settings
 from autoresearch.domain import AutoDLCreateRequest
 from autoresearch.services import autodl
 from autoresearch.services.autodl import AutoDLClient, AutoDLCreateUncertain, AutoDLError, extract_ssh
@@ -215,6 +215,27 @@ async def test_preflight_warns_about_explicit_legacy_gpu_spec(tmp_path: Path) ->
 def test_gpu_default_uses_documented_5090_spec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AUTODL_GPU_SPECS", raising=False)
     assert Settings.load(tmp_path).autodl_gpu_specs == ("v-48g", "5090-p")
+
+
+def test_blank_image_setting_uses_documented_public_base_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AUTODL_IMAGE_UUID", raising=False)
+    (tmp_path / ".env").write_text("AUTODL_IMAGE_UUID=\n", encoding="utf-8")
+    settings = Settings.load(tmp_path)
+    assert settings.autodl_image_uuid == DEFAULT_AUTODL_IMAGE_UUID
+
+
+@pytest.mark.asyncio
+async def test_preflight_reports_public_image_fallback_without_exposing_uuid(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.load(tmp_path).with_overrides(autodl_token="token")
+    result = await AutoDLClient(settings).preflight()
+    assert result["ready"] is True
+    assert result["image_source"] == "public_default"
+    assert "public base image" in result["checks"][1]["message"]
+    assert DEFAULT_AUTODL_IMAGE_UUID not in json.dumps(result)
 
 
 @pytest.mark.asyncio

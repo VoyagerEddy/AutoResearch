@@ -14,6 +14,7 @@ from .chatgpt_connection import connection_status, launch_tunnel_console
 from .config import EnvStore, Settings
 from .db import Database
 from .domain import (
+    AutoDLBrowserLoginLaunchRequest,
     AutoDLCreateRequest,
     AutoDLExperimentRequest,
     ChatGPTAnalysisRequest,
@@ -249,6 +250,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         verify_api: bool = False, image_uuid: str | None = None
     ) -> dict[str, Any]:
         return await state.chatgpt.autodl_readiness(verify_api=verify_api, image_uuid=image_uuid)
+
+    @app.post("/api/autodl/browser-login/launch", status_code=202)
+    async def launch_autodl_browser_login(
+        request: AutoDLBrowserLoginLaunchRequest,
+    ) -> dict[str, Any]:
+        if not request.confirm_launch:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirmation is required before opening the AutoDL login assistant",
+            )
+        try:
+            pid = DesktopBridge.launch_autodl_browser_login(
+                state.settings.root,
+                action=request.action,
+                browser=request.browser,
+                open_page=request.open_page,
+                keep_open=request.keep_open,
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "status": "launched",
+            "action": request.action,
+            "browser": request.browser,
+            "open_page": request.open_page,
+            "pid": pid,
+            "credential_storage": "windows-user-encrypted",
+        }
 
     @app.post("/api/autodl/instances", status_code=202)
     async def create_autodl(request: AutoDLCreateRequest) -> dict[str, Any]:

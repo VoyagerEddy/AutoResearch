@@ -35,6 +35,66 @@ def test_autodl_creation_requires_billable_confirmation(tmp_path: Path) -> None:
         assert response.status_code == 400
 
 
+def test_autodl_browser_login_launch_requires_confirmation(tmp_path: Path) -> None:
+    with TestClient(create_app(Settings.load(tmp_path))) as client:
+        response = client.post(
+            "/api/autodl/browser-login/launch",
+            json={"confirm_launch": False},
+        )
+    assert response.status_code == 400
+    assert "confirmation" in response.json()["detail"].lower()
+
+
+def test_autodl_browser_login_launches_private_interactive_helper(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls = []
+
+    def launch(root, **kwargs):
+        calls.append((root, kwargs))
+        return 4321
+
+    monkeypatch.setattr(
+        "autoresearch.api.DesktopBridge.launch_autodl_browser_login", launch
+    )
+    with TestClient(create_app(Settings.load(tmp_path))) as client:
+        response = client.post(
+            "/api/autodl/browser-login/launch",
+            json={
+                "action": "Login",
+                "browser": "edge",
+                "open_page": "console",
+                "keep_open": True,
+                "confirm_launch": True,
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "status": "launched",
+        "action": "Login",
+        "browser": "edge",
+        "open_page": "console",
+        "pid": 4321,
+        "credential_storage": "windows-user-encrypted",
+    }
+    assert calls == [
+        (
+            tmp_path,
+            {
+                "action": "Login",
+                "browser": "edge",
+                "open_page": "console",
+                "keep_open": True,
+            },
+        )
+    ]
+    assert not any(
+        secret in str(response.json()).lower()
+        for secret in ("phone", "password", "otp", "token")
+    )
+
+
 def test_experiment_readiness_exposes_blockers_and_handles_missing_project(tmp_path: Path) -> None:
     with TestClient(create_app(Settings.load(tmp_path))) as client:
         created = client.post("/api/chatgpt/projects", json={"topic": "readiness study"}).json()

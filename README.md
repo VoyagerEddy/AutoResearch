@@ -15,7 +15,7 @@ Requirements: Python 3.11+ and Git. Chrome and VS Code are recommended.
 3. The default workflow is **ChatGPT collaboration**. Create a project and use its project ID in your ChatGPT conversation.
 4. For the first ChatGPT connection, select **Set up connection** on the home page or run `setup-chatgpt.cmd`. On later runs, use `start-chatgpt.cmd` to keep both the local service and Tunnel available.
 5. Open **Settings and connections** and enter an OpenRouter key only if you delegate code generation to AutoResearch or use autonomous mode.
-6. To use AutoDL, obtain a developer token from **Account → Settings** in the AutoDL console and enter an image UUID.
+6. To use AutoDL, obtain a developer token from **Account → Settings** in the AutoDL console. A custom image UUID is optional; when it is blank, AutoResearch uses AutoDL's documented public PyTorch 2.0.0 / CUDA 11.8 base image.
 
 PowerShell alternative:
 
@@ -71,7 +71,7 @@ If OpenRouter is not configured or temporarily unavailable, AutoResearch creates
 
 ## AutoDL
 
-AutoResearch uses AutoDL's official [Container Instance Pro API](https://www.autodl.com/docs/instance_pro_api/) for normal provisioning. It does not store AutoDL account passwords. An optional Playwright adapter can use an installed Chrome or Edge browser for account setup and console workflows when API configuration is unavailable; credentials remain in process memory and the only external continuation is an SMS one-time-code callback. Its Aliyun puzzle solver uses observed piece position for closed-loop drag correction. See [`docs/AUTODL_BROWSER.md`](docs/AUTODL_BROWSER.md). The default GPU preference is:
+AutoResearch uses AutoDL's official [Container Instance Pro API](https://www.autodl.com/docs/instance_pro_api/) for normal provisioning. Its optional Playwright adapter can use an installed Chrome or Edge browser for account setup and console workflows when API configuration is unavailable. The dashboard's one-time setup stores the phone and password in the current user's local application data encrypted with Windows DPAPI; neither is committed or written to `.env`. Later logins fill those values automatically while visible security verification and the SMS one-time code remain user-completed. Start it from **Settings & Connections → AutoDL Pro API**. The adapter also contains a tested contour-matching and closed-loop drag implementation for explicitly authorized integration tests. See [`docs/AUTODL_BROWSER.md`](docs/AUTODL_BROWSER.md). The default GPU preference is:
 
 1. `v-48g`, the documented 4090-48G general-purpose specification.
 2. `5090-p`, the documented 5090-32G performance specification.
@@ -79,6 +79,8 @@ AutoResearch uses AutoDL's official [Container Instance Pro API](https://www.aut
 If a create request times out, returns an unexpected response, or lacks a valid instance UUID, AutoResearch stops without retrying and asks you to inspect the instance list. This prevents duplicate billable resources. It only falls back to another GPU specification for provider errors that contractually guarantee no instance was created. The public API currently documents no such error code, so the fallback allowlist is empty.
 
 Before provisioning, call `check_autodl_readiness` or `GET /api/autodl/preflight`. Local checks verify the token, image, and GPU configuration. With `verify_api=true`, AutoResearch performs a free read-only instance-list request and then reads the wallet balance without returning instance records or secrets. `configured` means required local settings exist, `verified` means the instance API authenticated successfully, and `balance_verified` separately means the wallet response was valid. Cash and voucher balances remain separate exact decimal strings based on the official milli-CNY fields. AutoResearch does not infer voucher eligibility or a spendable experiment budget. Inventory and image availability remain unverified.
+
+If `AUTODL_IMAGE_UUID` is absent or blank, AutoResearch selects the documented public base image `base-image-l2t43iu6uk`. An image UUID supplied in a create request has highest priority, followed by an explicitly configured value. The preflight response reports the selection source without exposing a private image UUID.
 
 If an SSH check finds an active GPU workload, recovery saves the current image and creates one clone. If the clone is also busy, AutoResearch may release only that replacement and provision from the base image when explicitly authorized. This is bounded to one clone and one rebuild.
 

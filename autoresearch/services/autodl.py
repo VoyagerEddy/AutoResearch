@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from ..config import Settings
+from ..config import DEFAULT_AUTODL_IMAGE_UUID, Settings
 from ..domain import AutoDLCreateRequest
 
 
@@ -62,6 +62,15 @@ class AutoDLClient:
     async def close(self) -> None:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
+
+    def _image_selection(self, requested: str | None = None) -> tuple[str, str]:
+        requested = (requested or "").strip()
+        if requested:
+            return requested, "request"
+        configured = self.settings.autodl_image_uuid.strip()
+        if configured == DEFAULT_AUTODL_IMAGE_UUID:
+            return configured, "public_default"
+        return configured, "configured" if configured else "missing"
 
     async def _request(self, method: str, path: str, payload: dict[str, Any]) -> Any:
         return await self._request_url(method, f"{self.base_url}/{path.lstrip('/')}", payload)
@@ -135,6 +144,12 @@ class AutoDLClient:
                 "message": "GPU inventory and image availability are unverified; provisioning may still fail after this check passes.",
             }
         ]
+        selected_image, image_source = self._image_selection(image_uuid)
+        image_message = (
+            "The documented AutoDL public base image fallback is selected."
+            if image_source == "public_default"
+            else "An image UUID is configured for provisioning."
+        )
         prerequisites = (
             (
                 "token", bool(self.settings.autodl_token.strip()), "missing_token",
@@ -142,8 +157,8 @@ class AutoDLClient:
                 "AutoDL developer token is missing; set AUTODL_TOKEN in the web settings.",
             ),
             (
-                "image", bool((image_uuid or self.settings.autodl_image_uuid).strip()),
-                "missing_image", "An image UUID is configured for provisioning.",
+                "image", bool(selected_image),
+                "missing_image", image_message,
                 "AutoDL image UUID is missing; set AUTODL_IMAGE_UUID in the web settings or pass image_uuid when provisioning.",
             ),
             (
@@ -234,6 +249,7 @@ class AutoDLClient:
             "balance_verified": balance is not None,
             "balance": balance,
             "availability_verified": False,
+            "image_source": image_source,
             "docs_url": self.docs_url,
         }
 
@@ -241,7 +257,7 @@ class AutoDLClient:
         readiness = await self.preflight(image_uuid=request.image_uuid)
         if not readiness["configured"]:
             raise AutoDLError("; ".join(issue["message"] for issue in readiness["blocking_issues"]))
-        image_uuid = request.image_uuid or self.settings.autodl_image_uuid
+        image_uuid, _ = self._image_selection(request.image_uuid)
         exhausted: list[str] = []
         uncertain_message = (
             "AutoDL provisioning outcome is unknown and automatic retries have stopped; a billable instance may exist. "

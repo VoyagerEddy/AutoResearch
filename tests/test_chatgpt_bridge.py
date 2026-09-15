@@ -135,3 +135,24 @@ async def test_mcp_readiness_reports_both_missing_settings(tmp_path: Path) -> No
     assert {issue["code"] for issue in result["blocking_issues"]} == {
         "missing_token", "missing_image",
     }
+
+
+@pytest.mark.asyncio
+async def test_mcp_autodl_creation_surfaces_actionable_configuration_error(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.load(tmp_path).with_overrides(
+        autodl_token="", autodl_image_uuid=""
+    )
+    app = create_app(settings)
+    async with Client(app.state.mcp_server, raise_exceptions=True) as client:
+        response = await client.call_tool(
+            "create_autodl_instance",
+            {"confirm_billable": True},
+        )
+    assert response.is_error is True
+    message = "\n".join(
+        item.text for item in response.content if item.type == "text"
+    )
+    assert "developer token is missing" in message
+    assert "image UUID is missing" in message

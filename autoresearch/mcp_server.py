@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .chatgpt_bridge import ChatGPTBridge
@@ -17,6 +18,7 @@ from .domain import (
     ResearchNoteRequest,
     SourceSearchRequest,
 )
+from .services.autodl import AutoDLError
 
 
 READ_ONLY = ToolAnnotations(
@@ -247,17 +249,23 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
         disk_gb: int = 0,
         data_centers: list[str] | None = None,
     ) -> dict[str, Any]:
-        return await bridge.create_autodl_instance(
-            AutoDLCreateRequest(
-                image_uuid=image_uuid,
-                instance_name=instance_name,
-                gpu_amount=gpu_amount,
-                disk_gb=disk_gb,
-                data_centers=data_centers or [],
-                confirm_billable=confirm_billable,
-            ),
-            project_id=project_id,
-        )
+        try:
+            return await bridge.create_autodl_instance(
+                AutoDLCreateRequest(
+                    image_uuid=image_uuid,
+                    instance_name=instance_name,
+                    gpu_amount=gpu_amount,
+                    disk_gb=disk_gb,
+                    data_centers=data_centers or [],
+                    confirm_billable=confirm_billable,
+                ),
+                project_id=project_id,
+            )
+        except (AutoDLError, ValueError) as exc:
+            # Expected provisioning/configuration failures must reach ChatGPT as
+            # actionable tool errors. Unhandled exceptions are intentionally
+            # redacted by the MCP SDK as a generic "Error executing tool".
+            raise ToolError(str(exc)) from exc
 
     @server.tool(
         name="get_autodl_instance_status",
@@ -275,7 +283,10 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
         structured_output=True,
     )
     async def get_autodl_instance_status(instance_uuid: str) -> dict[str, Any]:
-        return await bridge.autodl_instance_status(instance_uuid)
+        try:
+            return await bridge.autodl_instance_status(instance_uuid)
+        except (AutoDLError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
 
     @server.tool(
         name="start_autodl_experiment",
@@ -297,18 +308,21 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
         recover_busy_gpu: bool = True,
         allow_release_replacement: bool = False,
     ) -> dict[str, Any]:
-        return await bridge.start_autodl_experiment(
-            AutoDLExperimentRequest(
-                project_id=project_id,
-                instance_uuid=instance_uuid,
-                confirm_execute=confirm_execute,
-                command=command,
-                remote_dir=remote_dir,
-                max_iterations=max_iterations,
-                recover_busy_gpu=recover_busy_gpu,
-                allow_release_replacement=allow_release_replacement,
+        try:
+            return await bridge.start_autodl_experiment(
+                AutoDLExperimentRequest(
+                    project_id=project_id,
+                    instance_uuid=instance_uuid,
+                    confirm_execute=confirm_execute,
+                    command=command,
+                    remote_dir=remote_dir,
+                    max_iterations=max_iterations,
+                    recover_busy_gpu=recover_busy_gpu,
+                    allow_release_replacement=allow_release_replacement,
+                )
             )
-        )
+        except (AutoDLError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
 
     @server.tool(
         name="get_experiment_result",

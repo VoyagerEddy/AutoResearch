@@ -61,6 +61,14 @@ class ChatGPTTunnelLaunchRequest(BaseModel):
     confirm_launch: bool = False
 
 
+class AutoDLBrowserLoginLaunchRequest(BaseModel):
+    action: Literal["Setup", "Login"] = "Login"
+    browser: Literal["auto", "chrome", "edge"] = "auto"
+    open_page: Literal["console", "market", "none"] = "console"
+    keep_open: bool = True
+    confirm_launch: bool = False
+
+
 class Project(BaseModel):
     id: str
     topic: str

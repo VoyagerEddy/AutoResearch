@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Open an authenticated AutoDL browser session using installed Chrome or Edge.",
     )
     parser.add_argument("--phone", help="AutoDL phone number; prompts when omitted")
+    parser.add_argument("--sms", action="store_true", help="Use SMS login without an account password")
     parser.add_argument(
         "--browser",
         choices=("auto", "chrome", "edge"),
@@ -29,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--executable-path", type=Path, help="Explicit Chrome or Edge executable")
     parser.add_argument("--headless", action="store_true", help="Run without a visible browser window")
+    parser.add_argument(
+        "--manual-captcha",
+        action="store_true",
+        help="Wait for the user to complete the visible slider verification",
+    )
     parser.add_argument(
         "--open",
         choices=("console", "market", "none"),
@@ -50,8 +56,10 @@ async def _read_line(prompt: str) -> str:
 
 async def run(args: argparse.Namespace) -> None:
     phone = args.phone or os.environ.get("AUTODL_BROWSER_PHONE") or input("AutoDL phone: ").strip()
-    password = os.environ.get("AUTODL_BROWSER_PASSWORD") or getpass.getpass("AutoDL password: ")
-    credentials = AutoDLCredentials(phone=phone, password=password)
+    credentials = None
+    if not args.sms:
+        password = os.environ.get("AUTODL_BROWSER_PASSWORD") or getpass.getpass("AutoDL password: ")
+        credentials = AutoDLCredentials(phone=phone, password=password)
 
     async def otp_provider() -> str:
         return (await _read_line("SMS one-time code: ")).strip()
@@ -60,9 +68,15 @@ async def run(args: argparse.Namespace) -> None:
         browser=args.browser,
         executable_path=args.executable_path,
         headless=args.headless,
+        timeout_ms=300_000 if args.manual_captcha else 30_000,
     )
     async with AutoDLBrowserSession(options) as session:
-        result = await session.login(credentials, otp_provider)
+        if args.sms:
+            result = await session.login_sms(phone, otp_provider)
+        else:
+            result = await session.login(
+                credentials, otp_provider, automate_captcha=not args.manual_captcha,
+            )
         if args.open_page == "console":
             await session.open_instance_list()
         elif args.open_page == "market":
