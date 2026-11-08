@@ -12,6 +12,7 @@ from .domain import (
     AutoDLExperimentRequest,
     ChatGPTAnalysisRequest,
     ChatGPTProjectRequest,
+    ColabPrepareRequest,
     CodeFile,
     CodeGenerationRequest,
     CodeSaveRequest,
@@ -64,6 +65,7 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
             "Call list_research_projects or create_research_project first, then reuse the project ID with other tools. "
             "Call save_experiment_code when ChatGPT has written the code; call generate_experiment_code to delegate implementation to AutoResearch/OpenRouter. "
             "Before using AutoDL, call check_autodl_readiness; it never creates billable resources. "
+            "For free Colab GPUs, call prepare_colab_experiment then start_colab_experiment with user authorization. Google login or Drive consent can require user action; a retry deadline is not GPU allocation. "
             "Then call check_experiment_readiness to inspect entry points, data, and metric declarations; a passing static check does not validate scientific results. "
             "Obtain explicit user confirmation and set the relevant confirm parameter to true before billable AutoDL actions or remote execution. "
             "Never ask for or echo an AutoDL token, SSH password, or OpenRouter key in conversation."
@@ -361,5 +363,39 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
                 recommendations=recommendations or [],
             ),
         )
+
+    @server.tool(
+        name="get_colab_status", title="Get Colab GPU and Retry Status",
+        description="Reads a project's Colab notebook job, observed runtime state, retry deadline, and checkpoint directory. A queued job does not mean a GPU has been allocated.",
+        annotations=READ_ONLY, structured_output=True,
+    )
+    def get_colab_status(project_id: str) -> dict[str, Any]:
+        return bridge.colab_status(project_id)
+
+    @server.tool(
+        name="prepare_colab_experiment", title="Prepare a Free Colab GPU Experiment",
+        description="Exports a project notebook after validating its explicit full-state checkpoint and resume contract. Does not allocate a GPU or upload files. Uses random 5–10 minute GPU retries.",
+        annotations=LOCAL_WRITE, structured_output=True,
+    )
+    def prepare_colab_experiment(project_id: str, drive_root: str = "AutoResearch",
+                                 notebook_url: str = "") -> dict[str, Any]:
+        return bridge.prepare_colab(project_id, ColabPrepareRequest(
+            drive_root=drive_root, notebook_url=notebook_url))
+
+    @server.tool(
+        name="start_colab_experiment", title="Start the Colab Notebook Browser",
+        description="Starts the local Colab browser worker to request a free GPU and execute the prepared project through the normal notebook UI. Requires user authorization; Google sign-in and Drive permissions may need user action. No paid fallback.",
+        annotations=REMOTE_EXECUTION, structured_output=True,
+    )
+    def start_colab_experiment(project_id: str, confirm_execute: bool) -> dict[str, Any]:
+        return bridge.start_colab(project_id, confirm_execute=confirm_execute)
+
+    @server.tool(
+        name="cancel_colab_retries", title="Stop Colab GPU Retries",
+        description="Stops this project's local GPU retry queue. Stop an already running notebook in Colab itself.",
+        annotations=LOCAL_WRITE, structured_output=True,
+    )
+    def cancel_colab_retries(project_id: str) -> dict[str, Any]:
+        return bridge.cancel_colab(project_id)
 
     return server

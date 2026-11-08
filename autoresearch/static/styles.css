@@ -162,6 +162,19 @@ dialog::backdrop { background: rgba(13,25,20,.5); backdrop-filter: blur(3px); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .form-status { min-height: 18px; margin-top: 14px; color: var(--accent); font-size: 11px; font-weight: 700; }
 .form-status.error { color: var(--danger); }
+#computeProvider { max-width: 460px; margin: 8px 0 16px; }
+#colabDetails { white-space: pre-line; margin-bottom: 16px; }
+#colabPanel .settings-help { margin: 12px 0; font-size: 12px; }
+#colabPanel .experiment-actions { gap: 10px; flex-wrap: wrap; }
+#colabDownloads { font-size: 12px; }
+.resource-agent-card { margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 12px; }
+.resource-agent-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; }
+.resource-availability { padding: 5px 10px; border-radius: 20px; font-size: 12px; background: #f1f3f5; color: #56606d; }
+.resource-availability.available { background: #e7f5ee; color: #187544; }
+.resource-availability.unavailable { background: #fff3df; color: #8b5a14; }
+.resource-agent-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 18px; margin: 16px 0 0; font-size: 12px; }
+.resource-agent-details dt { color: var(--muted); margin-bottom: 4px; }
+.resource-agent-details dd { margin: 0; overflow-wrap: anywhere; }
 .toast { z-index: 9999; position: fixed; right: 24px; bottom: 24px; max-width: 420px; padding: 13px 16px; border-radius: 10px; background: #1e2b26; color: white; font-size: 12px; box-shadow: var(--shadow); transform: translateY(30px); opacity: 0; pointer-events: none; transition: .25s; }
 .toast.show { transform: translateY(0); opacity: 1; }
 .toast.error { background: var(--danger); }

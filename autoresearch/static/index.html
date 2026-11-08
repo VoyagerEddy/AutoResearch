@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AutoResearch</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20261010-desktop-colab">
 </head>
 <body>
   <div class="shell">
@@ -131,9 +131,15 @@
 
         <section class="panel experiment-panel">
           <div class="panel-title">
-            <div><span class="kicker">COMPUTE</span><h3>AutoDL Remote Experiment</h3></div>
+            <div><span class="kicker">COMPUTE</span><h3>Remote Experiment</h3></div>
             <button class="ghost" id="toggleExperiment">Configure Experiment</button>
           </div>
+          <label for="computeProvider">Compute platform / 计算平台</label>
+          <select id="computeProvider">
+            <option value="autodl">AutoDL · Paid GPU / 付费 GPU</option>
+            <option value="colab">Google Colab · Free GPU / 免费 GPU</option>
+          </select>
+          <div id="autodlPanel">
           <div class="compute-summary">
             <div><span>GPU Order</span><strong id="gpuOrder">4090 → 5090</strong></div>
             <div><span>Execution</span><strong>SSH Background Process</strong></div>
@@ -164,6 +170,41 @@
             </div>
           </form>
           <div id="experimentResults" class="experiment-results"><div class="empty compact">Experiment status, metrics, and logs will appear here</div></div>
+          </div>
+          <div id="colabPanel" class="hidden">
+            <div class="compute-summary">
+              <div><span>GPU</span><strong>Colab Free · Subject to availability</strong></div>
+              <div><span>Retry / 重试</span><strong>Random 5–10 minutes · Honors quota cooldown</strong></div>
+              <div><span>Checkpoint</span><strong>Google Drive · Resume training state</strong></div>
+              <div><span>Status / 状态</span><strong id="colabStatus">Not prepared / 未准备</strong></div>
+            </div>
+            <p class="settings-help">已准备的项目选择 Colab 后自动启动资源检测。首次如提示需要登录，点击“普通浏览器登录”，在 Chrome 完成 Google 登录后关闭该窗口，再点击继续；挂载 Drive 也需要授权。免费 GPU 不保证可用，会话可能提前断开；已保存的 checkpoint 用于下次续跑。</p>
+            <div id="colabDetails" class="form-status" role="status" aria-live="polite">选择项目后准备 Colab 实验。</div>
+            <div class="resource-agent-card" aria-label="Colab 资源检查 Agent">
+              <div class="resource-agent-heading"><strong>Colab 资源检查 Agent</strong><span id="colabResourceAvailability" class="resource-availability unknown" role="status" aria-live="polite">待确认 · 等待下次实际检查</span></div>
+              <dl class="resource-agent-details">
+                <div><dt>Agent 状态</dt><dd id="colabResourceAgentState">尚未启动</dd></div>
+                <div><dt>最近心跳</dt><dd id="colabResourceHeartbeat">—</dd></div>
+                <div><dt>最近检查结果</dt><dd id="colabResourceLastResult">尚未确认</dd></div>
+                <div><dt>最近实际检查</dt><dd id="colabResourceLastChecked">—</dd></div>
+                <div><dt>下次实际检查</dt><dd id="colabResourceNextCheck">—</dd></div>
+              </dl>
+              <p id="colabResourceMessage" class="settings-help">已准备的项目选择 Colab 后，专用 Agent 自动监测资源申请流程。</p>
+              <p class="settings-help">Agent 每 10 秒更新监测状态；GPU 暂缺时每隔随机 5–10 分钟实际检查当前账号一次，额度限制按冷却时间等待。最近检查结果与当前可用性分别显示。</p>
+            </div>
+            <div class="form-grid three">
+              <div><label for="colabDriveRoot">Google Drive folder</label><input id="colabDriveRoot" value="AutoResearch" placeholder="AutoResearch"></div>
+              <div><label for="colabNotebookUrl">Existing notebook URL (optional)</label><input id="colabNotebookUrl" placeholder="https://colab.research.google.com/drive/…"></div>
+            </div>
+            <div class="experiment-actions">
+              <button type="button" class="ghost" id="loginColab">Google Login / 普通浏览器登录</button>
+              <button type="button" class="ghost" id="prepareColab">Prepare Notebook / 准备实验</button>
+              <button type="button" class="primary" id="startColab" disabled>Start Free GPU Trial / 申请并运行</button>
+              <button type="button" class="ghost" id="cancelColab" disabled>Stop Retry / 停止重试</button>
+            </div>
+            <p id="colabDownloads" class="hidden"><a id="downloadColabNotebook" download>Download notebook</a> · <a id="downloadColabBundle" download>Download experiment package</a> · <a id="downloadColabInputs" class="hidden" download>Download speech subset / 下载语音子集</a></p>
+            <p class="settings-help">等待资源时请保持 AutoResearch 本地服务运行。专用 Agent 会在下次检查时间申请 GPU，并在获得资源后继续试验。</p>
+          </div>
         </section>
       </section>
     </main>
@@ -211,6 +252,6 @@
     </form>
   </dialog>
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20261010-desktop-colab"></script>
 </body>
 </html>

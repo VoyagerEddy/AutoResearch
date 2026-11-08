@@ -11,6 +11,16 @@ from .services.desktop import DesktopBridge
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "colab-resource-agent":
+        from .colab_resource_monitor_cli import main as colab_resource_main
+
+        raise SystemExit(colab_resource_main(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "colab-browser":
+        from .colab_browser_cli import main as colab_browser_main
+
+        raise SystemExit(colab_browser_main(sys.argv[2:]))
+
     if len(sys.argv) > 1 and sys.argv[1] == "autodl-browser-login":
         from .autodl_browser_cli import main as autodl_browser_main
 

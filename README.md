@@ -84,6 +84,18 @@ If `AUTODL_IMAGE_UUID` is absent or blank, AutoResearch selects the documented p
 
 If an SSH check finds an active GPU workload, recovery saves the current image and creates one clone. If the clone is also busy, AutoResearch may release only that replacement and provision from the base image when explicitly authorized. This is bounded to one clone and one rebuild.
 
+## Google Colab free GPU
+
+Select **Google Colab · Free GPU** in a project's compute panel, prepare the notebook, then start the browser worker. Complete Google sign-in and Drive authorization in the browser when requested. Training executes in the Colab notebook, with durable files in `MyDrive/AutoResearch/<project-id>/` and resumable training checkpoints.
+
+Starting a prepared job saves its autorun authorization. Unavailable GPUs are retried after a persisted random 5–10 minute interval. An explicit account quota limit uses the provider's cooldown when available, or a conservative 12-hour wait when unspecified; this does not guarantee Google's quota reset time. Keep the local AutoResearch app running: its scheduler launches a missing browser worker when the saved deadline arrives, including after an app restart. Login, CAPTCHA, authorization, and ambiguous runtime state pause for user action. **Stop retries** cancels future launches; stop any active training runtime in Colab itself. GPU availability is verified for the signed-in account; exporting a notebook does not allocate a GPU.
+
+A dedicated background resource agent follows each authorized Colab job every 10 seconds. The project panel shows account availability, the agent heartbeat, the last actual GPU-check result and time, and the next check. Actual connection attempts follow the saved retry deadline; waiting, quota cooldowns and stale observations remain unconfirmed. Browser closure does not stop this observer. Canceling retries or finishing the job stops it.
+
+On Windows, the desktop **AutoResearch** shortcut uses `start-desktop.ps1` to start the local service in the background or reuse the running service. It opens the speaker project. Select **Google Colab** to start the resource check and monitor automatically; any login or authorization pause is shown in the panel.
+
+An optional official Colab Notebook MCP bridge runs in an isolated Python 3.13 environment to edit cells and read their output. GPU selection and connection still use the Colab interface. See [docs/COLAB.md](docs/COLAB.md) for setup, checkpoint requirements, and recovery.
+
 ## Configuration
 
 Copy `.env.example` to `.env`, or use the web settings dialog:

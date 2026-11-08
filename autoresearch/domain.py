@@ -69,6 +69,31 @@ class AutoDLBrowserLoginLaunchRequest(BaseModel):
     confirm_launch: bool = False
 
 
+class ColabPrepareRequest(BaseModel):
+    drive_root: str = Field(default="AutoResearch", min_length=1, max_length=120)
+    notebook_url: str = Field(default="", max_length=2000)
+    retry_min_minutes: int = Field(default=5, ge=5, le=120)
+    retry_max_minutes: int = Field(default=10, ge=5, le=180)
+
+
+class ColabObservationRequest(BaseModel):
+    status: Literal[
+        "available", "unavailable", "quota", "auth", "network", "disconnected",
+        "running", "completed", "failed",
+    ]
+    details: dict[str, Any] = Field(default_factory=dict)
+    retry_after_minutes: int | None = Field(default=None, ge=5, le=525600)
+
+
+class ColabNotebookBindingRequest(BaseModel):
+    notebook_url: str = Field(min_length=1, max_length=2000)
+    bundle_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+class ColabBrowserLaunchRequest(BaseModel):
+    browser: Literal["auto", "chrome", "edge"] = "auto"
+
+
 class Project(BaseModel):
     id: str
     topic: str

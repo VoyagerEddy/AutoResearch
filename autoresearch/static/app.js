@@ -1,4 +1,4 @@
-const state = { projects: [], current: null, settings: null, connection: null, autodl: null, instanceCreating: false, creationUncertain: false, poller: null, connectionPoller: null, experimentId: null };
+const state = { projects: [], current: null, settings: null, connection: null, autodl: null, instanceCreating: false, creationUncertain: false, poller: null, connectionPoller: null, experimentId: null, colab: null, colabBusy: false, colabCheckedProjectId: null, colabResourceAgent: null, colabResourceAgentUnavailable: false };
 const phaseLabels = {
   queued: "Queued", planning: "Planning", searching: "Source Search", synthesizing: "Method Design",
   generating: "Code Generation", ready: "Code Saved", experiment: "Remote Experiment", analyzing: "Result Analysis",
@@ -24,6 +24,7 @@ async function api(path, options = {}) {
       const detail = data.detail;
       const error = new Error(typeof detail === "string" ? detail : (detail?.message || `Request failed (${response.status})`));
       error.code = detail?.code;
+      error.status = response.status;
       throw error;
     }
     return data;
@@ -66,6 +67,11 @@ async function bootstrap() {
     state.connectionPoller = setInterval(refreshConnection, 5000);
     await loadProjects();
     const requested = new URLSearchParams(location.search).get("project");
+    const requestedCompute = new URLSearchParams(location.search).get("compute");
+    if (requestedCompute === "colab") {
+      $("computeProvider").value = "colab";
+      updateComputeProvider();
+    }
     if (requested && state.projects.some((project) => project.id === requested)) await selectProject(requested);
   } catch (error) {
     $("healthText").textContent = "Local service unavailable";
@@ -174,17 +180,22 @@ function renderProjectList() {
 }
 
 async function selectProject(id) {
+  if (state.current?.id !== id) state.colabCheckedProjectId = null;
   state.current = await api(`/api/projects/${id}`);
   state.experimentId = null;
+  state.colab = null;
+  state.colabResourceAgent = null;
+  state.colabResourceAgentUnavailable = false;
   $("createView").classList.add("hidden");
   $("projectView").classList.remove("hidden");
   $("pageTitle").textContent = "Research Workspace";
   $("openCode").disabled = false;
   $("syncGit").disabled = state.current.status !== "ready";
-  history.replaceState(null, "", `?project=${encodeURIComponent(id)}`);
+  history.replaceState(null, "", `?project=${encodeURIComponent(id)}&compute=${$("computeProvider").value === "colab" ? "colab" : "autodl"}`);
   renderProject();
   renderProjectList();
-  await Promise.all([loadEvents(), loadSources(), loadManifest(), loadExperiments(), loadExperimentReadiness()]);
+  await Promise.all([loadEvents(), loadSources(), loadManifest(), loadExperiments(), loadExperimentReadiness(), loadColab()]);
+  if (state.current?.id === id) await ensureSelectedColabCheck();
   beginPolling();
 }
 
@@ -323,12 +334,245 @@ function beginPolling() {
     try {
       state.current = await api(`/api/projects/${state.current.id}`);
       renderProject();
-      await Promise.all([loadEvents(), loadSources(), loadExperiments()]);
+      await Promise.all([loadEvents(), loadSources(), loadExperiments(), loadColab()]);
       await loadProjects();
       if (state.experimentId) await refreshExperiment();
     } catch (_) {}
   }, 2500);
 }
+
+function updateComputeProvider() {
+  const isColab = $("computeProvider").value === "colab";
+  $("autodlPanel").classList.toggle("hidden", isColab);
+  $("colabPanel").classList.toggle("hidden", !isColab);
+  $("toggleExperiment").classList.toggle("hidden", isColab);
+  if (state.current) {
+    history.replaceState(null, "", `?project=${encodeURIComponent(state.current.id)}&compute=${isColab ? "colab" : "autodl"}`);
+  }
+}
+
+function renderColab() {
+  const job = state.colab || {};
+  const labels = {
+    not_prepared: "Not prepared / 未准备", idle: "Not prepared / 未准备", prepared: "Prepared / 已准备", queued: "Waiting for browser / 等待浏览器",
+    checking: "Requesting GPU / 正在申请", waiting: "Waiting to retry / 等待重试", retry_wait: "Waiting to retry / 等待重试",
+    attempting: "Requesting GPU / 正在申请", waiting_for_gpu: "Waiting for GPU retry / 等待 GPU 重试",
+    waiting_for_connection: "Connection unavailable / 等待恢复连接", gpu_available: "GPU allocated / 已分配 GPU",
+    available: "GPU allocated / 已分配 GPU", running: "Training / 训练中", completed: "Completed / 已完成",
+    auth: "Login or authorization needed / 等待登录或授权", awaiting_auth: "Login or authorization needed / 等待登录或授权",
+    auth_required: "Needs login or page action / 等待登录或页面操作", disconnected: "Session disconnected / 会话已断开",
+    failed: "Failed / 失败", cancelled: "Retry stopped / 已停止重试", blocked: "Preparation blocked / 准备受阻"
+  };
+  const completed = job.last_observation?.details || {};
+  const completionLabels = {
+    campaign_complete: "Official development experiment completed / 正式开发集实验完成",
+    acceptance_passed: "Resume acceptance passed / 断线续训验收通过",
+    process_exit: "Program finished / 程序运行结束"
+  };
+  $("colabStatus").textContent = (job.status === "completed" && completionLabels[completed.completion_kind]) || labels[job.status] || job.status || labels.idle;
+  const lines = [];
+  if (job.status === "completed" && completed.completion_kind === "acceptance_passed") lines.push("功能验收通过；正式论文实验仍需完成训练与评测。");
+  if (job.status === "completed" && completed.completion_kind === "campaign_complete") lines.push("已完成官方开发集评测；改进是否有效请根据配对结果分析。");
+  if (job.status === "completed" && completed.metrics) {
+    for (const name of ["B0_eer_percent", "VQ_eer_percent", "B0_min_dcf", "VQ_min_dcf"]) {
+      if (Number.isFinite(completed.metrics[name])) lines.push(`${name}: ${completed.metrics[name].toFixed(4)}`);
+    }
+  }
+  if (job.blocked_reason) lines.push(job.blocked_reason);
+  if (job.last_observation?.message) lines.push(job.last_observation.message);
+  if (job.next_attempt_at) lines.push(`Next attempt / 下次申请: ${new Date(job.next_attempt_at).toLocaleString("zh-CN")}`);
+  if (job.attempt_count) lines.push(`Browser attempts / 浏览器连接次数: ${job.attempt_count}`);
+  if (job.drive_project_dir) lines.push(`Persistent files / 持久保存: ${job.drive_project_dir}`);
+  $("colabDetails").textContent = lines.join("\n") || (job.prepared ? "已准备实验；选择 Colab 后自动启动资源检测。" : "请先准备项目的 Colab 实验，再选择 Colab 开始资源检测。");
+  $("colabDetails").className = `form-status${job.blocked_reason || job.status === "failed" ? " error" : ""}`;
+  $("prepareColab").disabled = state.colabBusy || ["running", "checking", "attempting", "gpu_available"].includes(job.status);
+  $("loginColab").disabled = state.colabBusy || ["running", "checking", "attempting", "gpu_available"].includes(job.status);
+  const liveWorker = job.worker_running !== false;
+  $("startColab").disabled = state.colabBusy || !job.prepared || ["completed", "failed", "cancelled"].includes(job.status) || (liveWorker && ["running", "checking", "attempting", "gpu_available"].includes(job.status));
+  $("startColab").textContent = job.status === "auth_required" ? "Resume After Login / 登录后继续" : (["running", "gpu_available"].includes(job.status) ? "Resume Monitoring / 恢复监控" : "Start Free GPU Trial / 申请并运行");
+  $("cancelColab").disabled = state.colabBusy || !job.prepared || ["cancelled", "completed", "failed"].includes(job.status);
+  $("colabDownloads").classList.toggle("hidden", !job.prepared);
+  // Download targets always use this local project's export endpoints.
+  if (state.current) {
+    const base = `/api/projects/${encodeURIComponent(state.current.id)}/colab`;
+    $("downloadColabNotebook").href = `${base}/notebook.ipynb`;
+    $("downloadColabBundle").href = `${base}/bundle.zip`;
+    $("downloadColabInputs").href = `${base}/inputs.zip`;
+    $("downloadColabInputs").classList.toggle("hidden", !job.input_bundle_url);
+  }
+  renderColabResourceAgent();
+}
+
+function colabResourceView(snapshot, job, now = Date.now()) {
+  const heartbeatTime = Date.parse(snapshot?.heartbeat_at || "");
+  const heartbeatFresh = Number.isFinite(heartbeatTime) && now - heartbeatTime <= 45000 && now >= heartbeatTime - 10000;
+  const checkedTime = Date.parse(snapshot?.last_checked_at || "");
+  const checkFresh = Number.isFinite(checkedTime) && now - checkedTime <= 45000 && now >= checkedTime - 10000;
+  const checking = snapshot?.agent_state === "checking";
+  const active = ["watching", "checking"].includes(snapshot?.agent_state);
+  const jobKnown = typeof job?.status === "string";
+  const allocated = snapshot?.worker_running === true && job?.worker_running === true && ["gpu_available", "available", "running"].includes(snapshot?.job_status) && ["gpu_available", "available", "running"].includes(job?.status);
+  let availability = "unknown";
+  if (heartbeatFresh && active && snapshot?.availability === "available" && allocated) availability = "available";
+  if (heartbeatFresh && checkFresh && active && jobKnown && snapshot?.availability === "unavailable" && !checking) availability = "unavailable";
+  const agentLabels = {
+    watching: "持续监测中", checking: "正在检查 GPU", quota_wait: "等待额度冷却",
+    auth_required: "等待登录或授权", stopped: "已停止", offline: "监测 Agent 离线"
+  };
+  const resultLabels = {
+    available: "当前账号已分配 GPU", unavailable: "当前账号暂不可用", quota: "当前账号不可用（额度限制）",
+    network: "连接失败，资源状态未确认", auth: "需要登录或授权，资源状态未确认", unknown: "尚未确认"
+  };
+  return {
+    availability,
+    availabilityLabel: { available: "有 · 当前账号已分配 GPU", unavailable: "暂不可用 · 最近一次申请结果", unknown: "待确认 · 等待下次实际检查" }[availability],
+    agentLabel: snapshot ? (heartbeatFresh ? (agentLabels[snapshot.agent_state] || "监测中") : "监测 Agent 离线 · 状态已过期") : "监测 Agent 尚未启动",
+    lastResultLabel: resultLabels[snapshot?.last_result] || resultLabels.unknown,
+    nextCheck: snapshot?.next_check_at || job?.next_attempt_at || null,
+    heartbeatFresh
+  };
+}
+
+function colabResourceTime(value) {
+  const time = Date.parse(value || "");
+  return Number.isFinite(time) ? new Date(time).toLocaleString("zh-CN") : "—";
+}
+
+function renderColabResourceAgent() {
+  const snapshot = state.colabResourceAgent?.project_id === state.current?.id ? state.colabResourceAgent : null;
+  const view = colabResourceView(snapshot, state.colab || {});
+  if (!snapshot && state.colabResourceAgentUnavailable) view.agentLabel = "监测状态暂时不可用";
+  $("colabResourceAvailability").textContent = view.availabilityLabel;
+  $("colabResourceAvailability").className = `resource-availability ${view.availability}`;
+  $("colabResourceAgentState").textContent = view.agentLabel;
+  $("colabResourceHeartbeat").textContent = colabResourceTime(snapshot?.heartbeat_at);
+  $("colabResourceLastResult").textContent = view.lastResultLabel;
+  $("colabResourceLastChecked").textContent = colabResourceTime(snapshot?.last_checked_at);
+  $("colabResourceNextCheck").textContent = colabResourceTime(view.nextCheck);
+  $("colabResourceMessage").textContent = snapshot?.message || "已准备的项目选择 Colab 后，专用 Agent 自动监测资源；需要登录或授权时，完成页面操作后继续。";
+}
+
+async function loadColabResourceAgent(projectId) {
+  try {
+    const snapshot = await api(`/static/colab-resource-status/${encodeURIComponent(projectId)}.json`, { cache: "no-store" });
+    if (snapshot.project_id !== projectId) throw new Error("Resource status belongs to another project");
+    if (state.current?.id !== projectId) return;
+    state.colabResourceAgent = snapshot;
+    state.colabResourceAgentUnavailable = false;
+  } catch (error) {
+    if (state.current?.id !== projectId) return;
+    state.colabResourceAgent = null;
+    state.colabResourceAgentUnavailable = error.status !== 404;
+  }
+  renderColabResourceAgent();
+}
+
+async function loadColab() {
+  if (!state.current) return;
+  const projectId = state.current.id;
+  const loadJob = async () => {
+    try {
+      const job = await api(`/api/projects/${encodeURIComponent(projectId)}/colab`);
+      if (state.current?.id !== projectId) return;
+      state.colab = job;
+      renderColab();
+    } catch (error) {
+      if (state.current?.id !== projectId) return;
+      state.colab = null;
+      state.colabResourceAgent = null;
+      state.colabResourceAgentUnavailable = true;
+      renderColab();
+      $("colabDetails").textContent = `Colab status unavailable: ${error.message}`;
+    }
+  };
+  await Promise.all([loadJob(), loadColabResourceAgent(projectId)]);
+}
+
+async function ensureSelectedColabCheck() {
+  if ($("computeProvider").value !== "colab" || !state.current || !state.colab?.prepared || state.colabBusy) return;
+  const projectId = state.current.id;
+  if (state.colabCheckedProjectId === projectId || ["completed", "failed", "cancelled", "blocked"].includes(state.colab.status)) return;
+  state.colabCheckedProjectId = projectId;
+  state.colabBusy = true;
+  renderColab();
+  let checkMessage = "";
+  try {
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/colab/check`, {
+      method: "POST", timeoutMs: 20000, body: JSON.stringify({ browser: state.colab.browser || "chrome" })
+    });
+    if (state.current?.id !== projectId) return;
+    if (result.job) state.colab = result.job;
+    checkMessage = result.message || "";
+    await loadColabResourceAgent(projectId);
+  } catch (error) {
+    if (state.current?.id !== projectId) return;
+    state.colabCheckedProjectId = null;
+    checkMessage = `Colab 检测未启动: ${error.message}`;
+    toast(error.message, true);
+  } finally {
+    state.colabBusy = false;
+    if (state.current?.id === projectId) {
+      renderColab();
+      if (checkMessage) $("colabDetails").textContent = [checkMessage, $("colabDetails").textContent].join("\n");
+    }
+    else await ensureSelectedColabCheck();
+  }
+}
+
+async function selectComputeProvider() {
+  updateComputeProvider();
+  await ensureSelectedColabCheck();
+}
+
+$("computeProvider").addEventListener("change", selectComputeProvider);
+$("loginColab").onclick = async () => {
+  if (!state.current || state.colabBusy) return;
+  state.colabBusy = true; renderColab();
+  try {
+    await api(`/api/projects/${encodeURIComponent(state.current.id)}/colab/login`, {
+      method: "POST", timeoutMs: 60000, body: JSON.stringify({ browser: "chrome" })
+    });
+    toast("Complete Google login, close that Chrome window, then Start / 登录后关闭该窗口，再启动试验");
+  } catch (error) { toast(error.message, true); }
+  finally { state.colabBusy = false; await loadColab(); }
+};
+$("prepareColab").onclick = async () => {
+  if (!state.current || state.colabBusy) return;
+  state.colabBusy = true; renderColab();
+  const projectId = state.current.id;
+  try {
+    const job = await api(`/api/projects/${encodeURIComponent(projectId)}/colab/prepare`, {
+      method: "POST", timeoutMs: 60000, body: JSON.stringify({
+        drive_root: $("colabDriveRoot").value.trim() || "AutoResearch",
+        notebook_url: $("colabNotebookUrl").value.trim(), retry_min_minutes: 5, retry_max_minutes: 10
+      })
+    });
+    if (state.current?.id === projectId) state.colab = job;
+    toast("Colab notebook prepared / 实验已准备");
+  } catch (error) { toast(error.message, true); }
+  finally { state.colabBusy = false; await loadColab(); }
+};
+$("startColab").onclick = async () => {
+  if (!state.current || state.colabBusy || !state.colab?.prepared) return;
+  state.colabBusy = true; renderColab();
+  try {
+    const action = state.colab.status === "auth_required" && state.colab.worker_running !== false ? "resume" : "launch";
+    await api(`/api/projects/${encodeURIComponent(state.current.id)}/colab/${action}`, {
+      method: "POST", timeoutMs: 20000, body: JSON.stringify({ confirm_execute: true })
+    });
+    toast(action === "resume" ? "Colab worker resumed / 工作器继续运行" : "Colab browser opened. Complete Google login if prompted.");
+  } catch (error) { toast(error.message, true); }
+  finally { state.colabBusy = false; await loadColab(); }
+};
+$("cancelColab").onclick = async () => {
+  if (!state.current || state.colabBusy) return;
+  state.colabBusy = true; renderColab();
+  try {
+    state.colab = await api(`/api/projects/${encodeURIComponent(state.current.id)}/colab/cancel`, { method: "POST" });
+    toast("GPU retries stopped. An active notebook must be stopped in Colab.");
+  } catch (error) { toast(error.message, true); }
+  finally { state.colabBusy = false; await loadColab(); }
+};
 
 $("researchForm").addEventListener("submit", async (event) => {
   event.preventDefault();

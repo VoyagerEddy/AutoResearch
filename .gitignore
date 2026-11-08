@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 data/
+autoresearch/static/colab-resource-status/
 datasets/
 workspaces/
 results/

@@ -102,12 +102,18 @@ async def test_mcp_exposes_chatgpt_collaboration_tools(tmp_path: Path) -> None:
             "start_autodl_experiment",
             "get_experiment_result",
             "record_chatgpt_analysis",
+            "get_colab_status",
+            "prepare_colab_experiment",
+            "start_colab_experiment",
+            "cancel_colab_retries",
         } <= names
         assert by_name["start_autodl_experiment"].annotations.destructive_hint is True
         assert by_name["create_autodl_instance"].annotations.destructive_hint is True
         assert "confirm_execute" in by_name["start_autodl_experiment"].input_schema["required"]
         assert by_name["check_autodl_readiness"].annotations.read_only_hint is True
         assert by_name["check_autodl_readiness"].annotations.destructive_hint is False
+        assert "confirm_execute" in by_name["start_colab_experiment"].input_schema["required"]
+        assert by_name["get_colab_status"].annotations.read_only_hint is True
 
         created = await client.call_tool(
             "create_research_project",
@@ -120,6 +126,16 @@ async def test_mcp_exposes_chatgpt_collaboration_tools(tmp_path: Path) -> None:
         })
         assert readiness.structured_content["ready"] is False
         assert by_name["check_experiment_readiness"].annotations.read_only_hint is True
+
+        colab = await client.call_tool("get_colab_status", {
+            "project_id": created.structured_content["project"]["id"]
+        })
+        assert colab.structured_content["status"] == "not_prepared"
+        denied = await client.call_tool("start_colab_experiment", {
+            "project_id": created.structured_content["project"]["id"], "confirm_execute": False
+        })
+        assert denied.is_error is True
+        assert not (tmp_path / "data" / "colab-browser").exists()
 
 
 @pytest.mark.asyncio

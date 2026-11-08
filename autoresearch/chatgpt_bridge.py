@@ -10,6 +10,7 @@ from .domain import (
     AutoDLExperimentRequest,
     ChatGPTAnalysisRequest,
     ChatGPTProjectRequest,
+    ColabPrepareRequest,
     CodeGenerationRequest,
     CodeSaveRequest,
     ExperimentStartRequest,
@@ -25,6 +26,7 @@ from .services.experiment_readiness import inspect_experiment
 from .services.autodl import AutoDLClient, AutoDLError, extract_ssh
 from .services.llm import LLMError, OpenRouterClient
 from .services.search import ResearchSearch
+from .services.colab import ColabService
 
 
 class ChatGPTBridge:
@@ -39,9 +41,43 @@ class ChatGPTBridge:
         self.db = db
         self.settings = settings
         self.experiments = experiments
+        self.colab = ColabService(db, settings)
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings
+        self.colab.update_settings(settings)
+
+    def colab_status(self, project_id: str) -> dict[str, Any]:
+        return self.colab.status(project_id)
+
+    def prepare_colab(self, project_id: str, request: ColabPrepareRequest) -> dict[str, Any]:
+        return self.colab.prepare(project_id, request)
+
+    def start_colab(self, project_id: str, *, confirm_execute: bool = False) -> dict[str, Any]:
+        if not confirm_execute:
+            raise ValueError("User authorization is required before executing the project in Colab")
+        from .colab_browser_cli import launch_colab_worker
+
+        job = self.colab.status(project_id)
+        if not job.get("prepared"):
+            raise ValueError("Prepare the Colab experiment notebook first")
+        if job.get("status") in {"completed", "failed", "cancelled"}:
+            raise ValueError("Prepare the Colab notebook again before starting another run")
+        job = self.colab.enable_autorun(project_id, job.get("browser", "auto"))
+        if job.get("status") == "auth_required":
+            job = self.colab.resume(project_id)
+        if not job.get("can_attempt") and job.get("status") not in {"running", "gpu_available"} and not job.get("worker_running"):
+            return {"project_id": project_id, "status": "retry_scheduled",
+                    "next_attempt_at": job.get("next_attempt_at"), "autorun_enabled": True}
+        pid = launch_colab_worker(self.settings.root, project_id,
+                                  api_url=f"http://127.0.0.1:{self.settings.port}",
+                                  browser=job.get("browser", "auto"))
+        self.colab.worker_launched(project_id, pid)
+        return {"project_id": project_id, "status": "browser_launched", "pid": pid,
+                "message": "Complete Google login and notebook Drive authorization in the browser if prompted."}
+
+    def cancel_colab(self, project_id: str) -> dict[str, Any]:
+        return self.colab.cancel(project_id)
 
     def create_project(self, request: ChatGPTProjectRequest) -> dict[str, Any]:
         project = self.db.create_project(
