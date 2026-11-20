@@ -1,10 +1,10 @@
 # AutoResearch
 
-AutoResearch is a local research execution workbench. The recommended workflow is to use the current conversation and selected model in the ChatGPT desktop app for research reasoning, then call AutoResearch's local MCP tools to persist notes and code, search sources, provision AutoDL instances, run experiments, and inspect results. Project state, sources, logs, metrics, and analysis remain visible in the web dashboard.
+AutoResearch is a ChatGPT plugin with a local research execution service. ChatGPT handles research reasoning and calls the plugin to save notes and code, search sources, provision compute, run experiments, and inspect results. The read-only dashboard shows project progress, sources, logs, metrics, analysis, and connection status.
 
 The original fully autonomous OpenRouter workflow is still available. In collaborative mode, only `generate_experiment_code` invokes the configured OpenRouter model. `save_experiment_code` safely stores code already written by ChatGPT and does not make another model call.
 
-> This release is a working MVP. Do not run model-generated code unattended on production systems. The UI requires explicit confirmation before provisioning billable AutoDL instances, running SSH commands, or releasing replacement instances.
+> This release is a working MVP. Do not run model-generated code unattended on production systems. The plugin requires explicit confirmation in ChatGPT for billable AutoDL provisioning and remote SSH execution, including any authorized release of a replacement instance.
 
 ## Quick start on Windows
 
@@ -12,10 +12,8 @@ Requirements: Python 3.11+ and Git. Chrome and VS Code are recommended.
 
 1. Double-click `start.cmd`. The first run creates `.venv`, installs dependencies, and creates a local `.env` file.
 2. Chrome opens `http://127.0.0.1:8765`.
-3. The default workflow is **ChatGPT collaboration**. Create a project and use its project ID in your ChatGPT conversation.
-4. For the first ChatGPT connection, select **Set up connection** on the home page or run `setup-chatgpt.cmd`. On later runs, use `start-chatgpt.cmd` to keep both the local service and Tunnel available.
-5. Open **Settings and connections** and enter an OpenRouter key only if you delegate code generation to AutoResearch or use autonomous mode.
-6. To use AutoDL, obtain a developer token from **Account → Settings** in the AutoDL console. A custom image UUID is optional; when it is blank, AutoResearch uses AutoDL's documented public PyTorch 2.0.0 / CUDA 11.8 base image.
+3. Run `setup-chatgpt.cmd` for the first ChatGPT connection. On later runs, use `start-chatgpt.cmd` to keep the local service and Tunnel available.
+4. Enable AutoResearch in your ChatGPT conversation. Ask ChatGPT to create or open a project and use the dashboard link it returns to view progress.
 
 PowerShell alternative:
 
@@ -57,7 +55,7 @@ ChatGPT cannot connect directly to loopback addresses. Developer mode uses Secur
 - Diagnostics: run `powershell -NoProfile -ExecutionPolicy Bypass -File .\chatgpt-tunnel.ps1 -Action Doctor`.
 - Status: the web UI reports MCP, client installation, Tunnel configuration, and Tunnel runtime status separately.
 
-### Autonomous AutoResearch mode
+### Autonomous AutoResearch mode through the local API
 
 1. **Plan:** convert the topic into an objective, hypotheses, search queries, and an evaluation plan.
 2. **Search:** query several paper and code sources, deduplicate by title, and persist real URLs.
@@ -71,7 +69,9 @@ If OpenRouter is not configured or temporarily unavailable, AutoResearch creates
 
 ## AutoDL
 
-AutoResearch uses AutoDL's official [Container Instance Pro API](https://www.autodl.com/docs/instance_pro_api/) for normal provisioning. Its optional Playwright adapter can use an installed Chrome or Edge browser for account setup and console workflows when API configuration is unavailable. The dashboard's one-time setup stores the phone and password in the current user's local application data encrypted with Windows DPAPI; neither is committed or written to `.env`. Later logins fill those values automatically while visible security verification and the SMS one-time code remain user-completed. Start it from **Settings & Connections → AutoDL Pro API**. The adapter also contains a tested contour-matching and closed-loop drag implementation for explicitly authorized integration tests. See [`docs/AUTODL_BROWSER.md`](docs/AUTODL_BROWSER.md). The default GPU preference is:
+AutoResearch uses AutoDL's official [Container Instance Pro API](https://www.autodl.com/docs/instance_pro_api/) for provisioning from ChatGPT. An optional browser adapter is available through the local CLI for AutoDL account setup and troubleshooting. See [`docs/AUTODL_BROWSER.md`](docs/AUTODL_BROWSER.md).
+
+The default GPU preference is as follows.
 
 1. `v-48g`, the documented 4090-48G general-purpose specification.
 2. `5090-p`, the documented 5090-32G performance specification.
@@ -86,19 +86,19 @@ If an SSH check finds an active GPU workload, recovery saves the current image a
 
 ## Google Colab free GPU
 
-Select **Google Colab · Free GPU** in a project's compute panel, prepare the notebook, then start the browser worker. Complete Google sign-in and Drive authorization in the browser when requested. Training executes in the Colab notebook, with durable files in `MyDrive/AutoResearch/<project-id>/` and resumable training checkpoints.
+ChatGPT uses `prepare_colab_experiment` and `start_colab_experiment` to prepare and start the authorized job. The browser worker opens a saved Drive notebook and verifies its source checksum before requesting a GPU. Google sign-in and Drive consent prompts appear in the dedicated Colab browser when required. Training executes in the notebook, with durable files in `MyDrive/AutoResearch/<project-id>/` and resumable checkpoints.
 
-Starting a prepared job saves its autorun authorization. Unavailable GPUs are retried after a persisted random 5–10 minute interval. An explicit account quota limit uses the provider's cooldown when available, or a conservative 12-hour wait when unspecified; this does not guarantee Google's quota reset time. Keep the local AutoResearch app running: its scheduler launches a missing browser worker when the saved deadline arrives, including after an app restart. Login, CAPTCHA, authorization, and ambiguous runtime state pause for user action. **Stop retries** cancels future launches; stop any active training runtime in Colab itself. GPU availability is verified for the signed-in account; exporting a notebook does not allocate a GPU.
+Starting a prepared job saves its execution authorization. Unavailable GPUs are retried after a persisted random 5–10 minute interval. An explicit account quota limit uses the provider's cooldown when available or a conservative 12-hour wait when unspecified. While the local service runs, its scheduler launches a missing browser worker when the saved deadline arrives and can recover the schedule after a restart. ChatGPT can call `cancel_colab_retries` to cancel future launches. Any active runtime is stopped in Colab itself. The worker verifies GPU availability for the signed-in account.
 
 A dedicated background resource agent follows each authorized Colab job every 10 seconds. The project panel shows account availability, the agent heartbeat, the last actual GPU-check result and time, and the next check. Actual connection attempts follow the saved retry deadline; waiting, quota cooldowns and stale observations remain unconfirmed. Browser closure does not stop this observer. Canceling retries or finishing the job stops it.
 
-On Windows, the desktop **AutoResearch** shortcut uses `start-desktop.ps1` to start the local service in the background or reuse the running service. It opens the speaker project. Select **Google Colab** to start the resource check and monitor automatically; any login or authorization pause is shown in the panel.
+On Windows, the desktop **AutoResearch** shortcut uses `start-desktop.ps1` to start or reuse the local service and open the status dashboard. A project link from ChatGPT opens the status for that project.
 
 An optional official Colab Notebook MCP bridge runs in an isolated Python 3.13 environment to edit cells and read their output. GPU selection and connection still use the Colab interface. See [docs/COLAB.md](docs/COLAB.md) for setup, checkpoint requirements, and recovery.
 
 ## Configuration
 
-Copy `.env.example` to `.env`, or use the web settings dialog:
+Local service configuration lives in `.env`. `start.cmd` creates it from `.env.example` on first run. An OpenRouter key is needed for delegated code generation or autonomous mode. AutoDL uses the developer token from **Account → Settings** in the AutoDL console. A blank `AUTODL_IMAGE_UUID` selects the documented public PyTorch 2.0.0 / CUDA 11.8 base image.
 
 ```dotenv
 OPENROUTER_API_KEY=
@@ -106,7 +106,7 @@ OPENROUTER_MODEL=openrouter/free
 AUTODL_TOKEN=
 AUTODL_IMAGE_UUID=
 AUTODL_GPU_SPECS=v-48g,5090-p
-GITHUB_REMOTE_URL=https://github.com/VoyagerEddy/AutoResearch.git
+GITHUB_REMOTE_URL=
 ```
 
 Never commit real secrets. The settings API returns only whether a value is configured and never echoes keys or tokens.
@@ -123,7 +123,7 @@ Generated `experiment_manifest.json` files describe setup, data downloads, the r
 results/metrics.json
 ```
 
-Experiment entry points must return nonzero on failure. Setup and download commands are recorded for review; the UI executes only the confirmed experiment command. Through ChatGPT tools, AutoResearch retrieves SSH credentials internally and never returns the SSH password, AutoDL token, or OpenRouter key. Billable provisioning requires `confirm_billable=true`, and upload plus execution requires `confirm_execute=true` after explicit consent in the current conversation.
+Experiment entry points must return nonzero on failure. Setup and download commands are recorded for review. The plugin runs the confirmed experiment command and retrieves SSH credentials internally. Billable provisioning requires `confirm_billable=true`, and upload plus execution requires `confirm_execute=true` after explicit consent in the current conversation.
 
 ## Development and testing
 

@@ -72,7 +72,7 @@ if ($Action -eq "Setup") {
     Write-Utf8NoBom -Path $PhonePath -Value ($securePhone | ConvertFrom-SecureString)
     Write-Utf8NoBom -Path $SecretPath -Value ($password | ConvertFrom-SecureString)
     Write-Host "AutoDL login details were saved for this Windows user only."
-    Write-Host "Return to AutoResearch and click 'Auto Login to AutoDL'."
+    Write-Host "Run .\autodl-browser.ps1 -Action Login to open the AutoDL login browser."
     Read-Host "Press Enter to close"
     exit 0
 }
@@ -80,36 +80,27 @@ if ($Action -eq "Setup") {
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "AutoResearch virtual environment was not found. Run start.cmd once."
 }
-if (
-    -not (Test-Path -LiteralPath $PhonePath -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $SecretPath -PathType Leaf)
-) {
-    throw "AutoDL login is not configured. Click 'Configure AutoDL Login' first."
+if (-not (Test-Path -LiteralPath $PhonePath -PathType Leaf)) {
+    throw "AutoDL login is not configured. Run .\autodl-browser.ps1 -Action Setup first."
 }
 
 try {
     $protectedPhone = (Get-Content -Raw -LiteralPath $PhonePath).Trim()
-    $protectedPassword = (Get-Content -Raw -LiteralPath $SecretPath).Trim()
     $securePhone = $protectedPhone | ConvertTo-SecureString
-    $securePassword = $protectedPassword | ConvertTo-SecureString
 }
 catch {
     throw "The saved AutoDL login cannot be decrypted by this Windows user. Configure it again."
 }
 
 $plainPhone = Convert-ToPlainText $securePhone
-$plainPassword = Convert-ToPlainText $securePassword
 $previousPhone = [Environment]::GetEnvironmentVariable("AUTODL_BROWSER_PHONE", "Process")
-$previousPassword = [Environment]::GetEnvironmentVariable("AUTODL_BROWSER_PASSWORD", "Process")
 try {
     [Environment]::SetEnvironmentVariable("AUTODL_BROWSER_PHONE", $plainPhone, "Process")
-    [Environment]::SetEnvironmentVariable("AUTODL_BROWSER_PASSWORD", $plainPassword, "Process")
     $arguments = @(
         "-m", "autoresearch", "autodl-browser-login",
         "--sms",
         "--browser", $Browser,
-        "--open", $OpenPage,
-        "--manual-captcha"
+        "--open", $OpenPage
     )
     if ($KeepOpen) { $arguments += "--keep-open" }
     & $PythonPath @arguments
@@ -117,9 +108,7 @@ try {
 }
 finally {
     [Environment]::SetEnvironmentVariable("AUTODL_BROWSER_PHONE", $previousPhone, "Process")
-    [Environment]::SetEnvironmentVariable("AUTODL_BROWSER_PASSWORD", $previousPassword, "Process")
     $plainPhone = $null
-    $plainPassword = $null
 }
 
 if ($exitCode -ne 0) {

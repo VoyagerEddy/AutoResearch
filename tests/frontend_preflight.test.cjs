@@ -4,211 +4,195 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 
-// Run the actual UI handlers against controlled HTTP responses. This verifies
-// billing request counts and locks; it is not a visual/browser layout test.
-function ui(fetch) {
-  const root = path.join(__dirname, '..', 'autoresearch', 'static');
-  const ids = [...fs.readFileSync(path.join(root, 'index.html'), 'utf8').matchAll(/id="([^"]+)"/g)].map(m => m[1]);
-  const nodes = new Map(ids.map(id => [id, {
-    textContent: '', value: '', disabled: false,
-    classList: { toggle() {}, add() {}, remove() {} },
-    listeners: {},
-    addEventListener(event, handler) { this.listeners[event] = handler; },
-  }]));
-  let confirmations = 0;
+const root = path.join(__dirname, '..', 'autoresearch', 'static');
+const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/bootstrap\(\);\s*$/, '');
+
+function element() {
+  const classes = new Set();
+  return {
+    textContent: '', children: [], dataset: {}, attributes: {},
+    classList: {
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+      toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+    },
+    style: {setProperty() {}},
+    setAttribute(name, value) { this.attributes[name] = value; },
+    append(...children) { this.children.push(...children); },
+    prepend(...children) { this.children = [...children, ...this.children.filter(child => !children.includes(child))]; },
+    replaceChildren() { this.children = []; },
+    querySelectorAll() { return []; },
+  };
+}
+
+function ui(fetch, search = '') {
+  const ids = [...html.matchAll(/id="([^"]+)"/g)].map(m => m[1]);
+  const nodes = new Map(ids.map(id => [id, element()]));
+  const panelIds = [...html.matchAll(/<section id="(colabPanel|autodlPanel)"/g)].map(m => m[1]);
+  nodes.get('computePanels').append(...panelIds.map(id => nodes.get(id)));
+  const timers = [];
+  const location = {search};
   const context = vm.createContext({
     document: {
-      getElementById(id) { assert.ok(nodes.has(id), `Unknown DOM id: ${id}`); return nodes.get(id); },
+      getElementById(id) { assert.ok(nodes.has(id), "Unknown DOM ID " + id); return nodes.get(id); },
       querySelectorAll() { return []; },
+      createElement() { return element(); },
     },
-    fetch, AbortController, history: {replaceState() {}},
+    fetch, AbortController, URLSearchParams, location,
+    history: {replaceState(_state, _title, query) { location.search = query; }},
     setTimeout() { return 1; }, clearTimeout() {},
-    confirm() { confirmations++; return true; },
+    setInterval(handler) { timers.push(handler); },
   });
-  const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/bootstrap\(\);\s*$/, '');
   vm.runInContext(source, context);
-  return { nodes, context, confirmations: () => confirmations, click: () => nodes.get('createInstance').onclick() };
+  return { nodes, context, timers, location };
 }
 
 const response = (data, status = 200) => ({ ok: status < 400, status, json: async () => data });
-const ready = { ready: true, verified: false, blocking_issues: [], warnings: [] };
+const project = (id, phase = 'ready') => ({ id, topic: 'Project ' + id, phase, status: phase, progress: 70 });
+const ready = { ready: true, blocking_issues: [], warnings: [] };
 
-test('missing configuration prevents confirmation and billable request', async () => {
+function statusResponse(url, projects) {
+  if (url === '/api/health') return response({ok: true});
+  if (url === '/api/chatgpt/connection') return response({tunnel_ready: true});
+  if (url === '/api/settings') return response({autodl_gpu_specs: ['v-48g'], monitor_seconds: 30, max_iterations: 3});
+  if (url.includes('/preflight')) return response(ready);
+  if (url === '/api/projects') return response(projects);
+  if (url.endsWith('/readiness')) return response(ready);
+  if (url.endsWith('/colab')) return response({prepared: true, status: 'waiting_for_gpu'});
+  if (url.endsWith('/colab/resources')) return response({project_id: url.split('/')[3], agent_state: 'watching'});
+  if (/\/(events|sources|experiments)$/.test(url)) return response([]);
+  if (url === '/api/projects/earlier') return response(project('earlier'));
+  throw new Error('Unexpected status request ' + url);
+}
+
+test('dashboard has no forms or operation controls', () => {
+  assert.doesNotMatch(html, /<(form|input|select|textarea|button|dialog)(\s|>)/i);
+  assert.doesNotMatch(source, /\b(method\s*:|confirm\(|prompt\(|alert\()/);
+});
+
+test('latest ChatGPT project and its compute status appear automatically using only status requests', async () => {
   const calls = [];
-  const app = ui(async url => {
-    calls.push(url);
-    return response({ ...ready, ready: false, blocking_issues: [{ message: 'missing token and image' }] });
+  let projects = [];
+  const app = ui(async (url, options) => {
+    calls.push({url, method: options.method || 'GET'});
+    return statusResponse(url, projects);
   });
-  await app.click();
-  assert.equal(app.confirmations(), 0);
-  assert.equal(calls.length, 1);
-  assert.match(calls[0], /preflight/);
-  assert.equal(app.nodes.get('createInstance').disabled, true);
+  await vm.runInContext('bootstrap()', app.context);
+  assert.match(app.nodes.get('emptyTitle').textContent, /No research projects/);
+  assert.equal(app.timers.length, 1);
+  projects = [project('latest'), project('earlier')];
+  await app.timers[0]();
+  assert.equal(app.nodes.get('projectId').textContent, 'latest');
+  assert.match(app.nodes.get('colabStatus').textContent, /Waiting for GPU/);
+  assert.equal(app.nodes.get('experimentStatus').textContent, 'Not started');
+  assert.equal(app.nodes.get('computePanels').children[0], app.nodes.get('autodlPanel'));
+  assert.ok(calls.some(call => call.url === '/api/projects/latest/colab/resources'));
+  assert.ok(calls.every(call => call.method === 'GET'));
+  assert.equal(calls.some(call => /\/(check|launch|start|resume|login|prepare|cancel)$/.test(call.url)), false);
 });
 
-test('concurrent clicks send exactly one create request', async () => {
-  let creates = 0;
-  const app = ui(async url => {
-    if (url.includes('preflight')) return response(ready);
-    creates++;
-    return response({ instance_uuid: 'pro-test', gpu_spec: 'v-48g' });
-  });
-  await Promise.all([app.click(), app.click()]);
-  assert.equal(creates, 1);
-  assert.equal(app.confirmations(), 1);
-  assert.equal(app.nodes.get('instanceUuid').value, 'pro-test');
+test('project navigation changes the status display and uses the existing deep link', async () => {
+  const calls = [];
+  const app = ui(async (url, options) => {
+    calls.push({url, method: options.method || 'GET'});
+    return statusResponse(url, [project('latest'), project('earlier')]);
+  }, '?project=earlier&compute=colab');
+  await vm.runInContext('bootstrap()', app.context);
+  assert.equal(app.nodes.get('projectId').textContent, 'earlier');
+  assert.equal(app.nodes.get('computePanels').children[0], app.nodes.get('colabPanel'));
+  await app.nodes.get('projectList').children[0].onclick();
+  assert.equal(app.nodes.get('projectId').textContent, 'latest');
+  assert.equal(app.location.search, '?project=latest&compute=colab');
+  assert.ok(calls.every(call => call.method === 'GET'));
 });
 
-test('uncertain creation remains locked after preflight refresh and another click', async () => {
-  let creates = 0;
-  const app = ui(async url => {
-    if (url.includes('preflight')) return response(ready);
-    creates++;
-    return response({ detail: { code: 'autodl_create_uncertain', message: 'Check instances first' } }, 409);
-  });
-  await app.click();
-  await vm.runInContext('refreshAutoDL()', app.context);
-  await app.click();
-  assert.equal(creates, 1);
-  assert.equal(app.nodes.get('createInstance').disabled, true);
-  assert.match(app.nodes.get('createInstance').textContent, /result unknown/i);
+test('a direct link can load an older project outside the list window', async () => {
+  const app = ui(async url => statusResponse(url, [project('latest')]), '?project=earlier&compute=colab');
+  await vm.runInContext('bootstrap()', app.context);
+  assert.equal(app.nodes.get('projectId').textContent, 'earlier');
 });
 
-test('running launcher is not rendered as connected', () => {
+test('running launcher reports a connection that is still starting', () => {
   const app = ui(async () => { throw new Error('No request expected'); });
   vm.runInContext('state.connection = {tunnel_configured: true, tunnel_process_running: true, tunnel_ready: false}; renderConnection()', app.context);
   assert.match(app.nodes.get('tunnelRunStatus').textContent, /not ready/i);
-  assert.doesNotMatch(app.nodes.get('settingsTunnelStatus').textContent, /connected/i);
 });
 
 test('project input blockers are visible without executing commands', async () => {
   const calls = [];
-  const app = ui(async url => {
-    calls.push(url);
+  const app = ui(async (url, options) => {
+    calls.push({url, method: options.method || 'GET'});
     return response({ ready: false, blocking_issues: [{code: 'input', path: '/remote/data', message: 'Remote input remains unverified'}] });
   });
   await vm.runInContext("state.current = {id: 'project'}; loadExperimentReadiness()", app.context);
-  assert.deepEqual(calls, ['/api/projects/project/readiness']);
+  assert.deepEqual(calls, [{url: '/api/projects/project/readiness', method: 'GET'}]);
   assert.match(app.nodes.get('experimentReadiness').textContent, /unverified/);
-  assert.equal(app.nodes.get('checkExperimentReadiness').disabled, false);
-});
-
-test('an absent run command clears a previous project command', async () => {
-  const app = ui(async () => response({}));
-  app.nodes.get('remoteCommand').value = 'old command';
-  await vm.runInContext("state.current = {id: 'new-project', status: 'running'}; loadManifest()", app.context);
-  assert.equal(app.nodes.get('remoteCommand').value, '');
 });
 
 test('Colab waiting state displays a retry deadline without claiming GPU allocation', () => {
   const app = ui(async () => { throw new Error('No request expected'); });
-  vm.runInContext("state.current = {id: 'speaker'}; state.colab = {prepared: true, status: 'waiting', next_attempt_at: '2026-10-08T12:00:00Z', attempt_count: 1}; renderColab()", app.context);
+  vm.runInContext("state.current = {id: 'sample-project'}; state.colab = {prepared: true, status: 'waiting', next_attempt_at: '2026-10-08T12:00:00Z', attempt_count: 1}; renderColab()", app.context);
   assert.match(app.nodes.get('colabStatus').textContent, /Waiting/);
   assert.doesNotMatch(app.nodes.get('colabStatus').textContent, /allocated|Training/);
   assert.match(app.nodes.get('colabDetails').textContent, /Next attempt/);
-  assert.equal(app.nodes.get('downloadColabNotebook').href, '/api/projects/speaker/colab/notebook.ipynb');
+  assert.equal(app.nodes.get('downloadColabNotebook').href, '/api/projects/sample-project/colab/notebook.ipynb');
 });
 
-test('concurrent Colab launch clicks start exactly one worker', async () => {
-  let launches = 0;
-  const app = ui(async url => {
-    if (url.endsWith('/launch')) { launches++; return response({status: 'launched'}); }
-    return response({prepared: true, status: 'auth'});
-  });
-  vm.runInContext("state.current = {id: 'speaker'}; state.colab = {prepared: true}", app.context);
-  await Promise.all([app.nodes.get('startColab').onclick(), app.nodes.get('startColab').onclick()]);
-  assert.equal(launches, 1);
-  assert.match(app.nodes.get('colabStatus').textContent, /Login/);
-});
-
-test('a slow Colab status response cannot overwrite a different selected project', async () => {
-  const app = ui(async () => {
-    vm.runInContext("state.current = {id: 'other'}; state.colab = {status: 'running'}", app.context);
-    return response({prepared: true, status: 'waiting'});
-  });
-  await vm.runInContext("state.current = {id: 'speaker'}; loadColab()", app.context);
-  assert.equal(vm.runInContext('state.colab.status', app.context), 'running');
-});
-
-test('a Colab project link opens the resource panel and retains it across refresh', async () => {
-  let checks = 0;
-  const app = ui(async url => {
-    if (url.endsWith('/check')) { checks++; return response({job: {prepared: true, status: 'queued'}}); }
-    return response(url === '/api/projects/speaker' ? {id: 'speaker', status: 'ready'} : {});
-  });
-  app.context.location = {search: '?project=speaker&compute=colab'};
-  app.context.URLSearchParams = URLSearchParams;
-  app.context.history = {replaceState(_state, _title, query) { app.context.location.search = query; }};
-  app.context.setInterval = () => 1;
-  app.context.clearInterval = () => {};
-  vm.runInContext(`
-    applySettings = renderConnection = renderProject = renderProjectList = beginPolling = () => {};
-    refreshAutoDL = loadEvents = loadSources = loadManifest = loadExperiments = loadExperimentReadiness = loadColabResourceAgent = async () => {};
-    loadColab = async () => { state.colab = {prepared: true, status: 'queued'}; };
-    loadProjects = async () => { state.projects = [{id: 'speaker'}]; };
-  `, app.context);
-  await vm.runInContext('bootstrap()', app.context);
-  assert.equal(app.nodes.get('computeProvider').value, 'colab');
-  assert.equal(new URLSearchParams(app.context.location.search).get('compute'), 'colab');
-  assert.equal(checks, 1);
-});
-
-test('choosing Colab checks prepared project once and polling sends no allocation requests', async () => {
+test('Colab authorization is displayed as status without a dashboard action', async () => {
   const calls = [];
   const app = ui(async (url, options) => {
     calls.push({url, method: options.method || 'GET'});
-    if (url.endsWith('/check')) return response({status: 'retry_scheduled', job: {prepared: true, status: 'waiting_for_gpu'}});
-    if (url.includes('/static/')) return response({project_id: 'speaker', availability: 'unknown'});
-    return response({prepared: true, status: 'waiting_for_gpu'});
+    if (url.endsWith('/resources')) return response({project_id: 'sample-project', availability: 'unknown'});
+    return response({
+      prepared: true,
+      status: 'auth_required',
+      blocked_reason: 'Complete Google Drive authorization, then click Continue in AutoResearch',
+      last_observation: {details: {auth_kind: 'drive_consent'}},
+    });
   });
-  vm.runInContext("state.current = {id: 'speaker'}; state.colab = {prepared: true, status: 'queued'}", app.context);
-  app.nodes.get('computeProvider').value = 'colab';
-  const select = app.nodes.get('computeProvider').listeners.change;
-  await Promise.all([select(), select()]);
-  await select();
-  await vm.runInContext('loadColab();', app.context);
-  assert.deepEqual(calls.filter(call => call.method === 'POST'), [{url: '/api/projects/speaker/colab/check', method: 'POST'}]);
-});
-
-test('Colab selection shows manual action without calling resume or paid resources', async () => {
-  const calls = [];
-  const app = ui(async (url, options) => {
-    calls.push(url);
-    if (url.endsWith('/check')) return response({status: 'auth_required', job: {prepared: true, status: 'auth_required'}});
-    return response({project_id: 'speaker', agent_state: 'auth_required', availability: 'unknown', heartbeat_at: new Date().toISOString()});
-  });
-  vm.runInContext("state.current = {id: 'speaker'}; state.colab = {prepared: true, status: 'auth_required'}", app.context);
-  app.nodes.get('computeProvider').value = 'colab';
-  await app.nodes.get('computeProvider').listeners.change();
-  assert.match(app.nodes.get('colabStatus').textContent, /页面操作/);
+  await vm.runInContext("state.current = {id: 'sample-project'}; loadColab()", app.context);
+  assert.match(app.nodes.get('colabStatus').textContent, /Browser step pending/i);
+  assert.match(app.nodes.get('colabDetails').textContent, /Waiting for Google Drive authorization/i);
+  assert.doesNotMatch(app.nodes.get('colabDetails').textContent, /click Continue/i);
   assert.match(app.nodes.get('colabResourceAvailability').textContent, /待确认/);
-  assert.equal(calls.some(url => /resume|launch|autodl|create/.test(url)), false);
+  assert.deepEqual(calls, [
+    {url: '/api/projects/sample-project/colab', method: 'GET'},
+    {url: '/api/projects/sample-project/colab/resources', method: 'GET'},
+  ]);
 });
 
-test('unprepared or finished project selection does not request Colab compute', async () => {
+test('a slow Colab status response cannot overwrite a different selected project', async () => {
+  let resolve;
+  const app = ui(async url => {
+    if (url.endsWith('/resources')) return response({}, 404);
+    return new Promise(done => { resolve = done; });
+  });
+  const load = vm.runInContext("state.current = {id: 'sample-project'}; loadColab()", app.context);
+  vm.runInContext("state.current = {id: 'other'}; state.colab = {status: 'running'}", app.context);
+  resolve(response({prepared: true, status: 'waiting'}));
+  await load;
+  assert.equal(vm.runInContext('state.colab.status', app.context), 'running');
+});
+
+test('a superseded Colab run does not display its completed metrics as current', () => {
   const app = ui(async () => { throw new Error('No request expected'); });
-  app.nodes.get('computeProvider').value = 'colab';
-  for (const status of ['not_prepared', 'completed', 'failed', 'cancelled', 'blocked']) {
-    vm.runInContext(`state.current = {id: 'speaker'}; state.colab = {prepared: ${status !== 'not_prepared'}, status: '${status}'}`, app.context);
-    await app.nodes.get('computeProvider').listeners.change();
-  }
-});
-
-test('a delayed selection check cannot replace a newly selected project status', async () => {
-  let resolveCheck;
-  const app = ui(() => new Promise(resolve => { resolveCheck = resolve; }));
-  vm.runInContext("state.current = {id: 'speaker'}; state.colab = {prepared: true, status: 'queued'}", app.context);
-  app.nodes.get('computeProvider').value = 'colab';
-  const request = app.nodes.get('computeProvider').listeners.change();
-  vm.runInContext("state.current = {id: 'other'}; state.colab = {prepared: false, status: 'not_prepared'}", app.context);
-  resolveCheck(response({job: {prepared: true, status: 'running'}}));
-  await request;
-  assert.equal(vm.runInContext('state.colab.status', app.context), 'not_prepared');
+  vm.runInContext(`
+    state.current = {id: 'sample-project'};
+    state.colab = {prepared: true, status: 'completed', source_current: true,
+      completion: {completion_kind: 'campaign_complete', metrics: {score: 0.42}}};
+    renderColab();
+  `, app.context);
+  assert.match(app.nodes.get('colabDetails').textContent, /0\.42/);
+  vm.runInContext('state.colab.source_current = false; renderColab()', app.context);
+  assert.match(app.nodes.get('colabStatus').textContent, /Code changed/);
+  assert.doesNotMatch(app.nodes.get('colabDetails').textContent, /0\.42/);
 });
 
 const monitorNow = Date.parse('2026-10-09T05:00:00Z');
 const monitorSnapshot = (extra = {}) => ({
-  project_id: 'speaker', agent_state: 'watching', heartbeat_at: '2026-10-09T05:00:00Z',
+  project_id: 'sample-project', agent_state: 'watching', heartbeat_at: '2026-10-09T05:00:00Z',
   availability: 'available', last_result: 'available', last_checked_at: '2026-10-09T04:59:50Z',
   job_status: 'running', worker_running: true, ...extra
 });
@@ -254,12 +238,12 @@ test('resource polling only reads uncached status and does not request GPU alloc
   const calls = [];
   const app = ui(async (url, options) => {
     calls.push({url, cache: options.cache});
-    if (url.includes('/static/')) return response(monitorSnapshot({heartbeat_at: new Date().toISOString(), availability: 'unknown', agent_state: 'quota_wait', last_result: 'quota'}));
+    if (url.endsWith('/colab/resources')) return response(monitorSnapshot({heartbeat_at: new Date().toISOString(), availability: 'unknown', agent_state: 'quota_wait', last_result: 'quota'}));
     return response({prepared: true, status: 'waiting_for_gpu', worker_running: false});
   });
-  await vm.runInContext("state.current = {id: 'speaker'}; loadColab()", app.context);
+  await vm.runInContext("state.current = {id: 'sample-project'}; loadColab()", app.context);
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls.find(call => call.url.includes('/static/')), {url: '/static/colab-resource-status/speaker.json', cache: 'no-store'});
+  assert.deepEqual(calls.find(call => call.url.endsWith('/colab/resources')), {url: '/api/projects/sample-project/colab/resources', cache: 'no-store'});
   assert.match(app.nodes.get('colabResourceAvailability').textContent, /待确认/);
   assert.match(app.nodes.get('colabResourceLastResult').textContent, /额度限制/);
 });
@@ -267,7 +251,7 @@ test('resource polling only reads uncached status and does not request GPU alloc
 test('a slow resource monitor response cannot overwrite a newly selected project', async () => {
   let resolveStatus;
   const app = ui(() => new Promise(resolve => { resolveStatus = resolve; }));
-  const load = vm.runInContext("state.current = {id: 'speaker'}; loadColabResourceAgent('speaker')", app.context);
+  const load = vm.runInContext("state.current = {id: 'sample-project'}; loadColabResourceAgent('sample-project')", app.context);
   vm.runInContext("state.current = {id: 'other'}; state.colabResourceAgent = {project_id: 'other', agent_state: 'stopped'}", app.context);
   resolveStatus(response(monitorSnapshot()));
   await load;
@@ -276,18 +260,18 @@ test('a slow resource monitor response cannot overwrite a newly selected project
 
 test('missing monitor status keeps the saved retry deadline without inventing availability', async () => {
   const app = ui(async () => response({}, 404));
-  await vm.runInContext("state.current = {id: 'speaker'}; state.colab = {status: 'waiting_for_gpu', next_attempt_at: '2026-10-09T05:10:00Z'}; loadColabResourceAgent('speaker')", app.context);
+  await vm.runInContext("state.current = {id: 'sample-project'}; state.colab = {status: 'waiting_for_gpu', next_attempt_at: '2026-10-09T05:10:00Z'}; loadColabResourceAgent('sample-project')", app.context);
   assert.match(app.nodes.get('colabResourceAvailability').textContent, /待确认/);
   assert.match(app.nodes.get('colabResourceAgentState').textContent, /尚未启动/);
   assert.notEqual(app.nodes.get('colabResourceNextCheck').textContent, '—');
 });
 
-test('job API failure suppresses a fresh allocation claimed by the separate monitor file', async () => {
+test('job API failure suppresses a fresh allocation claimed by the resource monitor', async () => {
   const app = ui(async url => {
-    if (url.includes('/static/')) return response(monitorSnapshot({heartbeat_at: new Date().toISOString()}));
+    if (url.endsWith('/colab/resources')) return response(monitorSnapshot({heartbeat_at: new Date().toISOString()}));
     return response({detail: 'status unavailable'}, 503);
   });
-  await vm.runInContext("state.current = {id: 'speaker'}; loadColab()", app.context);
+  await vm.runInContext("state.current = {id: 'sample-project'}; loadColab()", app.context);
   assert.match(app.nodes.get('colabResourceAvailability').textContent, /待确认/);
   assert.match(app.nodes.get('colabDetails').textContent, /unavailable/);
 });

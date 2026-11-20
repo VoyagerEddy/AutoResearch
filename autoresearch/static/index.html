@@ -3,255 +3,113 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AutoResearch</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261010-desktop-colab">
+  <title>AutoResearch · Research Status</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20261120-status">
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark">AR</div>
-          <div><strong>AutoResearch</strong><span>ChatGPT Research Execution Backend</span></div>
+        <div class="brand-mark" aria-hidden="true">AR</div>
+        <div><strong>AutoResearch</strong><span>ChatGPT Research</span></div>
       </div>
-      <button class="new-button" id="newProject">＋ New Research</button>
-      <div class="section-label">Research Projects</div>
-      <div id="projectList" class="project-list"></div>
+      <nav aria-labelledby="projectsHeading">
+        <h2 id="projectsHeading" class="section-label">Research Projects</h2>
+        <div id="projectList" class="project-list"></div>
+      </nav>
       <div class="sidebar-foot">
-        <button class="ghost" id="settingsButton">⚙ Settings & Connections</button>
-        <div class="health"><i id="healthDot"></i><span id="healthText">Connecting to local service</span></div>
+        <div class="health" role="status"><i id="healthDot"></i><span id="healthText">Connecting to local service</span></div>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <div>
-          <div class="eyebrow">CHATGPT × AUTORESEARCH</div>
-          <h1 id="pageTitle">Turn an Idea into a Reproducible Experiment</h1>
-        </div>
-        <div class="top-actions">
-          <button class="ghost" id="openCode" disabled>Open in VS Code</button>
-          <button class="primary small" id="syncGit" disabled>Sync GitHub</button>
-        </div>
+        <h1>Research Status</h1>
+        <details class="connection-status">
+          <summary id="tunnelRunStatus">Checking ChatGPT connection</summary>
+          <div class="connection-details">
+            <span id="localMcpStatus">Checking local MCP</span>
+            <span id="tunnelInstallStatus">Checking tunnel-client</span>
+            <span id="tunnelConfigStatus">Checking tunnel configuration</span>
+          </div>
+        </details>
       </header>
 
-      <section id="createView" class="create-view">
-        <div class="hero-card">
-          <div class="hero-copy">
-            <span class="pill">ChatGPT Reasons · AutoResearch Executes</span>
-            <h2>What would you like to test?</h2>
-            <p>Let the current ChatGPT conversation handle problem analysis and research reasoning. Call AutoResearch when you need to save notes, generate code, retrieve sources, or use AutoDL.</p>
-          </div>
-          <form id="researchForm">
-            <label for="topic">Research Topic / Idea</label>
-            <textarea id="topic" required minlength="3" placeholder="Example: How can uncertainty sampling reduce annotation costs for few-shot medical image segmentation?"></textarea>
-            <div class="form-grid">
-              <div>
-                <label for="workflowMode">Workflow</label>
-                <select id="workflowMode">
-                  <option value="chatgpt" selected>ChatGPT Collaboration · Recommended</option>
-                  <option value="autonomous">Autonomous AutoResearch</option>
-                </select>
-              </div>
-              <div>
-                <label for="notes">Constraints and Notes (Optional)</label>
-                <input id="notes" placeholder="Dataset size, framework, VRAM, or metric requirements">
-              </div>
-              <div class="autonomous-option">
-                <label for="maxSources">Source Limit</label>
-                <select id="maxSources">
-                  <option value="12">12 · Fast</option>
-                  <option value="20" selected>20 · Standard</option>
-                  <option value="40">40 · In Depth</option>
-                </select>
-              </div>
-            </div>
-            <label class="check autonomous-option"><input type="checkbox" id="downloadPapers"> Download up to 3 publicly accessible arXiv PDFs</label>
-            <div class="submit-row">
-              <span id="modelHint">ChatGPT handles reasoning; AutoResearch waits for tool calls</span>
-              <button class="primary" id="startResearch" type="submit">Create Collaborative Project <b>→</b></button>
-            </div>
-          </form>
-        </div>
-        <div class="feature-grid">
-          <article><span>01</span><h3>Native ChatGPT Reasoning</h3><p>Research discussion and result analysis use the current ChatGPT conversation and selected model without consuming OpenRouter.</p></article>
-          <article><span>02</span><h3>AutoResearch Execution</h3><p>Invoke tools as needed to retrieve sources, save code, connect to AutoDL, and continuously record status in the workspace.</p></article>
-          <article><span>03</span><h3>Secrets Stay Local</h3><p>ChatGPT cannot see the OpenRouter key, AutoDL token, or SSH password. Billable and execution actions still require confirmation.</p></article>
-        </div>
-        <section class="chatgpt-connect panel">
-          <div>
-            <span class="kicker">CHATGPT CONNECTION</span>
-            <h3>Set Up the ChatGPT Desktop Connection</h3>
-            <p>The first run opens a secure setup wizard. After account authorization, click "Start ChatGPT Connection" and keep the popup window running.</p>
-          </div>
-          <div class="endpoint-box"><code id="mcpEndpoint">http://127.0.0.1:8765/mcp</code><button class="ghost" id="copyMcp" type="button">Copy Address</button></div>
-          <div class="connection-steps" aria-live="polite">
-            <span class="ready" id="localMcpStatus">✓ Local MCP Ready</span>
-            <span id="tunnelInstallStatus">○ Checking tunnel-client</span>
-            <span id="tunnelConfigStatus">○ Tunnel Not Configured</span>
-            <span id="tunnelRunStatus">○ Tunnel Not Running</span>
-            <span>○ ChatGPT Developer Mode Requires Account Confirmation</span>
-          </div>
-          <div class="connection-actions">
-            <button class="ghost" id="setupChatgpt" type="button">Set Up Connection</button>
-            <button class="primary small" id="startChatgpt" type="button">Start ChatGPT Connection</button>
-            <a href="https://developers.openai.com/api/docs/guides/secure-mcp-tunnels" target="_blank" rel="noreferrer">Official Guide ↗</a>
-          </div>
-        </section>
+      <section id="emptyView" class="empty-view panel" aria-live="polite">
+        <h2 id="emptyTitle">Loading research projects</h2>
+        <p id="emptyMessage">Project status updates automatically.</p>
       </section>
 
-      <section id="projectView" class="project-view hidden">
+      <section id="projectView" class="project-view hidden" aria-label="Selected project">
         <div class="project-heading">
           <div>
-            <span class="status-badge" id="statusBadge">Queued</span>
+            <span class="status-badge" id="statusBadge"></span>
             <h2 id="projectTopic"></h2>
-            <p id="projectSummary">Preparing the research agent…</p>
-            <div class="project-id">Project ID <code id="projectId"></code><button id="copyProjectId" type="button">Copy for ChatGPT</button></div>
+            <p id="projectSummary"></p>
+            <div class="project-id">Project ID <code id="projectId"></code></div>
           </div>
           <div class="progress-ring" id="progressRing"><span id="progressText">0%</span></div>
         </div>
 
-        <div class="pipeline" id="pipeline">
+        <div class="pipeline" id="pipeline" aria-label="Research stages">
           <div data-phase="planning"><i>1</i><span>Research Reasoning</span></div>
           <div data-phase="searching"><i>2</i><span>Source Search</span></div>
           <div data-phase="synthesizing"><i>3</i><span>Method Design</span></div>
           <div data-phase="generating"><i>4</i><span>Code Output</span></div>
-          <div data-phase="ready"><i>5</i><span>Experiment & Analysis</span></div>
+          <div data-phase="ready"><i>5</i><span>Experiment &amp; Analysis</span></div>
         </div>
 
         <div class="dashboard-grid">
           <section class="panel activity-panel">
-            <div class="panel-title"><div><span class="kicker">AGENT LOG</span><h3>Research Progress</h3></div><span class="live-dot">LIVE</span></div>
-            <div id="eventList" class="event-list"><div class="empty">Waiting for the agent to start…</div></div>
+            <div class="panel-title"><h3>Research Progress</h3></div>
+            <div id="eventList" class="event-list"><div class="empty">No research activity recorded</div></div>
           </section>
           <section class="panel source-panel">
-            <div class="panel-title"><div><span class="kicker">EVIDENCE</span><h3>Papers & Code</h3></div><span id="sourceCount" class="count">0</span></div>
-            <div id="sourceList" class="source-list"><div class="empty">Retrieved sources will appear here</div></div>
+            <div class="panel-title"><h3>Papers &amp; Code</h3><span id="sourceCount" class="count">0</span></div>
+            <div id="sourceList" class="source-list"><div class="empty">No sources retrieved</div></div>
           </section>
         </div>
 
-        <section class="panel experiment-panel">
-          <div class="panel-title">
-            <div><span class="kicker">COMPUTE</span><h3>Remote Experiment</h3></div>
-            <button class="ghost" id="toggleExperiment">Configure Experiment</button>
-          </div>
-          <label for="computeProvider">Compute platform / 计算平台</label>
-          <select id="computeProvider">
-            <option value="autodl">AutoDL · Paid GPU / 付费 GPU</option>
-            <option value="colab">Google Colab · Free GPU / 免费 GPU</option>
-          </select>
-          <div id="autodlPanel">
-          <div class="compute-summary">
-            <div><span>GPU Order</span><strong id="gpuOrder">4090 → 5090</strong></div>
-            <div><span>Execution</span><strong>SSH Background Process</strong></div>
-            <div><span>Monitoring & Improvement</span><strong id="monitorPolicy">Every 30s · Up to 3 rounds</strong></div>
-            <div><span>Experiment Status</span><strong id="experimentStatus">Not Started</strong></div>
-          </div>
-          <div id="autodlReadiness" class="form-status" role="status" aria-live="polite">Checking AutoDL configuration…</div>
-          <div id="experimentReadiness" class="form-status" role="status" aria-live="polite">Experiment inputs not checked</div>
-          <button type="button" class="ghost" id="checkExperimentReadiness">Check Entry Point & Inputs (No Execution)</button>
-          <form id="experimentForm" class="experiment-form hidden">
-            <div class="form-grid three">
-              <div><label for="instanceUuid">AutoDL Instance UUID</label><input id="instanceUuid" placeholder="pro-xxxxxxxxxxxx"></div>
-              <div><label for="sshHost">SSH Host</label><input id="sshHost" required placeholder="connect.region.autodl.com"></div>
-              <div><label for="sshPort">SSH Port</label><input id="sshPort" required type="number" value="22"></div>
-              <div><label for="sshUser">SSH User</label><input id="sshUser" value="root"></div>
-              <div><label for="sshPassword">SSH Password (Stored in Task Memory Only)</label><input id="sshPassword" type="password"></div>
-              <div><label for="maxIterations">Maximum Experiment Rounds</label><input id="maxIterations" type="number" min="1" max="10" value="1"></div>
-            </div>
-            <label for="remoteCommand">Experiment Command</label>
-            <input id="remoteCommand" value="python experiment.py">
-            <div class="experiment-actions">
-              <label class="check"><input type="checkbox" id="allowRelease"> Allow replacement instance release and recreation if the GPU remains busy after cloning</label>
-              <div>
-                <button type="button" class="ghost" id="loadSsh">Load SSH from Instance</button>
-                <button type="button" class="ghost" id="createInstance" disabled>Create Billable Instance</button>
-                <button class="primary" type="submit">Confirm & Start Experiment</button>
+        <div id="computePanels" class="compute-panels">
+          <section id="colabPanel" class="panel">
+            <div class="panel-title"><h3>Google Colab</h3><span class="status-badge" id="colabStatus">未准备</span></div>
+            <div class="compute-body">
+              <div id="colabDetails" class="status-message">正在读取 Colab 状态。</div>
+              <div class="resource-agent-card" aria-label="Colab 资源检查 Agent">
+                <div class="resource-agent-heading"><strong>Colab 资源检查 Agent</strong><span id="colabResourceAvailability" class="resource-availability unknown">待确认 · 等待下次实际检查</span></div>
+                <dl class="resource-agent-details">
+                  <div><dt>Agent 状态</dt><dd id="colabResourceAgentState">尚未启动</dd></div>
+                  <div><dt>最近心跳</dt><dd id="colabResourceHeartbeat">—</dd></div>
+                  <div><dt>最近检查结果</dt><dd id="colabResourceLastResult">尚未确认</dd></div>
+                  <div><dt>最近实际检查</dt><dd id="colabResourceLastChecked">—</dd></div>
+                  <div><dt>下次实际检查</dt><dd id="colabResourceNextCheck">—</dd></div>
+                </dl>
+                <p id="colabResourceMessage" class="status-description"></p>
+              </div>
+              <div id="colabDownloads" class="artifact-links hidden">
+                <a id="downloadColabNotebook" download>Download notebook</a>
+                <a id="downloadColabBundle" download>Download experiment package</a>
+                <a id="downloadColabInputs" class="hidden" download>Download experiment inputs</a>
               </div>
             </div>
-          </form>
-          <div id="experimentResults" class="experiment-results"><div class="empty compact">Experiment status, metrics, and logs will appear here</div></div>
-          </div>
-          <div id="colabPanel" class="hidden">
+          </section>
+
+          <section id="autodlPanel" class="panel">
+            <div class="panel-title"><h3>AutoDL</h3><span class="status-badge" id="experimentStatus">Not started</span></div>
             <div class="compute-summary">
-              <div><span>GPU</span><strong>Colab Free · Subject to availability</strong></div>
-              <div><span>Retry / 重试</span><strong>Random 5–10 minutes · Honors quota cooldown</strong></div>
-              <div><span>Checkpoint</span><strong>Google Drive · Resume training state</strong></div>
-              <div><span>Status / 状态</span><strong id="colabStatus">Not prepared / 未准备</strong></div>
+              <div><span>GPU Priority</span><strong id="gpuOrder">—</strong></div>
+              <div><span>Monitoring</span><strong id="monitorPolicy">—</strong></div>
             </div>
-            <p class="settings-help">已准备的项目选择 Colab 后自动启动资源检测。首次如提示需要登录，点击“普通浏览器登录”，在 Chrome 完成 Google 登录后关闭该窗口，再点击继续；挂载 Drive 也需要授权。免费 GPU 不保证可用，会话可能提前断开；已保存的 checkpoint 用于下次续跑。</p>
-            <div id="colabDetails" class="form-status" role="status" aria-live="polite">选择项目后准备 Colab 实验。</div>
-            <div class="resource-agent-card" aria-label="Colab 资源检查 Agent">
-              <div class="resource-agent-heading"><strong>Colab 资源检查 Agent</strong><span id="colabResourceAvailability" class="resource-availability unknown" role="status" aria-live="polite">待确认 · 等待下次实际检查</span></div>
-              <dl class="resource-agent-details">
-                <div><dt>Agent 状态</dt><dd id="colabResourceAgentState">尚未启动</dd></div>
-                <div><dt>最近心跳</dt><dd id="colabResourceHeartbeat">—</dd></div>
-                <div><dt>最近检查结果</dt><dd id="colabResourceLastResult">尚未确认</dd></div>
-                <div><dt>最近实际检查</dt><dd id="colabResourceLastChecked">—</dd></div>
-                <div><dt>下次实际检查</dt><dd id="colabResourceNextCheck">—</dd></div>
-              </dl>
-              <p id="colabResourceMessage" class="settings-help">已准备的项目选择 Colab 后，专用 Agent 自动监测资源申请流程。</p>
-              <p class="settings-help">Agent 每 10 秒更新监测状态；GPU 暂缺时每隔随机 5–10 分钟实际检查当前账号一次，额度限制按冷却时间等待。最近检查结果与当前可用性分别显示。</p>
+            <div class="compute-body">
+              <div id="autodlReadiness" class="status-message">Checking AutoDL configuration…</div>
+              <div id="experimentReadiness" class="status-message">Checking experiment requirements…</div>
             </div>
-            <div class="form-grid three">
-              <div><label for="colabDriveRoot">Google Drive folder</label><input id="colabDriveRoot" value="AutoResearch" placeholder="AutoResearch"></div>
-              <div><label for="colabNotebookUrl">Existing notebook URL (optional)</label><input id="colabNotebookUrl" placeholder="https://colab.research.google.com/drive/…"></div>
-            </div>
-            <div class="experiment-actions">
-              <button type="button" class="ghost" id="loginColab">Google Login / 普通浏览器登录</button>
-              <button type="button" class="ghost" id="prepareColab">Prepare Notebook / 准备实验</button>
-              <button type="button" class="primary" id="startColab" disabled>Start Free GPU Trial / 申请并运行</button>
-              <button type="button" class="ghost" id="cancelColab" disabled>Stop Retry / 停止重试</button>
-            </div>
-            <p id="colabDownloads" class="hidden"><a id="downloadColabNotebook" download>Download notebook</a> · <a id="downloadColabBundle" download>Download experiment package</a> · <a id="downloadColabInputs" class="hidden" download>Download speech subset / 下载语音子集</a></p>
-            <p class="settings-help">等待资源时请保持 AutoResearch 本地服务运行。专用 Agent 会在下次检查时间申请 GPU，并在获得资源后继续试验。</p>
-          </div>
-        </section>
+            <div id="experimentResults" class="experiment-results"><div class="empty compact">No experiments recorded</div></div>
+          </section>
+        </div>
       </section>
     </main>
   </div>
-
-  <dialog id="settingsDialog">
-    <form id="settingsForm">
-      <div class="dialog-head"><div><span class="kicker">LOCAL ONLY</span><h2>Settings & Connections</h2></div><button type="button" class="icon-button close-settings" aria-label="Close settings">×</button></div>
-      <p class="dialog-note">Secrets are written only to the local <code>.env</code> file. They are never echoed by the API or committed to Git.</p>
-      <div class="settings-section">
-        <h3>OpenRouter</h3>
-        <label>API Key <input id="settingOpenRouterKey" type="password" placeholder="Leave blank to keep unchanged"></label>
-        <label>Model <input id="settingModel" placeholder="openrouter/free"></label>
-      </div>
-      <div class="settings-section">
-        <h3>AutoDL Pro API</h3>
-        <label>Developer Token <input id="settingAutoDLToken" type="password" placeholder="Console → Account → Settings"></label>
-        <div class="form-grid">
-          <label>Image UUID (optional) <input id="settingImageUuid" placeholder="Blank uses the public PyTorch/CUDA base image"></label>
-          <label>GPU Spec Priority <input id="settingGpuSpecs" placeholder="v-48g,5090-p"></label>
-        </div>
-        <div id="settingsAutoDLStatus" class="form-status" role="status" aria-live="polite">Checking AutoDL configuration…</div>
-        <div class="settings-connect-actions">
-          <button type="button" class="ghost" id="setupAutoDLLogin">Configure AutoDL Login</button>
-          <button type="button" class="ghost" id="openAutoDLLogin">Auto Login to AutoDL</button>
-          <button type="button" class="ghost" id="checkAutoDL">Check Saved API Configuration (No Charge)</button>
-        </div>
-        <p class="settings-help">Configure once to save the phone and password outside the repository, encrypted for the current Windows user. Later logins fill them automatically. You still complete the visible security verification and enter the SMS one-time code; neither is saved.</p>
-      </div>
-      <div class="settings-section">
-        <h3>GitHub</h3>
-        <label>Remote Repository <input id="settingRemote" placeholder="https://github.com/owner/repo.git"></label>
-      </div>
-      <div class="settings-section">
-        <h3>ChatGPT Collaboration</h3>
-        <p class="settings-help">The MCP service starts with the app at <code>http://127.0.0.1:8765/mcp</code>. Runtime API keys are encrypted with Windows DPAPI in the current user configuration and are never written to the project or Git.</p>
-        <div class="settings-connect-actions">
-          <button type="button" class="ghost" id="settingsSetupChatgpt">Open Setup Wizard</button>
-          <button type="button" class="ghost" id="settingsStartChatgpt">Start Connection</button>
-          <span id="settingsTunnelStatus">Checking Tunnel…</span>
-        </div>
-      </div>
-      <div id="settingsStatus" class="form-status" role="status" aria-live="polite"></div>
-      <div class="dialog-actions"><button type="button" class="ghost close-settings">Cancel</button><button type="submit" class="primary" id="saveSettings">Save Settings</button></div>
-    </form>
-  </dialog>
-  <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=20261010-desktop-colab"></script>
+  <script src="/static/app.js?v=20261120-status"></script>
 </body>
 </html>

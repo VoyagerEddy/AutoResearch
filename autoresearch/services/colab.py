@@ -38,7 +38,7 @@ SOURCE_SUFFIXES = {'.py', '.yaml', '.yml', '.json', '.toml', '.md', '.txt', '.sh
 EXCLUDED_DIRS = {
     '.git', '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache', '.cache',
     'cache', 'data', 'datasets', 'inputs', 'checkpoints', 'weights', 'results', 'logs',
-    'wandb', 'node_modules', 'stage1_prepared', 'stage1_runs', 'artifacts', '.ssh',
+    'wandb', 'node_modules', 'stage1_prepared', 'stage1_runs', 'colab_prepared', 'artifacts', '.ssh',
 }
 EXCLUDED_NAMES = ArtifactStore.BLOCKED_NAMES | {
     'credentials.json', 'token.json', 'tokens.json', 'secrets.json', 'service-account.json',
@@ -397,7 +397,8 @@ class ColabService:
                 job.update(status='waiting_for_gpu', next_attempt_at=provider_until,
                            blocked_reason='Colab provider GPU cooldown remains in force.')
                 self._write(project_id, job)
-            job['can_attempt'] = bool(job.get('prepared') and job['status'] in RETRY_STATUSES
+            job['source_current'] = self.source_matches_prepared_bundle(project_id)
+            job['can_attempt'] = bool(job.get('prepared') and job['source_current'] is not False and job['status'] in RETRY_STATUSES
                 and job.get('next_attempt_at') and _parse(job['next_attempt_at']) <= now)
             job['queue_only'] = job['status'] in RETRY_STATUSES
             job['rules_url'] = 'https://research.google.com/colaboratory/faq.html'
@@ -416,6 +417,8 @@ class ColabService:
             job = self._read(project_id)
             if not job.get('prepared') or job['status'] in TERMINAL_STATUSES:
                 raise ColabConflict('Prepare an active Colab job before enabling its browser worker')
+            if self.source_matches_prepared_bundle(project_id) is False:
+                raise ColabConflict('Generated code changed after preparation; prepare a new Colab notebook before running it')
             job.update(autorun_enabled=True, browser=browser)
             self._write(project_id, job)
             return self.status(project_id)
@@ -456,6 +459,21 @@ class ColabService:
         prepare = config.get('prepare_command', '')
         if not isinstance(prepare, str) or len(prepare) > 12000:
             raise ValueError('Invalid Colab prepare_command')
+        preflight = config.get('preflight_command', '')
+        if not isinstance(preflight, str) or len(preflight) > 12000:
+            raise ValueError('Invalid Colab preflight_command')
+        timeout = config.get('preflight_timeout_seconds', 900)
+        if type(timeout) is not int or not 1 <= timeout <= 3600:
+            raise ValueError('Colab preflight_timeout_seconds must be between 1 and 3600')
+        runtime = config.get('runtime_requirements', {})
+        if not isinstance(runtime, dict) or set(runtime) - {'framework', 'require_cuda', 'match_torchaudio'}:
+            raise ValueError('Invalid Colab runtime_requirements')
+        if runtime.get('framework') not in (None, 'pytorch') or any(
+                key in runtime and type(runtime[key]) is not bool for key in ('require_cuda', 'match_torchaudio')):
+            raise ValueError('Invalid Colab runtime_requirements')
+        if runtime.get('framework') is None and (runtime.get('require_cuda') or runtime.get('match_torchaudio')):
+            raise ValueError('A runtime framework is required for CUDA or TorchAudio checks')
+        self._source_exclusions(generated)
         required = config.get('required_drive_paths', [])
         if not isinstance(required, list) or len(required) > 100:
             raise ValueError('Invalid Colab required_drive_paths')
@@ -513,16 +531,34 @@ class ColabService:
         return {'input_bundle_path': str(target), 'input_bundle_url': '',
                 'input_bundle_sha256': digest, 'input_bundle_bytes': target.stat().st_size}
 
-    def _bundle(self, generated: Path, target: Path) -> dict[str, Any]:
+    def _source_exclusions(self, generated: Path) -> set[str]:
+        manifest = generated / 'experiment_manifest.json'
+        if not manifest.is_file() or _linked(manifest) or manifest.stat().st_size > 2_000_000:
+            raise ValueError('A regular generated/experiment_manifest.json is required')
+        value = json.loads(manifest.read_text(encoding='utf-8-sig'))
+        if not isinstance(value, dict) or not isinstance(value.get('colab', {}), dict):
+            raise ValueError('Invalid Colab source export contract')
+        config = value.get('colab', {})
+        excluded = config.get('source_exclude_paths', [])
+        if not isinstance(excluded, list) or len(excluded) > 100 or any(not isinstance(item, str) for item in excluded):
+            raise ValueError('Invalid Colab source_exclude_paths')
+        result = {_relative(item) for item in excluded}
+        if 'experiment_manifest.json' in result:
+            raise ValueError('The experiment manifest cannot be excluded from source export')
+        return result
+
+    def _source_entries(self, generated: Path) -> list[tuple[str, bytes]]:
         if not generated.is_dir() or _linked(generated):
             raise ValueError('Generated source directory must be regular and unlinked')
+        excluded = self._source_exclusions(generated)
         root = generated.resolve()
         pending: list[tuple[str, bytes]] = []
         total_bytes = 0
         for directory, dirs, files in os.walk(generated, followlinks=False):
             parent = Path(directory)
             for name in list(dirs):
-                if name.casefold() in EXCLUDED_DIRS or name.startswith('.'):
+                relative_dir = (parent / name).relative_to(generated).as_posix()
+                if name.casefold() in EXCLUDED_DIRS or name.startswith('.') or relative_dir in excluded:
                     dirs.remove(name)
                 elif _linked(parent / name):
                     raise ValueError('Source bundle must not contain linked directories')
@@ -533,6 +569,8 @@ class ColabService:
                 if _linked(path) or not path.resolve().is_relative_to(root):
                     raise ValueError('Source bundle must not contain linked or escaping files')
                 relative = _relative(path.relative_to(generated).as_posix())
+                if relative in excluded:
+                    continue
                 size = path.stat().st_size
                 if size > 5_000_000:
                     raise ValueError(f'Source file exceeds 5 MB: {relative}')
@@ -546,6 +584,44 @@ class ColabService:
                 pending.append((relative, content))
         if not pending:
             raise ValueError('No generated source files available for Colab export')
+        return sorted(pending)
+
+    @staticmethod
+    def _source_identity(entries: list[tuple[str, bytes]]) -> str:
+        files = [(name, hashlib.sha256(content).hexdigest()) for name, content in sorted(entries)]
+        return hashlib.sha256(json.dumps(files, ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
+
+    def source_matches_prepared_bundle(self, project_id: str) -> bool | None:
+        """Compare current exportable code to its prepared snapshot without rewriting it.
+
+        Older job files remain readable: their existing ZIP supplies the source
+        identity. Checkpoints, input data and generated plans are never source.
+        """
+        job = self._read(project_id)
+        if not job.get('prepared'):
+            return None
+        try:
+            project = self.db.get_project(project_id)
+            current = self._source_identity(self._source_entries(Path(project.workspace) / 'generated'))
+            expected = job.get('source_manifest_sha256')
+            if expected:
+                return current == expected
+            archive = self._directory(project_id) / 'source.zip'
+            if not archive.is_file() or _linked(archive) or archive.stat().st_size > 100_000_000:
+                return False
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != job.get('bundle_sha256'):
+                return False
+            with zipfile.ZipFile(archive) as bundle:
+                entries = bundle.infolist()
+                if sum(item.file_size for item in entries) > 100_000_000:
+                    return False
+                previous = [(item.filename, bundle.read(item)) for item in entries if not item.is_dir()]
+            return current == self._source_identity(previous)
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError, TypeError):
+            return False
+
+    def _bundle(self, generated: Path, target: Path) -> dict[str, Any]:
+        pending = self._source_entries(generated)
         temp = target.with_suffix('.zip.tmp')
         for path in (target, temp):
             if path.exists() and _linked(path):
@@ -559,7 +635,8 @@ class ColabService:
                 info.compress_type = zipfile.ZIP_DEFLATED
                 archive.writestr(info, content)
         os.replace(temp, target)
-        return {'source_file_count': len(pending), 'source_bytes': total_bytes,
+        return {'source_file_count': len(pending), 'source_bytes': sum(len(content) for _, content in pending),
+                'source_manifest_sha256': self._source_identity(pending),
                 'bundle_sha256': hashlib.sha256(target.read_bytes()).hexdigest()}
 
     def prepare(self, project_id: str, request: ColabPrepareRequest) -> dict[str, Any]:
@@ -634,7 +711,7 @@ class ColabService:
                 # notebook after the project was prepared for a full campaign.
                 # Provider cooldowns remain independent of that source identity.
                 for key in ('recovery', 'authorization_continuation', 'runtime_id', 'runtime_started_at', 'running_at', 'finished_at',
-                            'last_connection_observation'):
+                            'last_connection_observation', 'ordinary_login', 'ordinary_login_recheck'):
                     job.pop(key, None)
                 job['last_observation'] = None
                 job['last_attempt_at'] = None
@@ -735,6 +812,8 @@ class ColabService:
                 if request.status == 'unavailable':
                     job['provider_retry_not_before'] = job['next_attempt_at']
             if request.status in {'available', 'running'} and request.details.get('runtime_id'):
+                if request.status == 'running' or request.details.get('current_gpu_verified') is True:
+                    job.pop('ordinary_login_recheck', None)
                 previous_runtime = job.get('runtime_id')
                 job['runtime_id'] = request.details['runtime_id']
                 if previous_runtime != job['runtime_id'] or not job.get('runtime_started_at'):
@@ -788,6 +867,32 @@ class ColabService:
             self._write(project_id, job)
             return self.status(project_id)
 
+    def ordinary_login_opened(self, project_id: str, pid: int) -> dict[str, Any]:
+        """Persist a handoff for the scheduler after launching regular Chrome."""
+        with self._transaction(project_id):
+            job = self._read(project_id)
+            if not job.get('prepared') or job['status'] in TERMINAL_STATUSES:
+                return self.status(project_id)
+            if job['status'] in {'running', 'gpu_available'}:
+                raise ColabConflict('Keep the active notebook open for Drive authorization')
+            job.update(ordinary_login={'pid': pid, 'opened_at': _stamp(_utc())})
+            if job['status'] != 'auth_required':
+                job.update(status='auth_required', next_attempt_at=None, lease_until=None)
+            job['blocked_reason'] = 'Finish Google sign-in in the ordinary Colab window and close that window to resume automatically.'
+            self._write(project_id, job)
+            return self.status(project_id)
+
+    def complete_ordinary_login(self, project_id: str) -> dict[str, Any]:
+        """Closing the window permits a recheck, without assuming login succeeded."""
+        with self._transaction(project_id):
+            job = self._read(project_id)
+            if job['status'] != 'auth_required' or not job.get('ordinary_login') or not job.get('autorun_enabled'):
+                return self.status(project_id)
+            job.pop('ordinary_login')
+            job['ordinary_login_recheck'] = True
+            self._write(project_id, job)
+            return self.resume(project_id)
+
     def cancel(self, project_id: str) -> dict[str, Any]:
         with self._transaction(project_id):
             job = self._read(project_id)
@@ -795,6 +900,7 @@ class ColabService:
                        blocked_reason='Local retry queue stopped. Stop an active Colab runtime in its browser UI.')
             job.pop('recovery', None)
             job.pop('authorization_continuation',None)
+            job.pop('ordinary_login', None)
             self._write(project_id, job)
             return self.status(project_id)
 

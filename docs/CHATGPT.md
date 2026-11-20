@@ -3,15 +3,15 @@
 ## Responsibilities
 
 - ChatGPT desktop: research discussion, problem decomposition, hypothesis evaluation, design choices, and result analysis.
-- AutoResearch: project persistence, paper and code search, artifact writes, delegated OpenRouter code generation, AutoDL instances and remote experiments, and status/result display.
-- OpenRouter: used only by `generate_experiment_code` and autonomous web workflows.
+- AutoResearch handles project persistence, paper and code search, artifact writes, delegated code generation, and experiment execution on AutoDL and Colab. The read-only dashboard displays project progress and results.
+- OpenRouter supports `generate_experiment_code` and autonomous workflows through the local API.
 
 This workflow does not convert the ChatGPT conversation into OpenAI API requests, and AutoResearch needs no OpenAI API key.
 
 ## One-time connection
 
 1. Run `start.cmd` from the repository root and confirm that the web page reports the local service and ChatGPT tools as ready.
-2. Select **Set up connection** on the home page, or run `setup-chatgpt.cmd`. The assistant checks the local service and opens [OpenAI Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels).
+2. Run `setup-chatgpt.cmd`. The setup helper checks the local service and opens [OpenAI Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels).
 3. In the signed-in account, create a Secure MCP Tunnel, obtain the `tunnel_id` and runtime API key, and download `tunnel-client.exe` for Windows. These are account-level operations and cannot be performed by the local app.
 4. Return to the assistant and enter the downloaded file path, `tunnel_id`, and runtime API key. It configures the HTTP MCP endpoint and runs `doctor`:
 
@@ -25,7 +25,7 @@ This workflow does not convert the ChatGPT conversation into OpenAI API requests
 8. Start a new ChatGPT conversation and enable AutoResearch from the tools menu.
 9. On later runs, start `start-chatgpt.cmd`. It checks and starts AutoResearch, then keeps Tunnel running. Leave that window open while using ChatGPT.
 
-The same setup and connection actions are available from the AutoResearch home page and settings dialog. The page refreshes Tunnel status every five seconds.
+The dashboard refreshes Tunnel status automatically.
 
 The local endpoint remains `http://127.0.0.1:8765/mcp`. It works with MCP Inspector for local checks but cannot be entered directly as a public ChatGPT connector URL.
 
@@ -67,7 +67,7 @@ After completion:
 
 ## Safety notes
 
-- Code paths passed to `save_experiment_code` are relative to the project's `generated/` directory, such as `tidyvoice/wespeaker/models/example.py`; do not prefix them with `generated/`. The complete bundle is validated before any write, so invalid paths, conflicts, or oversized content cannot cause partial replacement.
+- Pass code paths relative to the project's `generated/` directory, for example `package/models/example.py`. AutoResearch validates the complete bundle before writing files.
 - A saved code package has not necessarily been executed. After `check_autodl_readiness`, still verify data, weights, dependencies, and the experiment entry point.
 - Connection status checks process existence and Tunnel health/readiness separately. A running process is not reported as connected until readiness passes. Windows process probes do not send termination signals.
 - If provisioning times out or returns an invalid response, inspect the AutoDL instance list first. AutoResearch does not automatically retry with another GPU when creation status is uncertain.

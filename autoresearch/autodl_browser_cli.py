@@ -72,7 +72,11 @@ async def run(args: argparse.Namespace) -> None:
     )
     async with AutoDLBrowserSession(options) as session:
         if args.sms:
-            result = await session.login_sms(phone, otp_provider)
+            result = await session.login_sms(
+                phone,
+                otp_provider,
+                automate_captcha=not args.manual_captcha,
+            )
         else:
             result = await session.login(
                 credentials, otp_provider, automate_captcha=not args.manual_captcha,

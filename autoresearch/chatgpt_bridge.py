@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .config import Settings
 from .db import Database
@@ -10,6 +12,7 @@ from .domain import (
     AutoDLExperimentRequest,
     ChatGPTAnalysisRequest,
     ChatGPTProjectRequest,
+    ColabNotebookBindingRequest,
     ColabPrepareRequest,
     CodeGenerationRequest,
     CodeSaveRequest,
@@ -48,36 +51,277 @@ class ChatGPTBridge:
         self.colab.update_settings(settings)
 
     def colab_status(self, project_id: str) -> dict[str, Any]:
-        return self.colab.status(project_id)
+        job = self.colab.status(project_id)
+        public = self._public_colab_job(job)
+        public["resource_agent"] = self.colab_resources(project_id)
+        public["next_action"] = self._colab_next_action(job)
+        return public
+
+    def colab_resources(self, project_id: str) -> dict[str, Any]:
+        self._project(project_id)
+        from .services.colab_resource_monitor import resource_monitor_status
+
+        return resource_monitor_status(self.settings.root, project_id)
+
+    def save_research_plan(self, project_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+        from .services.research_workflow import ResearchWorkflowService
+
+        self._project(project_id)
+        return ResearchWorkflowService(self.db, self.settings).save_plan(project_id, plan)
+
+    def research_workflow(self, project_id: str) -> dict[str, Any]:
+        from .services.research_workflow import ResearchWorkflowService
+
+        self._project(project_id)
+        return ResearchWorkflowService(self.db, self.settings).get_status(project_id)
+
+    def record_research_decision(self, project_id: str, decision: dict[str, Any]) -> dict[str, Any]:
+        from .services.research_workflow import ResearchWorkflowService
+
+        self._project(project_id)
+        return ResearchWorkflowService(self.db, self.settings).record_decision(project_id, decision)
 
     def prepare_colab(self, project_id: str, request: ColabPrepareRequest) -> dict[str, Any]:
-        return self.colab.prepare(project_id, request)
+        self.colab.prepare(project_id, request)
+        return self.colab_status(project_id)
 
-    def start_colab(self, project_id: str, *, confirm_execute: bool = False) -> dict[str, Any]:
+    def bind_colab_notebook(self, project_id: str, notebook_url: str, bundle_sha256: str) -> dict[str, Any]:
+        # Proxy connection fragments belong only to the local browser session.
+        # The saved recovery link must never retain them in a tool response.
+        if urlsplit(notebook_url).username or urlsplit(notebook_url).password:
+            raise ValueError("Notebook links must not contain credentials")
+        url = self._public_url(notebook_url)
+        self.colab.bind_notebook(project_id, ColabNotebookBindingRequest(
+            notebook_url=url, bundle_sha256=bundle_sha256))
+        return self.colab_status(project_id)
+
+    def resume_colab(self, project_id: str, *, confirm_execute: bool = False) -> dict[str, Any]:
+        if not confirm_execute:
+            raise ValueError("User authorization is required before resuming the project in Colab")
+        job = self.colab.status(project_id)
+        if job.get("status") != "auth_required":
+            raise ValueError("Only a Colab login or authorization pause can be resumed; retry cooldowns remain in force")
+        return self.start_colab(project_id, confirm_execute=True, resume_auth=True)
+
+    def open_colab_login(self, project_id: str, *, browser: str = "auto") -> dict[str, Any]:
+        self._project(project_id)
+        from .colab_browser_cli import launch_colab_login_browser, worker_is_running
+
+        self.colab.status(project_id)
+        worker = worker_is_running(self.settings.root, project_id)
+        if worker is not None:
+            return {"project_id": project_id, "status": "use_existing_browser", "pid": worker,
+                    "action_required": True,
+                    "next_action": {"action": "complete_browser_authorization",
+                                    "message": "Use the already opened dedicated Colab browser for Google login, verification or Drive consent. The existing worker will check GPU availability; do not send passwords or verification codes to ChatGPT."}}
+        pid = launch_colab_login_browser(self.settings.root, browser=browser)
+        self.colab.ordinary_login_opened(project_id, pid)
+        return {"project_id": project_id, "status": "login_browser_opened", "pid": pid,
+                "action_required": True,
+                "next_action": {"action": "complete_login_then_close_window",
+                                "message": "Sign in to Google in the dedicated window. Close that window when finished so AutoResearch can recheck the session and continue the authorized job automatically."}}
+
+    def start_colab(self, project_id: str, *, confirm_execute: bool = False,
+                    resume_auth: bool = False, browser: str | None = None) -> dict[str, Any]:
         if not confirm_execute:
             raise ValueError("User authorization is required before executing the project in Colab")
-        from .colab_browser_cli import launch_colab_worker
+        from .colab_browser_cli import ColabProfileBusy, launch_colab_worker, login_browser_is_running
 
         job = self.colab.status(project_id)
         if not job.get("prepared"):
             raise ValueError("Prepare the Colab experiment notebook first")
         if job.get("status") in {"completed", "failed", "cancelled"}:
             raise ValueError("Prepare the Colab notebook again before starting another run")
-        job = self.colab.enable_autorun(project_id, job.get("browser", "auto"))
+        if self.colab.source_matches_prepared_bundle(project_id) is not True:
+            raise ValueError("Prepared Colab source is missing or changed; prepare the notebook again before execution")
+        job = self.colab.enable_autorun(project_id, browser or job.get("browser", "auto"))
+        resource_agent = self._ensure_colab_resource_agent(project_id, job.get("browser", "auto"))
+        login_pid = login_browser_is_running(self.settings.root)
+        if login_pid is not None:
+            if not job.get("ordinary_login"):
+                job = self.colab.ordinary_login_opened(project_id, login_pid)
+            return {"project_id": project_id, "status": "auth_required", "autorun_enabled": True,
+                    "action_required": True, "resource_agent": resource_agent,
+                    "next_action": self._colab_next_action(job)}
         if job.get("status") == "auth_required":
-            job = self.colab.resume(project_id)
+            if job.get("ordinary_login"):
+                job = self.colab.complete_ordinary_login(project_id)
+            elif resume_auth:
+                job = self.colab.resume(project_id)
+            else:
+                return {"project_id": project_id, "status": "auth_required", "autorun_enabled": True,
+                        "action_required": True, "resource_agent": resource_agent,
+                        "next_action": self._colab_next_action(job)}
+        if job.get("worker_running"):
+            return {"project_id": project_id, "status": "browser_launched",
+                    "pid": job.get("worker_pid"), "autorun_enabled": True,
+                    "resource_agent": resource_agent,
+                    "next_action": self._colab_next_action(job)}
         if not job.get("can_attempt") and job.get("status") not in {"running", "gpu_available"} and not job.get("worker_running"):
             return {"project_id": project_id, "status": "retry_scheduled",
-                    "next_attempt_at": job.get("next_attempt_at"), "autorun_enabled": True}
-        pid = launch_colab_worker(self.settings.root, project_id,
-                                  api_url=f"http://127.0.0.1:{self.settings.port}",
-                                  browser=job.get("browser", "auto"))
+                    "next_attempt_at": job.get("next_attempt_at"), "autorun_enabled": True,
+                    "resource_agent": resource_agent, "next_action": self._colab_next_action(job)}
+        try:
+            pid = launch_colab_worker(self.settings.root, project_id,
+                                      api_url=f"http://127.0.0.1:{self.settings.port}",
+                                      browser=job.get("browser", "auto"))
+        except ColabProfileBusy:
+            return {"project_id": project_id, "status": "retry_scheduled", "autorun_enabled": True,
+                    "next_attempt_at": job.get("next_attempt_at"), "resource_agent": resource_agent,
+                    "next_action": {"action": "wait_for_browser", "message": "The local scheduler will dispatch this job when the shared Colab browser becomes free."}}
         self.colab.worker_launched(project_id, pid)
         return {"project_id": project_id, "status": "browser_launched", "pid": pid,
+                "resource_agent": resource_agent, "autorun_enabled": True,
                 "message": "Complete Google login and notebook Drive authorization in the browser if prompted."}
 
+    def _ensure_colab_resource_agent(self, project_id: str, browser: str) -> dict[str, Any]:
+        from .services.colab_resource_monitor import launch_resource_monitor
+
+        try:
+            pid = launch_resource_monitor(self.settings.root, project_id,
+                                          api_url=f"http://127.0.0.1:{self.settings.port}", browser=browser)
+        except (OSError, ValueError, RuntimeError):
+            # A launch failure is explicit, never an assertion about GPU supply.
+            state = self.colab_resources(project_id)
+            return {**state, "launch_status": "pending_scheduler_retry"}
+        state = self.colab_resources(project_id)
+        return {**state, "pid": pid, "launch_status": "running" if state.get("agent_running") else "starting"}
+
     def cancel_colab(self, project_id: str) -> dict[str, Any]:
-        return self.colab.cancel(project_id)
+        self.colab.cancel(project_id)
+        return self.colab_status(project_id)
+
+    def colab_result(self, project_id: str) -> dict[str, Any]:
+        """Return evidence from this prepared source and currently observed VM.
+
+        A remote path is a locator, never proof that its contents reached this
+        process. We do not open provider paths on the Windows filesystem.
+        """
+        from .services.colab_data import validate_completion_details
+
+        job = self.colab.status(project_id)
+        observation = job.get("last_observation") or {}
+        details = observation.get("details") or {}
+        runtime_id = job.get("runtime_id")
+        current_runtime = bool(runtime_id and details.get("runtime_id") == runtime_id)
+        source_current = self.colab.source_matches_prepared_bundle(project_id)
+        issues = []
+        completion = None
+        if job.get("status") == "completed":
+            if not current_runtime or observation.get("status") != "completed" or details.get("returncode") != 0:
+                issues.append("No successful completion observation from the currently tracked Colab runtime")
+            elif source_current is not True:
+                issues.append("The current code does not match the source prepared for this Colab run")
+            else:
+                try:
+                    validated = validate_completion_details(details, job.get("success_criteria"))
+                    if job.get("completion") != validated:
+                        raise ValueError("Saved completion differs from the current runtime evidence")
+                    completion = validated
+                except (TypeError, ValueError) as exc:
+                    issues.append(self._public_text(str(exc)))
+        observed_log = details.get("log_tail") if current_runtime else None
+        log_tail = self._public_text(observed_log[-8000:]) if isinstance(observed_log, str) else None
+        kind = completion.get("completion_kind") if completion else None
+        return {
+            "project_id": project_id,
+            "experiment_id": f"colab:{project_id}:{runtime_id}" if runtime_id else None,
+            "platform": "colab",
+            "status": job.get("status"),
+            "result_status": "validated" if completion else "pending_evidence" if job.get("status") == "completed" else "failed" if job.get("status") == "failed" else "pending",
+            "execution_completed": completion is not None,
+            "full_experiment_complete": kind == "campaign_complete",
+            "acceptance_complete": kind == "acceptance_passed",
+            "scientific_metrics_produced": bool(completion and completion.get("scientific_metrics_produced")),
+            "research_effect_validated": False,
+            "metrics": completion.get("metrics", {}) if completion else {},
+            "completion_kind": kind,
+            "returncode": details.get("returncode") if current_runtime else None,
+            "log_tail": log_tail,
+            "log_status": "returned" if log_tail is not None else "not_returned",
+            "remote_log_path": self._public_text(details.get("log_path")) if current_runtime and isinstance(details.get("log_path"), str) else None,
+            "evidence": {
+                "runtime_id": runtime_id,
+                "observed_at": observation.get("observed_at"),
+                "prepared_bundle_sha256": job.get("bundle_sha256"),
+                "source_current": source_current,
+                "metrics_file": completion.get("metrics_file") if completion else None,
+                "origin": "current_notebook_observation" if completion else "not_verified",
+            },
+            "blocking_issues": issues,
+            "next_action": {"action": "analyze_results", "message": "ChatGPT should analyze these measured results and save the analysis and next research decision."} if completion else self._colab_next_action(job),
+            "analysis_hint": "Only validated current-run metrics can support conclusions. A successful acceptance run is not a completed full-data experiment; missing logs remain unknown. Use record_chatgpt_analysis to persist ChatGPT's analysis.",
+            "dashboard_url": self._dashboard(project_id),
+        }
+
+    @staticmethod
+    def _public_url(value: str) -> str:
+        try:
+            parsed = urlsplit(value)
+            return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
+        except ValueError:
+            return "[invalid URL]"
+
+    @staticmethod
+    def _public_text(value: str) -> str:
+        value = re.sub(r"https?://[^\s<>]+", lambda match: ChatGPTBridge._public_url(match.group()), value)
+        value = re.sub(r"(?i)\b(mcpProxyToken|api[_-]?key|authorization|password|secret|token)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", value)
+        value = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]+|AIza[A-Za-z0-9_-]{20,})", "[REDACTED]", value)
+        return value[:8000]
+
+    @classmethod
+    def _public_colab_job(cls, job: dict[str, Any]) -> dict[str, Any]:
+        fields = ("project_id", "status", "prepared", "attempt_count", "next_attempt_at",
+                  "retry_min_minutes", "retry_max_minutes", "can_attempt", "autorun_enabled",
+                  "worker_running", "created_at", "updated_at", "running_at", "finished_at",
+                  "runtime_id", "bundle_sha256", "source_current", "source_file_count", "source_bytes",
+                  "input_bundle_bytes", "drive_project_dir", "success_criteria", "source_manifest_sha256",
+                  "notebook_download_url", "bundle_url", "input_bundle_url")
+        public = {key: job[key] for key in fields if key in job}
+        public["blocked_reason"] = cls._public_text(str(job.get("blocked_reason") or ""))
+        public["action_required"] = job.get("status") == "auth_required"
+        for key in ("notebook_url", "browser_url"):
+            if isinstance(job.get(key), str):
+                public[key] = cls._public_url(job[key])
+        observed = job.get("last_observation")
+        if isinstance(observed, dict):
+            public["last_observation"] = {key: observed.get(key) for key in ("status", "observed_at")}
+            details = observed.get("details") or {}
+            public["last_observation"]["reason"] = cls._public_text(str(details.get("reason") or ""))
+            if details.get("auth_kind") in {"google_sign_in", "drive_consent", "authorization"}:
+                public["last_observation"]["auth_kind"] = details["auth_kind"]
+        contract = job.get("checkpoint_contract")
+        if isinstance(contract, dict):
+            public["checkpoint_contract"] = {key: contract[key] for key in ("directory", "interval_seconds", "resume_supported", "full_training_state", "files") if key in contract}
+        return public
+
+    @staticmethod
+    def _colab_next_action(job: dict[str, Any]) -> dict[str, Any]:
+        status = job.get("status")
+        if not job.get("prepared") or status in {"not_prepared", "blocked", "cancelled", "failed"}:
+            action, message = "prepare_experiment", "Review the manifest, code, inputs and failure evidence, then prepare the Colab notebook."
+        elif job.get("source_current") is False:
+            action, message = "prepare_experiment", "Code changed after this notebook was prepared; prepare a new source snapshot before executing or using results."
+        elif status == "auth_required":
+            details = (job.get("last_observation") or {}).get("details") or {}
+            if job.get("ordinary_login"):
+                action, message = "complete_login_then_close_window", "Finish Google sign-in in the ordinary Colab window and close it. The scheduler will recheck the signed-in session automatically."
+            elif details.get("auth_kind") == "google_sign_in" and details.get("login_browser") == "required":
+                if job.get("ordinary_login_recheck"):
+                    action, message = "open_colab_login", "The sign-in recheck still needs Google authorization. Open the dedicated ordinary login window to finish sign-in."
+                else:
+                    action, message = "ordinary_login_pending", "AutoResearch will open the dedicated ordinary login window."
+            elif details.get("auth_kind") == "google_sign_in":
+                action, message = "complete_google_sign_in", "Complete Google sign-in in the dedicated Colab window. The worker will detect successful sign-in and continue automatically."
+            else:
+                action, message = "complete_browser_authorization", "Complete the indicated notebook or Drive action in the dedicated window, then call resume_colab_experiment using the existing authorization."
+        elif status in {"queued", "waiting_for_gpu", "waiting_for_connection", "disconnected"}:
+            action, message = ("wait_for_retry", "Keep the local AutoResearch service running; its persistent scheduler respects the saved retry deadline.") if job.get("autorun_enabled") else ("start_experiment", "Call start_colab_experiment after the user has authorized this code and command.")
+        elif status == "completed":
+            action, message = "read_current_results", "Call get_colab_experiment_result to validate current-run evidence before analyzing or iterating."
+        else:
+            action, message = "observe_experiment", "The browser worker is checking resources or executing the notebook; poll status and current-run results."
+        return {"action": action, "message": message, "next_attempt_at": job.get("next_attempt_at")}
 
     def create_project(self, request: ChatGPTProjectRequest) -> dict[str, Any]:
         project = self.db.create_project(
@@ -376,16 +620,21 @@ Include README.md, requirements.txt, a runnable entry point, a test or validatio
         experiments = self.db.list_experiments(project_id)
         project_data = project.model_dump()
         project_data.pop("workspace", None)
-        collaborative = (Path(project.workspace) / "research" / "chatgpt-brief.md").is_file()
+        workflow = self.research_workflow(project_id)
+        collaborative = ((Path(project.workspace) / "research" / "chatgpt-brief.md").is_file()
+                         or bool(workflow.get("plan_id")))
         return {
             "project": project_data,
             "reasoning_owner": "Current ChatGPT conversation" if collaborative else "AutoResearch/OpenRouter",
             "execution_model": project.model or self.settings.openrouter_model,
+            "model_delegation": "explicit_generate_experiment_code_only" if collaborative else "configured_autoresearch_mode",
             "sources": [item.model_dump() for item in self.db.list_sources(project_id)],
             "experiments": experiments,
             "recent_events": self.db.list_events(project_id)[-30:],
             "artifacts": store.list_files(),
             "experiment_readiness": self.experiment_readiness(project_id),
+            "colab": self.colab_status(project_id),
+            "research_workflow": workflow,
             "dashboard_url": self._dashboard(project_id),
         }
 

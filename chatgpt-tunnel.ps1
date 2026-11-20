@@ -19,7 +19,8 @@ $StateDirectory = Join-Path $LocalAppDataPath "AutoResearch"
 $ConfigPath = Join-Path $StateDirectory "tunnel.json"
 $SecretPath = Join-Path $StateDirectory "tunnel-api-key.dpapi"
 $RuntimePath = Join-Path $StateDirectory "tunnel-status.json"
-$McpServerUrl = "http://127.0.0.1:8765/mcp"
+$McpServerUrl = $null
+$LocalMcpDiscovery = $null
 $PlatformUrl = "https://platform.openai.com/settings/organization/tunnels"
 $ChatGPTPluginsUrl = "https://chatgpt.com/plugins"
 
@@ -163,9 +164,25 @@ function Invoke-TunnelClient {
 }
 
 function Test-LocalMcp {
+    $discoveryPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $discoveryPython -PathType Leaf)) { return $false }
     try {
-        $health = Invoke-RestMethod -Uri "http://127.0.0.1:8765/api/health" -TimeoutSec 3
-        return $health.ok -eq $true -and $health.chatgpt_bridge -eq "ready"
+        Push-Location -LiteralPath $ProjectRoot
+        try {
+            $discoveryJson = & $discoveryPython -m autoresearch.chatgpt_connection --discover --root $ProjectRoot 2>$null
+            if ($LASTEXITCODE -ne 0) { return $false }
+        } finally { Pop-Location }
+        $discovery = $discoveryJson | ConvertFrom-Json
+        # Discovery accepts only this checkout and its current MCP tool catalog.
+        # Validate the loopback target again at the process boundary.
+        if ($discovery.ready -eq $true -and $discovery.mcp_url -match '^http://127\.0\.0\.1:([0-9]{4,5})/mcp$') {
+            $discoveryPort = [int]$Matches[1]
+            if ($discoveryPort -lt 1024 -or $discoveryPort -gt 65535) { return $false }
+            $script:McpServerUrl = [string]$discovery.mcp_url
+            $script:LocalMcpDiscovery = $discovery
+            return $true
+        }
+        return $false
     }
     catch { return $false }
 }
@@ -174,14 +191,14 @@ function Ensure-LocalMcp {
     if (Test-LocalMcp) { return }
 
     Write-Host "Starting AutoResearch in the background..."
-    $startScript = Join-Path $ProjectRoot "start.ps1"
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
+    $startScript = Join-Path $ProjectRoot "start-desktop.ps1"
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`" -NoOpen"
     Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WorkingDirectory $ProjectRoot -WindowStyle Hidden
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         Start-Sleep -Milliseconds 500
         if (Test-LocalMcp) { return }
     }
-    throw "AutoResearch did not become ready. Run start.cmd and inspect its error output."
+    throw "The current AutoResearch checkout and its MCP tools did not become ready. Restart this checkout's local service and inspect its startup log."
 }
 
 function Read-SavedApiKey {
@@ -205,7 +222,7 @@ function Invoke-Doctor {
 
     Ensure-LocalMcp
     Invoke-TunnelClient -Executable $Config.tunnel_client -SecureApiKey $SecureApiKey -Arguments @(
-        "doctor", "--profile", $Config.profile, "--explain"
+        "doctor", "--profile", $Config.profile, "--mcp.server-url", "url=$McpServerUrl", "--explain"
     )
 }
 
@@ -217,6 +234,9 @@ function Invoke-Run {
     $runtimeState = @{
         pid = $PID
         profile = $Config.profile
+        mcp_server_url = $McpServerUrl
+        mcp_server_version = $LocalMcpDiscovery.mcp_server_version
+        mcp_tools_sha256 = $LocalMcpDiscovery.mcp_tools_sha256
         started_at = (Get-Date).ToUniversalTime().ToString("o")
     } | ConvertTo-Json
     Write-Utf8NoBom -Path $RuntimePath -Value $runtimeState
@@ -229,7 +249,7 @@ function Invoke-Run {
     Write-Host ""
     try {
         Invoke-TunnelClient -Executable $Config.tunnel_client -SecureApiKey $SecureApiKey -Arguments @(
-            "run", "--profile", $Config.profile
+            "run", "--profile", $Config.profile, "--mcp.server-url", "url=$McpServerUrl"
         )
     }
     finally {

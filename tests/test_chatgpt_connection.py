@@ -23,6 +23,14 @@ def test_connection_status_detects_config_without_exposing_secrets(
     client.write_bytes(b"test")
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.setattr(chatgpt_connection, "_tunnel_health", lambda: (True, True))
+    target = "http://127.0.0.1:8767/mcp"
+    catalog_fingerprint = "fixture-tool-catalog"
+    monkeypatch.setattr(chatgpt_connection, "discover_local_mcp", lambda _: {
+        "ready": True, "mcp_url": target, "status": "ready",
+        "mcp_server_version": "0.3.1",
+        "mcp_tools": sorted(chatgpt_connection.REQUIRED_MCP_TOOLS),
+        "mcp_tools_sha256": catalog_fingerprint, "missing_tools": [],
+    })
 
     (state_dir / "tunnel.json").write_text(
         json.dumps(
@@ -38,7 +46,8 @@ def test_connection_status_detects_config_without_exposing_secrets(
         "encrypted-secret-placeholder", encoding="utf-8"
     )
     (state_dir / "tunnel-status.json").write_text(
-        json.dumps({"pid": os.getpid()}), encoding="utf-8"
+        json.dumps({"pid": os.getpid(), "mcp_server_url": target,
+                    "mcp_tools_sha256": catalog_fingerprint}), encoding="utf-8"
     )
 
     status = connection_status(root)
@@ -46,6 +55,9 @@ def test_connection_status_detects_config_without_exposing_secrets(
     assert status["tunnel_client_installed"] is True
     assert status["tunnel_configured"] is True
     assert status["tunnel_running"] is True
+    assert status["tunnel_status"] == "ready"
+    assert status["tunnel_local_target_matches"] is True
+    assert status["tunnel_tool_catalog_matches"] is True
     assert status["tunnel_id_hint"] == "...abcdef"
 
 
@@ -133,10 +145,14 @@ def test_running_launcher_does_not_imply_connected_tunnel(tmp_path, monkeypatch)
 
 def test_connection_status_handles_fresh_install(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    # Skip network discovery when this isolated fixture has no listener.
+    monkeypatch.setattr(chatgpt_connection, "_candidate_ports", lambda *_: [])
 
     status = connection_status(tmp_path / "project")
 
-    assert status["local_mcp_ready"] is True
+    assert status["local_mcp_ready"] is False
+    assert status["local_mcp_status"] == "not_running"
+    assert status["local_mcp_url"] is None
     assert status["tunnel_configured"] is False
     assert status["tunnel_running"] is False
 
@@ -166,3 +182,35 @@ def test_connection_status_accepts_windows_powershell_utf8_bom(
 
     assert status["tunnel_configured"] is True
     assert status["tunnel_id_hint"] == "...abcdef"
+
+
+def test_mcp_discovery_skips_wrong_checkout_and_old_tool_catalog(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "current"
+    root.mkdir()
+    original_client = httpx.Client
+    tool_names = sorted(chatgpt_connection.REQUIRED_MCP_TOOLS)
+    visited = []
+
+    def handle(request):
+        visited.append(str(request.url))
+        data = {"ok": True, "chatgpt_bridge": "ready", "application_root": str(root),
+                "mcp_server_version": "0.3.1", "mcp_tools": tool_names,
+                "mcp_endpoint": "https://outside.example/mcp"}
+        if request.url.port == 8765:
+            data["application_root"] = str(tmp_path / "old-checkout")
+        elif request.url.port == 8766:
+            data.update(mcp_server_version="0.3.0", mcp_tools=["get_research_status"])
+        return httpx.Response(200, json=data)
+
+    def client(**kwargs):
+        assert kwargs["trust_env"] is False
+        assert kwargs["follow_redirects"] is False
+        return original_client(transport=httpx.MockTransport(handle), **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client)
+    result = chatgpt_connection.discover_local_mcp(root, preferred_port=8765)
+    assert visited == [f"http://127.0.0.1:{port}/api/health" for port in (8765, 8766, 8767)]
+    assert result["ready"] is True
+    assert result["mcp_url"] == "http://127.0.0.1:8767/mcp"
+    assert result["mcp_tools"] == tool_names
+    assert len(result["mcp_tools_sha256"]) == 64

@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import httpx
@@ -19,7 +19,11 @@ from .colab_continuation import plan_authorization_continuation
 
 COLAB_URL = "https://colab.research.google.com/"
 COLAB_EMPTY_NOTEBOOK_URL = "https://colab.research.google.com/notebooks/empty.ipynb"
-GOOGLE_SIGN_IN_REASON = "Complete Google sign-in in the visible browser, then Resume in AutoResearch"
+GOOGLE_SIGN_IN_REASON = "Complete Google sign-in in the visible browser"
+_LEGACY_GOOGLE_SIGN_IN_REASON = GOOGLE_SIGN_IN_REASON + ", then Resume in AutoResearch"
+GOOGLE_ORDINARY_LOGIN_REASON = "Google requires an ordinary browser for sign-in; opening the dedicated login window"
+DRIVE_CONSENT_REASON = "Colab is waiting for Google Drive authorization"
+_BOUND_NOTEBOOK_LOAD_REASON = "The bound Colab notebook did not display the prepared source checksum before the load timeout"
 STATUS_PREFIX = "AUTORESEARCH_COLAB_STATUS "
 UPLOAD_PREFIX = "AUTORESEARCH_COLAB_UPLOAD_BUNDLE"
 DATA_UPLOAD_PREFIX = "AUTORESEARCH_COLAB_UPLOAD_DATA "
@@ -32,11 +36,22 @@ _UI_CONTROLS = (
     '[role="menuitem"], [role="tab"], [role="radio"], '
     '[role="combobox"], [role="option"]'
 )
-_AUTH_TEXT = (
-    "verify it's you", "verify it’s you", "verification required", "captcha",
-    "connect to google drive", "access your google drive", "sign in to continue",
-    "this notebook requires authentication", "verify you are human",
-    "验证您", "验证你的身份", "连接到 google 云端硬盘", "登录以继续",
+_ACCOUNT_AUTH_TEXT = (
+    "verify it's you", "verify it’s you", "sign in to continue",
+    "验证您", "验证你的身份", "登录以继续",
+)
+_DRIVE_AUTH_TEXT = (
+    "connect to google drive", "access your google drive", "连接到 google 云端硬盘",
+    "访问您的 google 云端硬盘", "访问您的 google 云端磁盘",
+)
+_OTHER_AUTH_TEXT = (
+    "verification required", "captcha", "this notebook requires authentication", "verify you are human",
+)
+_GOOGLE_INSECURE_BROWSER_TEXT = (
+    "this browser or app may not be secure",
+    "此浏览器或应用可能不安全",
+    "这个浏览器或应用可能不安全",
+    "此瀏覽器或應用程式可能不安全",
 )
 _QUOTA_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # A GPU advisory also mentions usage limits. Only an actual connection
@@ -92,6 +107,7 @@ _SAFE_LOCAL_ERRORS = frozenset({
     "The official notebook bridge returned invalid cell identifiers",
     "The prepared notebook source checksum does not match this job",
     "The official Colab notebook source changed after import; execution was stopped",
+    _BOUND_NOTEBOOK_LOAD_REASON,
 })
 
 
@@ -122,6 +138,7 @@ class ColabBrowserOptions:
     executable_path: Path | None = None
     timeout_ms: int = 45_000
     poll_seconds: float = 20.0
+    notebook_bridge: bool = True
 
     def __post_init__(self) -> None:
         if self.browser not in {"auto", "chrome", "edge"}:
@@ -267,15 +284,49 @@ def validate_local_api_url(url: str) -> str:
     return url.rstrip("/")
 
 
+def classify_colab_authorization(url: str, visible_text: str) -> str | None:
+    """Keep account sign-in separate from notebook permission and consent."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"accounts.google.com", "colab.research.google.com"}:
+        return None
+    text = re.sub(r"\s+", " ", visible_text.casefold())
+    if any(message in text for message in _DRIVE_AUTH_TEXT):
+        return "drive_consent"
+    if parsed.hostname == "accounts.google.com":
+        if parsed.path.casefold().startswith(("/o/oauth2", "/signin/oauth", "/oauth")):
+            return "authorization"
+        return "google_sign_in"
+    if any(message in text for message in _ACCOUNT_AUTH_TEXT):
+        return "google_sign_in"
+    if any(message in text for message in _OTHER_AUTH_TEXT):
+        return "authorization"
+    return None
+
+
+def requires_ordinary_google_login(url: str, visible_text: str) -> bool:
+    parsed = urlparse(url)
+    text = re.sub(r"\s+", " ", visible_text.casefold())
+    return (parsed.scheme == "https" and parsed.hostname == "accounts.google.com"
+            and classify_colab_authorization(url, visible_text) == "google_sign_in"
+            and any(message in text for message in _GOOGLE_INSECURE_BROWSER_TEXT))
+
+
+def colab_authorization_reason(kind: str) -> str:
+    if kind == "google_sign_in":
+        return GOOGLE_SIGN_IN_REASON
+    if kind == "drive_consent":
+        return DRIVE_CONSENT_REASON
+    return "Colab is waiting for browser authorization"
+
+
 def classify_colab_page(url: str, visible_text: str) -> str | None:
     """Only explicit visible errors count as quota or GPU unavailability.
 
     A disconnected indicator on an unopened notebook is normal, so generic
     'Connect' or 'Disconnected' labels deliberately do not imply a failed run.
     """
-    parsed = urlparse(url)
     text = re.sub(r"\s+", " ", visible_text.casefold())
-    if parsed.hostname == "accounts.google.com" or any(x in text for x in _AUTH_TEXT):
+    if classify_colab_authorization(url, visible_text):
         return "auth"
     if any(pattern.search(text) for pattern in _QUOTA_PATTERNS):
         return "quota"
@@ -305,7 +356,7 @@ def provider_cooldown_minutes(text: str) -> int | None:
 
 def control_label(name: str) -> str:
     """Normalize observed menu labels without guessing their DOM selectors."""
-    first_line = name.splitlines()[0].strip()
+    first_line = name.partition("\n")[0].strip()
     first_line = re.sub(r"\s*\(?\s*(?:Ctrl\+|Alt\+|Shift\+|Cmd\+|⌘)[^\n]*$", "", first_line)
     return first_line.rstrip(". …").casefold()
 
@@ -414,6 +465,19 @@ def marker_is_current(marker: Mapping[str, Any], attempt_started: datetime) -> b
         return started_at >= attempt_started.astimezone(timezone.utc) - timedelta(seconds=120)
     except (KeyError, ValueError, TypeError):
         return False
+
+
+def input_bundle_markers(text: str, prefix: str, project_id: str, runtime_id: str) -> Iterator[dict[str, Any]]:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith(prefix):
+            continue
+        try:
+            value = json.loads(line[len(prefix):])
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("project_id") == project_id and value.get("runtime_id") == runtime_id:
+            yield value
 
 
 def parse_data_upload_requests(text: str, project_id: str, *, prefix: str = DATA_UPLOAD_PREFIX) -> list[dict[str, Any]]:
@@ -765,6 +829,8 @@ class ColabBrowserSession:
 
     def _official_mcp_location(self) -> tuple[Path, Path] | None:
         """Enable the installed bridge only for the application's own profile."""
+        if not self.options.notebook_bridge:
+            return None
         profile = self.options.profile_dir.resolve()
         if len(profile.parents) < 3 or tuple(part.casefold() for part in profile.parts[-3:]) != ("data", "colab-browser", "profile"):
             return None
@@ -982,6 +1048,10 @@ class ColabBrowserSession:
         current_dialog_accepted = False
         saved_command_opened = False
         while True:
+            if urlparse(self.page.url).hostname == "accounts.google.com":
+                authorization = classify_colab_authorization(self.page.url, await self.visible_text())
+                if authorization:
+                    raise ManualColabAction(colab_authorization_reason(authorization))
             # Colab requires its normal connection consent. Never click the
             # 'Connect separate tabs' control or another permission dialog.
             if notebook_url is not None and not client.status().get("connected"):
@@ -1027,8 +1097,9 @@ class ColabBrowserSession:
                     pass
                 else:
                     break
-            if classify_colab_page(self.page.url, await self.visible_text()) == "auth":
-                raise ManualColabAction(GOOGLE_SIGN_IN_REASON)
+            authorization = classify_colab_authorization(self.page.url, await self.visible_text())
+            if authorization:
+                raise ManualColabAction(colab_authorization_reason(authorization))
             if asyncio.get_running_loop().time() >= deadline:
                 raise ManualColabAction("Open the official Colab notebook bridge in this browser and resume once connected")
             await asyncio.sleep(0.25)
@@ -1107,7 +1178,9 @@ class ColabBrowserSession:
         await self.page.goto(COLAB_URL, wait_until="domcontentloaded")
         state = classify_colab_page(self.page.url, await self.visible_text())
         if state:
-            raise ManualColabAction(f"Colab requires attention: {state}")
+            # Let the worker record the classified account/provider state. A
+            # GPU denial on the home page is a retry, not an authorization pause.
+            return
         await self.import_prepared_notebook(job)
 
     async def import_prepared_notebook(self, job: Mapping[str, Any]) -> None:
@@ -1122,8 +1195,38 @@ class ColabBrowserSession:
         notebook = Path(str(job["notebook_path"])).resolve(strict=True)
         if notebook.suffix != ".ipynb":
             raise ColabBrowserError("Prepared Colab notebook must be an .ipynb file")
+        original = self.page
+        existing_pages = list(self.context.pages) if self.context else [original]
         await inputs[0].set_input_files(str(notebook))
-        await self.page.wait_for_url("**/drive/**", timeout=self.options.timeout_ms)
+        expected = str(job.get("bundle_sha256") or "")
+        deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000
+        while True:
+            pages = list(self.context.pages) if self.context else [original]
+            matching = []
+            for page in pages:
+                if page is not original and page in existing_pages:
+                    continue
+                location = urlparse(page.url)
+                if location.hostname != "colab.research.google.com" or not re.fullmatch(
+                        r"/drive/[A-Za-z0-9_-]{1,200}", location.path):
+                    continue
+                self.page = page
+                try:
+                    if source_stamp_matches(await self.rendered_markdown(), expected):
+                        matching.append(page)
+                finally:
+                    self.page = original
+            if len(matching) == 1:
+                self.page = matching[0]
+                return
+            if len(matching) > 1:
+                raise ManualColabAction("Multiple copies of the prepared notebook opened; select the newly imported copy")
+            auth = classify_colab_authorization(self.page.url, await self.visible_text())
+            if auth:
+                raise ManualColabAction(colab_authorization_reason(auth))
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ManualColabAction("Colab did not open a verified Drive copy after the upload. Open the prepared notebook using File > Open notebook > Upload.")
+            await asyncio.sleep(0.25)
 
     async def rendered_markdown(self) -> str:
         return await self.page.locator("body").evaluate(
@@ -1160,18 +1263,22 @@ class ColabBrowserSession:
             raise ColabBrowserError("The official Colab notebook source changed after import; execution was stopped")
         if source_stamp_matches(await self.rendered_markdown(), expected):
             return
-        if await self.author_prepared_notebook_with_mcp(job):
-            return
-        # Import this prepared artifact through the same normal picker; do not
-        # execute an old saved Drive notebook that embeds an earlier source zip.
-        await self.import_prepared_notebook(job)
+        bound_notebook = bool(job.get("notebook_url")) and job.get("notebook_bundle_sha256") == expected
+        if not bound_notebook:
+            if await self.author_prepared_notebook_with_mcp(job):
+                return
+            await self.import_prepared_notebook(job)
+        # A saved notebook's cells can render after DOMContentLoaded.
         deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000
         while True:
             if source_stamp_matches(await self.rendered_markdown(), expected):
                 return
-            if classify_colab_page(self.page.url, await self.visible_text()) == "auth":
-                raise ManualColabAction("Complete Google sign-in before importing the newly prepared notebook")
+            authorization = classify_colab_authorization(self.page.url, await self.visible_text())
+            if authorization:
+                raise ManualColabAction(colab_authorization_reason(authorization))
             if asyncio.get_running_loop().time() >= deadline:
+                if bound_notebook:
+                    raise ColabBrowserError(_BOUND_NOTEBOOK_LOAD_REASON)
                 raise ManualColabAction(f"Import the newly prepared notebook; its visible source checksum must match this job: {job['notebook_path']}")
             await asyncio.sleep(0.25)
 
@@ -1233,8 +1340,9 @@ class ColabBrowserSession:
             if candidates:
                 saved = candidates[0]
                 break
-            if classify_colab_page(original.url,await self.visible_text()) == 'auth':
-                raise ManualColabAction('Complete Google sign-in and save this prepared notebook to Drive')
+            authorization = classify_colab_authorization(original.url, await self.visible_text())
+            if authorization:
+                raise ManualColabAction(colab_authorization_reason(authorization))
             if asyncio.get_running_loop().time() >= deadline:
                 raise ManualColabAction('The notebook copy has no Drive URL yet; finish saving it before continuing')
             await asyncio.sleep(0.25)
@@ -1470,15 +1578,8 @@ class ColabBrowserWorker:
         pending = self._input_submission
         if not pending or pending['runtime_id'] != self.runtime_id:
             return
-        for line in outputs.splitlines():
-            if not line.strip().startswith(INPUTS_READY_PREFIX):
-                continue
-            try:
-                record = json.loads(line.strip()[len(INPUTS_READY_PREFIX):])
-            except (ValueError,TypeError):
-                continue
-            if (isinstance(record,dict) and record.get('project_id')==self.client.project_id
-                    and record.get('runtime_id')==self.runtime_id and record.get('sha256')==pending['sha256']):
+        for record in input_bundle_markers(outputs, INPUTS_READY_PREFIX, self.client.project_id, pending['runtime_id']):
+            if record.get('sha256') == pending['sha256']:
                 self.inputs_uploaded = True
                 self._input_submission = None
                 self.log('Notebook confirmed the prepared input bundle identity and required inputs')
@@ -1549,9 +1650,25 @@ class ColabBrowserWorker:
             # source and historical outputs. Keep the provider's actual UI
             # wording without private authentication or account details.
             details["provider_ui_text"] = sanitize_provider_ui_text(text)
+        reason = "Colab displayed a provider message"
         if status == "auth":
-            details.update(runtime_active=self.runtime_id is not None, runtime_id=self.runtime_id)
-        await self._observation(status, "Colab displayed a provider or authentication message", retry_after_minutes=cooldown, **details)
+            kind = classify_colab_authorization(self.browser.page.url, text) or "authorization"
+            reason = colab_authorization_reason(kind)
+            details.update(auth_kind=kind, manual_action=True,
+                           runtime_active=self.runtime_id is not None, runtime_id=self.runtime_id)
+            if self.runtime_id is not None and self.attempt_started is not None:
+                details["started_at"] = self.attempt_started.isoformat()
+            if self.runtime_id is None and requires_ordinary_google_login(self.browser.page.url, text):
+                details["login_browser"] = "required"
+                reason = GOOGLE_ORDINARY_LOGIN_REASON
+            elif kind == "google_sign_in":
+                await self._open_google_sign_in_control()
+        await self._observation(status, reason, retry_after_minutes=cooldown, **details)
+
+    async def _open_google_sign_in_control(self) -> None:
+        parsed = urlparse(self.browser.page.url)
+        if parsed.scheme == "https" and parsed.hostname == "colab.research.google.com" and self.runtime_id is None:
+            await self.browser.click_observed(("Sign in", "Sign in to continue", "登录", "登录以继续", "登入"))
 
     async def _manual_observation(self, reason: str, *, preserve_runtime: bool = False) -> None:
         try:
@@ -1562,6 +1679,11 @@ class ColabBrowserWorker:
             diagnostics = {"ui_controls": [], "ui_role_tree": "", "ui_frames": []}
         parsed = urlparse(self.browser.page.url)
         diagnostics.update(ui_host=parsed.hostname, ui_path=parsed.path)
+        if reason == GOOGLE_SIGN_IN_REASON:
+            diagnostics["auth_kind"] = "google_sign_in"
+            await self._open_google_sign_in_control()
+        elif reason == DRIVE_CONSENT_REASON:
+            diagnostics["auth_kind"] = "drive_consent"
         if preserve_runtime and self.runtime_id is not None and self.attempt_started is not None:
             diagnostics.update(runtime_active=True, runtime_id=self.runtime_id, started_at=self.attempt_started.isoformat())
         self._last_ui_diagnostics = json.dumps(diagnostics, sort_keys=True, ensure_ascii=False)
@@ -1627,7 +1749,8 @@ class ColabBrowserWorker:
         if (
             job.get("status") != "auth_required"
             or observation.get("status") != "auth"
-            or details.get("reason") != GOOGLE_SIGN_IN_REASON
+            or (details.get("auth_kind") != "google_sign_in" and details.get("reason") not in (GOOGLE_SIGN_IN_REASON, _LEGACY_GOOGLE_SIGN_IN_REASON))
+            or details.get("login_browser") == "required"
             or details.get("manual_action") is not True
             or urlparse(self.browser.page.url).hostname != "colab.research.google.com"
         ):
@@ -1653,20 +1776,70 @@ class ColabBrowserWorker:
         self._manual_reason = ""
         return True
 
+    async def _resume_after_drive_consent(self, job: Mapping[str, Any]) -> bool:
+        observation = job.get("last_observation") or {}
+        details = observation.get("details") or {}
+        runtime_id = self.runtime_id
+        attempt_started = self.attempt_started
+        source_hash = str(job.get("bundle_sha256") or "")
+        inputs_hash = job.get("input_bundle_sha256")
+        notebook_url = str(job.get("notebook_url") or "")
+        page_url = urlparse(self.browser.page.url)
+        if (
+            job.get("status") != "auth_required"
+            or not job.get("autorun_enabled")
+            or job.get("source_current") is False
+            or observation.get("status") != "auth"
+            or details.get("auth_kind") != "drive_consent"
+            or not runtime_id or runtime_id in self._ignored_runtime_ids or attempt_started is None
+            or job.get("notebook_bundle_sha256") != source_hash
+            or not notebook_url or page_url._replace(query="", fragment="").geturl() != notebook_url
+        ):
+            return False
+        try:
+            if classify_colab_page(self.browser.page.url, await self.browser.visible_text()) is not None:
+                return False
+            outputs = await self.browser.output_text()
+            # The GPU check runs before Drive mounts. Require output from a later cell.
+            past_mount = (
+                any(marker["runtime_id"] == runtime_id and marker["status"] in {"running", "completed"}
+                    and marker_is_current(marker, attempt_started)
+                    for marker in parse_status_markers(outputs, self.client.project_id))
+                or any(input_bundle_markers(outputs, INPUTS_PREFIX, self.client.project_id, runtime_id))
+                or (inputs_hash and any(record.get("sha256") == inputs_hash
+                                        for record in input_bundle_markers(outputs, INPUTS_READY_PREFIX, self.client.project_id, runtime_id)))
+                or any(request["runtime_id"] == runtime_id
+                       for request in parse_data_upload_requests(outputs, self.client.project_id))
+            )
+            if not past_mount or not source_stamp_matches(await self.browser.rendered_markdown(), source_hash):
+                return False
+        except Exception as exc:
+            if is_browser_closed_error(exc):
+                raise
+            return False
+        if not await self.client.resume():
+            return False
+        self.log("The verified notebook continued after mounting Google Drive; resuming observation of the existing runtime")
+        return True
+
+    @staticmethod
+    def _waiting_for_gpu_retry(job: Mapping[str, Any]) -> bool:
+        if job.get("status") != "waiting_for_gpu":
+            return False
+        try:
+            retry_at = datetime.fromisoformat(str(job.get("next_attempt_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return retry_at.tzinfo is not None and retry_at > datetime.now(timezone.utc)
+
     async def _record_closed_browser(self) -> None:
         latest = await self.client.status()
         if latest.get("status") in {"completed", "failed", "cancelled"}:
             self.log(f"Worker stopped: job is {latest['status']}")
             return
-        if latest.get("status") == "waiting_for_gpu":
-            try:
-                retry_at = datetime.fromisoformat(str(latest.get("next_attempt_at") or "").replace("Z", "+00:00"))
-                cooling_down = retry_at.tzinfo is not None and retry_at > datetime.now(timezone.utc)
-            except (ValueError, TypeError):
-                cooling_down = False
-            if cooling_down:
-                self.log("Worker stopped after browser closure; the saved GPU retry deadline and provider observation remain unchanged")
-                return
+        if self._waiting_for_gpu_retry(latest):
+            self.log("Worker stopped after browser closure; the saved GPU retry deadline and provider observation remain unchanged")
+            return
         try:
             await self._observation(
                 "network", "The dedicated Colab browser was closed; the saved retry queue and Drive checkpoints remain available",
@@ -1731,22 +1904,35 @@ class ColabBrowserWorker:
             if self._page_is_closed():
                 await self._record_closed_browser()
                 return
+            if (job.get("autorun_enabled") and self._waiting_for_gpu_retry(job)
+                    and not self.available_reported and not self.running_reported):
+                self.log("No GPU was allocated. The saved retry deadline and dedicated resource monitor will continue the workflow")
+                return
             if status == "auth_required":
-                # The UI's explicit Resume action re-enables the next claim.
+                details = (job.get("last_observation") or {}).get("details") or {}
+                if details.get("login_browser") == "required" and self.runtime_id is None:
+                    self.log("Releasing the dedicated profile for ordinary Google sign-in")
+                    return
                 if not self._manual_reason:
                     if self.browser.page.url in {"about:blank", ""}:
                         await self.browser.page.goto(
                             validate_colab_url(str(job.get("notebook_url") or COLAB_URL)),
                             wait_until="domcontentloaded",
                         )
-                    pause_reason = ((job.get("last_observation") or {}).get("details") or {}).get("reason")
-                    if pause_reason == GOOGLE_SIGN_IN_REASON:
+                    if details.get("auth_kind") == "google_sign_in" or details.get("reason") in (GOOGLE_SIGN_IN_REASON, _LEGACY_GOOGLE_SIGN_IN_REASON):
                         self.log("Complete Google sign-in in the visible browser; the worker will continue after this page returns to Colab")
+                    elif details.get("auth_kind") == "drive_consent":
+                        self.log("Waiting for the notebook's Google Drive authorization and subsequent runtime output")
                     else:
-                        self.log("Complete Drive permission or the indicated manual action in the visible browser, then Resume in AutoResearch")
+                        self.log("Waiting for the required action in the Colab browser")
                     self._manual_reason = "paused"
                 await self._adopt_manual_runtime()
-                if await self._resume_after_google_login(job):
+                if (self.runtime_id is None and urlparse(self.browser.page.url).hostname == "accounts.google.com"):
+                    visible = await self.browser.visible_text()
+                    if requires_ordinary_google_login(self.browser.page.url, visible):
+                        await self._provider_observation("auth", visible)
+                        return
+                if await self._resume_after_google_login(job) or await self._resume_after_drive_consent(job):
                     continue
                 await self._refresh_import_diagnostics(job)
                 await asyncio.sleep(self.browser.options.poll_seconds)
@@ -1794,6 +1980,7 @@ class ColabBrowserWorker:
                     await asyncio.gather(self._continuation_task,return_exceptions=True)
                     self._continuation_task = None
                 self._disconnect_seen_at = None
+                stage = "opening or importing the notebook"
                 try:
                     await self.browser.open_notebook(job)
                     text = await self.browser.visible_text()
@@ -1801,19 +1988,24 @@ class ColabBrowserWorker:
                     if page_status:
                         await self._provider_observation(page_status, text)
                         continue
+                    stage = "verifying and saving the notebook"
                     await self.browser.ensure_prepared_notebook(job)
                     saved_url = await self.browser.save_prepared_notebook(job)
                     await self.client.bind_notebook(notebook_url=saved_url,bundle_sha256=str(job['bundle_sha256']))
-                    job = {**job,'notebook_url':saved_url,'browser_url':saved_url}
+                    job = {**job, "notebook_url": saved_url, "browser_url": saved_url,
+                           "notebook_bundle_sha256": job["bundle_sha256"]}
                     # A Drive copy is a different notebook. Reconnect and verify
                     # its exact source/native cell ownership before allocation.
+                    stage = "opening the saved notebook"
                     await self.browser.open_notebook(job)
                     await self.browser.ensure_prepared_notebook(job)
                     previous_output = await self.browser.output_text()
                     self._ignored_runtime_ids = {
                         item["runtime_id"] for item in parse_status_markers(previous_output, self.client.project_id)
                     }
+                    stage = "selecting a free GPU in Colab"
                     await self.browser.select_free_gpu()
+                    stage = "starting the notebook"
                     await self.browser.run_all()
                     self.log("Requested Run all through the standard Colab interface; waiting for actual notebook output")
                 except ManualColabAction as exc:
@@ -1822,7 +2014,7 @@ class ColabBrowserWorker:
                 except Exception as exc:
                     if is_browser_closed_error(exc):
                         raise
-                    await self._observation("network", safe_local_error_reason(exc, "Could not load or operate the Colab page"))
+                    await self._observation("network", safe_local_error_reason(exc, f"Colab connection failed while {stage}"))
                     continue
             if self.attempt_started is not None and status not in {"waiting_for_gpu", "waiting_for_connection", "quota_exceeded"}:
                 try:
@@ -1911,11 +2103,14 @@ class ColabBrowserWorker:
                 if (self._authorization_resumed and self._authorization_continuation
                         and self._authorization_continuation.get('runtime_id')==self.runtime_id):
                     continue
-                reason = "Required experiment inputs are missing in Drive" if marker.get("reason") == "missing_inputs" else "Notebook requires manual authorization or inputs"
+                missing_inputs = marker.get("reason") == "missing_inputs"
+                reason = "Required experiment inputs are missing in Drive" if missing_inputs else DRIVE_CONSENT_REASON
                 self._authorization_continuation = {'runtime_id':self.runtime_id,'started_at':marker['started_at'],'inflight_cell_id':None}
                 self._authorization_resumed = False
-                await self._observation("auth", reason, runtime_active=True,
-                    authorization_continuation=dict(self._authorization_continuation), **marker_details)
+                marker_details.update(runtime_active=True, manual_action=True,
+                    auth_kind="experiment_inputs" if missing_inputs else "drive_consent",
+                    authorization_continuation=dict(self._authorization_continuation))
+                await self._observation("auth", reason, **marker_details)
                 return
             if marker_status == "unavailable":
                 await self._observation("unavailable", "Notebook GPU check reported no usable CUDA GPU", **marker_details)
@@ -1976,15 +2171,8 @@ class ColabBrowserWorker:
             self.bundle_uploaded = True
             self.log("Submitted the prepared source bundle to the active notebook file picker")
         if self.runtime_id and not self.inputs_uploaded and self._input_submission is None:
-            for line in outputs.splitlines():
-                if not line.strip().startswith(INPUTS_PREFIX):
-                    continue
-                try:
-                    request = json.loads(line.strip()[len(INPUTS_PREFIX):])
-                except (ValueError, TypeError):
-                    continue
-                if request.get("project_id") != self.client.project_id or request.get("runtime_id") != self.runtime_id:
-                    continue
+            requests = input_bundle_markers(outputs, INPUTS_PREFIX, self.client.project_id, self.runtime_id)
+            if next(requests, None) is not None:
                 bundle = job.get("input_bundle_path")
                 if not bundle or not await self.browser.upload_source_bundle(Path(str(bundle))):
                     await self._observation("auth", f"Choose the prepared real-input bundle in Colab's file upload: {bundle}", manual_action=True)
@@ -1992,7 +2180,6 @@ class ColabBrowserWorker:
                 self._input_submission = {'runtime_id':self.runtime_id,'sha256':str(job.get('input_bundle_sha256') or ''),
                                           'submitted_at':datetime.now(timezone.utc)}
                 self.log("Submitted the prepared input bundle; waiting for notebook receipt confirmation")
-                break
         if self.runtime_id and (self.available_reported or self.running_reported):
             if await self.browser.has_disconnected_runtime_control():
                 now = datetime.now(timezone.utc)

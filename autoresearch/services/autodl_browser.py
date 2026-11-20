@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import math
 import os
@@ -9,7 +10,7 @@ import shutil
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Literal, Sequence, TypeVar
 from urllib.parse import urljoin, urlparse
 
 
@@ -95,6 +96,10 @@ class AutoDLBrowserSelectors:
         ".verify button:not([disabled])",
         ".verify .el-button:not([disabled])",
     )
+    sms_login_buttons: tuple[str, ...] = (
+        'button:has-text("短信登录")',
+        '.content button:has-text("短信登录")',
+    )
     captcha_modal: str = "#aliyunCaptcha-window-popup"
     captcha_background: str = "#aliyunCaptcha-img"
     captcha_piece: str = "#aliyunCaptcha-puzzle"
@@ -130,6 +135,7 @@ OTPProvider = Callable[[], str | Awaitable[str]]
 T = TypeVar("T")
 AuthenticatedHook = Callable[["AutoDLBrowserSession"], T | Awaitable[T]]
 PixelMatrix = Sequence[Sequence[int]]
+CaptchaWaitResult = Literal["success", "refreshed", "timeout"]
 
 
 def discover_browser_executable(browser: str = "auto") -> Path | None:
@@ -526,13 +532,20 @@ class AutoDLBrowserSession:
         if playwright is not None:
             await playwright.stop()
 
-    async def login_sms(self, phone: str, otp_provider: OTPProvider) -> LoginResult:
+    async def login_sms(
+        self,
+        phone: str,
+        otp_provider: OTPProvider,
+        *,
+        automate_captcha: bool = True,
+    ) -> LoginResult:
         """Send an SMS once, then submit the user-provided code."""
         if not phone.strip():
             raise ValueError("An AutoDL phone number is required")
         if self._page is None:
             await self.start()
         await self.goto_autodl(AUTODL_LOGIN_URL, wait_until="domcontentloaded")
+        await self._ensure_sms_login_mode()
         phone_input = await self._find_visible((*self.selectors.phone_inputs, 'input[placeholder="请输入手机号"]'))
         await phone_input.fill(phone.strip())
         button = await self._find_visible((*self.selectors.send_code_buttons, 'button:has-text("发送验证码")'))
@@ -541,7 +554,7 @@ class AutoDLBrowserSession:
         deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000
         while asyncio.get_running_loop().time() < deadline:
             if await self._is_visible(self.selectors.captcha_background):
-                await self._complete_captcha(False)
+                await self._complete_captcha(automate_captcha)
             label = await button.inner_text()
             if any(char.isdigit() for char in label):
                 break
@@ -560,7 +573,7 @@ class AutoDLBrowserSession:
         await self._click_submit()
         state = await self._wait_for_login_state(allow_otp=False)
         if state == "captcha":
-            await self._complete_captcha(False)
+            await self._complete_captcha(automate_captcha)
             state = await self._wait_for_login_state(allow_otp=False)
         if state != "authenticated":
             raise AutoDLLoginError("AutoDL SMS login did not reach an authenticated page")
@@ -649,6 +662,11 @@ class AutoDLBrowserSession:
             piece = await self._find_visible((self.selectors.captcha_piece,))
             track = await self._find_visible((self.selectors.captcha_track,))
             thumb = await self._find_visible((self.selectors.captcha_thumb,))
+            await asyncio.gather(
+                self._wait_for_captcha_image(background),
+                self._wait_for_captcha_image(piece),
+            )
+            initial_source = await background.get_attribute("src")
 
             background_bytes, piece_bytes = await asyncio.gather(
                 self._image_bytes(background), self._image_bytes(piece)
@@ -659,7 +677,13 @@ class AutoDLBrowserSession:
             match = solve_puzzle_gap(background_gray, piece_alpha, search_start=20)
             last_match = match
             if match.confidence < 1.005:
-                await self._refresh_captcha()
+                if attempt + 1 < max_attempts:
+                    await self._refresh_captcha()
+                continue
+
+            current_source = await background.get_attribute("src")
+            if initial_source and current_source and initial_source != current_source:
+                # The challenge changed while its images were being analysed.
                 continue
 
             background_box, piece_box, track_box, thumb_box = await asyncio.gather(
@@ -683,7 +707,6 @@ class AutoDLBrowserSession:
                 float(thumb_box["y"] + thumb_box["height"] / 2.0),
             )
             end = (start[0] + distance, start[1])
-            initial_source = await background.get_attribute("src")
             await self._drag_human_path(
                 start,
                 end,
@@ -694,9 +717,10 @@ class AutoDLBrowserSession:
                     float(track_box["width"] - thumb_box["width"] - 1.0),
                 ),
             )
-            if await self._wait_for_captcha_success(initial_source):
+            outcome = await self._wait_for_captcha_success(initial_source)
+            if outcome == "success":
                 return match
-            if attempt + 1 < max_attempts:
+            if outcome == "timeout" and attempt + 1 < max_attempts:
                 await self._refresh_captcha()
 
         detail = "" if last_match is None else f" (last confidence {last_match.confidence:.3f})"
@@ -746,6 +770,18 @@ class AutoDLBrowserSession:
         button = await self._find_visible(self.selectors.submit_buttons)
         await button.click()
 
+    async def _ensure_sms_login_mode(self) -> None:
+        send_code = (*self.selectors.send_code_buttons, 'button:has-text("发送验证码")')
+        deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000.0
+        while asyncio.get_running_loop().time() < deadline:
+            if await self._any_visible(send_code):
+                return
+            if await self._any_visible(self.selectors.sms_login_buttons):
+                toggle = await self._find_visible(self.selectors.sms_login_buttons)
+                await toggle.click()
+            await asyncio.sleep(0.15)
+        raise AutoDLBrowserError("AutoDL did not expose the SMS login form")
+
     async def _find_visible(self, selectors: Sequence[str]) -> Any:
         deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000.0
         while asyncio.get_running_loop().time() < deadline:
@@ -778,6 +814,10 @@ class AutoDLBrowserSession:
 
     async def _image_bytes(self, locator: Any) -> bytes:
         source = await locator.get_attribute("src")
+        if source and source.startswith("data:"):
+            header, payload = source.split(",", 1)
+            if ";base64" in header:
+                return base64.b64decode(payload)
         if source and self._context is not None:
             try:
                 response = await self._context.request.get(urljoin(self.page.url, source))
@@ -786,6 +826,20 @@ class AutoDLBrowserSession:
             except Exception:
                 pass
         return await locator.screenshot(type="png")
+
+    async def _wait_for_captcha_image(self, locator: Any) -> None:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                loaded = await locator.evaluate(
+                    "image => image.complete && image.naturalWidth > 0 && Boolean(image.getAttribute('src'))"
+                )
+                if loaded:
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+        raise PuzzleSolveError("The CAPTCHA image did not finish loading")
 
     async def _drag_human_path(
         self,
@@ -837,20 +891,36 @@ class AutoDLBrowserSession:
         finally:
             await self.page.mouse.up()
 
-    async def _wait_for_captcha_success(self, initial_source: str | None) -> bool:
-        deadline = asyncio.get_running_loop().time() + 8.0
+    async def _wait_for_captcha_success(
+        self,
+        initial_source: str | None,
+        *,
+        timeout_seconds: float = 8.0,
+        refresh_grace_seconds: float = 1.2,
+    ) -> CaptchaWaitResult:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        source_changed_at: float | None = None
         while asyncio.get_running_loop().time() < deadline:
-            if not await self._is_visible(self.selectors.captcha_modal):
-                return True
+            try:
+                modal = self.page.locator(self.selectors.captcha_modal)
+                modal_visible = bool(await modal.count()) and await modal.first.is_visible()
+            except Exception:
+                await asyncio.sleep(0.15)
+                continue
+            if not modal_visible:
+                return "success"
             background = self.page.locator(self.selectors.captcha_background).first
             try:
                 current_source = await background.get_attribute("src")
                 if initial_source and current_source and current_source != initial_source:
-                    return False
+                    if source_changed_at is None:
+                        source_changed_at = asyncio.get_running_loop().time()
+                    if asyncio.get_running_loop().time() - source_changed_at >= refresh_grace_seconds:
+                        return "refreshed"
             except Exception:
-                return True
+                pass
             await asyncio.sleep(0.15)
-        return False
+        return "timeout"
 
     async def _refresh_captcha(self) -> None:
         old_source: str | None = None

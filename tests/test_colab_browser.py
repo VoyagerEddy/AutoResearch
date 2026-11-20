@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from autoresearch.colab_browser_cli import WorkerLock, _process_identity, worker_is_running, launch_colab_login_browser, run as run_colab_browser_cli
+from autoresearch.colab_browser_cli import ColabProfileBusy, WorkerLock, _process_identity, worker_is_running, launch_colab_login_browser, run as run_colab_browser_cli
 from autoresearch.services.colab_browser import (
     ColabBrowserError,
     ColabBrowserOptions,
@@ -18,7 +18,9 @@ from autoresearch.services.colab_browser import (
     ColabBrowserWorker,
     ColabJobClient,
     COLAB_EMPTY_NOTEBOOK_URL,
+    classify_colab_authorization,
     classify_colab_page,
+    requires_ordinary_google_login,
     marker_is_current,
     parse_data_upload_requests,
     ManualColabAction,
@@ -95,13 +97,13 @@ def test_parse_actual_provider_cooldown(text: str, expected: int | None) -> None
     assert provider_cooldown_minutes(text) == expected
 
 
-@pytest.mark.parametrize("url", ["https://example.com/", "https://colab.research.google.com.evil/", "http://colab.research.google.com/", "https://user:secret@colab.research.google.com/"])
+@pytest.mark.parametrize("url", ["https://example.com/", "https://colab.research.google.com.evil/", "http://colab.research.google.com/", "https://fixture-user:fixture-password@colab.research.google.com/"])
 def test_notebook_navigation_rejects_untrusted_hosts(url: str) -> None:
     with pytest.raises(ValueError):
         validate_colab_url(url)
 
 
-@pytest.mark.parametrize("url", ["https://127.0.0.1:8765", "http://example.com", "http://127.0.0.1:8765/api", "http://user:secret@localhost/"])
+@pytest.mark.parametrize("url", ["https://127.0.0.1:8765", "http://example.com", "http://127.0.0.1:8765/api", "http://fixture-user:fixture-password@localhost/"])
 def test_worker_api_restricted_to_local_root(url: str) -> None:
     with pytest.raises(ValueError):
         validate_local_api_url(url)
@@ -400,7 +402,7 @@ def test_launcher_does_not_spawn_over_profile_owner_without_metadata(tmp_path: P
     monkeypatch.setattr(cli.subprocess, 'Popen', lambda *args, **kwargs: launches.append(args))
     profile = tmp_path / 'data' / 'colab-browser' / 'profile'
     with WorkerLock(profile.with_name('profile.lock')):
-        with pytest.raises(ColabBrowserError, match='already uses'):
+        with pytest.raises(ColabProfileBusy):
             cli.launch_colab_worker(tmp_path, 'project-1')
     assert launches == []
 
@@ -437,6 +439,38 @@ def test_observed_menu_label_normalizes_only_ellipsis_and_shortcuts() -> None:
     assert control_label("Open notebook…\nCtrl+O") == "open notebook"
     assert control_label("Run all (Ctrl+F9)") == "run all"
     assert control_label("T4 GPU") == "t4 gpu"
+    assert control_label("") == ""
+    assert control_label("\r\n") == ""
+
+
+@pytest.mark.asyncio
+async def test_standard_upload_follows_new_drive_tab_and_verifies_source(tmp_path) -> None:
+    digest = "1" * 64
+    notebook = tmp_path / "prepared.ipynb"
+    notebook.write_text("{}")
+    wrong = SimpleNamespace(url="https://colab.research.google.com/drive/another")
+    uploaded = SimpleNamespace(url="https://colab.research.google.com/drive/prepared")
+
+    class Input:
+        async def set_input_files(self, path):
+            assert Path(path) == notebook
+            session.context.pages.append(uploaded)
+
+    class Session(ColabBrowserSession):
+        async def open_upload_picker(self):
+            return True
+
+        async def rendered_markdown(self):
+            assert self.page is uploaded
+            return f"AUTORESEARCH_SOURCE_SHA256 {digest}"
+
+    session = Session(ColabBrowserOptions(profile_dir=tmp_path, notebook_bridge=False))
+    original = SimpleNamespace(url="https://colab.research.google.com/",
+                               locator=lambda selector: FakeRoleList([Input()]))
+    session.page = original
+    session.context = SimpleNamespace(pages=[original, wrong])
+    await session.import_prepared_notebook({"notebook_path": str(notebook), "bundle_sha256": digest})
+    assert session.page is uploaded
 
 
 def test_ui_diagnostics_do_not_log_account_identifiers() -> None:
@@ -1695,6 +1729,107 @@ async def test_google_login_auto_resume_never_releases_other_pauses(url: str, te
     browser.visible_controls = controls
     assert not await ColabBrowserWorker(client, browser)._resume_after_google_login(client.job)
     assert client.resume_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", [None, "prompt", "early_output", "other_runtime", "wrong_source", "wrong_page"])
+async def test_drive_consent_resume_requires_verified_post_mount_output(blocker: str | None) -> None:
+    started = datetime.now(timezone.utc)
+    notebook_url = "https://colab.research.google.com/drive/example"
+    source_hash = "a" * 64
+    client = FakeClient({
+        "status": "auth_required", "autorun_enabled": True, "notebook_url": notebook_url,
+        "bundle_sha256": source_hash, "notebook_bundle_sha256": source_hash,
+        "last_observation": {"status": "auth", "details": {"auth_kind": "drive_consent"}},
+    })
+    browser = FakeBrowser(
+        outputs=marker("available", started=started) if blocker == "early_output" else marker(
+            "running", started=started, runtime_id="other-runtime" if blocker == "other_runtime" else "runtime-1",
+        ),
+        text="Connect to Google Drive" if blocker == "prompt" else "",
+        url="https://colab.research.google.com/drive/other" if blocker == "wrong_page" else notebook_url,
+    )
+
+    async def rendered_markdown() -> str:
+        return "AUTORESEARCH_SOURCE_SHA256 " + ("b" * 64 if blocker == "wrong_source" else source_hash)
+
+    browser.rendered_markdown = rendered_markdown
+    worker = ColabBrowserWorker(client, browser)
+    worker.runtime_id = "runtime-1"
+    worker.attempt_started = started
+    assert await worker._resume_after_drive_consent(client.job) is (blocker is None)
+    assert client.resume_count == int(blocker is None)
+    assert browser.run_all_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url,text,kind,auto_resume", [
+    ("https://accounts.google.com/v3/signin/identifier", "", "google_sign_in", True),
+    ("https://colab.research.google.com/", "Sign in to continue", "google_sign_in", True),
+    ("https://colab.research.google.com/drive/example", "Connect to Google Drive", "drive_consent", False),
+    ("https://accounts.google.com/o/oauth2/v2/auth", "Sign in to continue", "authorization", False),
+    ("https://colab.research.google.com/drive/example", "This notebook requires authentication", "authorization", False),
+])
+async def test_provider_authorization_kind_controls_automatic_resume(url, text, kind, auto_resume):
+    client = FakeClient()
+    browser = FakeBrowser(url=url, text=text)
+    worker = ColabBrowserWorker(client, browser)
+    sign_in_controls = []
+
+    async def click(labels):
+        sign_in_controls.append(labels)
+        return True
+
+    browser.click_observed = click
+    assert classify_colab_authorization(url, text) == kind
+    await worker._provider_observation("auth", text)
+    status, details = client.observations[-1]
+    assert details["auth_kind"] == kind and details["manual_action"] is True
+    assert bool(sign_in_controls) == (kind == "google_sign_in" and "colab.research.google.com" in url)
+    client.job["last_observation"] = {"status": status, "details": details}
+    browser.page.url = "https://colab.research.google.com/drive/example"
+    browser.text = ""
+    browser.visible_controls = [{"role": "button", "name": "File"}]
+    assert await worker._resume_after_google_login(client.job) is auto_resume
+    assert client.resume_count == int(auto_resume)
+
+
+@pytest.mark.parametrize("url,text,expected", [
+    ("https://accounts.google.com/v3/signin/identifier", "This browser or app may not be secure", True),
+    ("https://accounts.google.com/v3/signin/rejected", "此浏览器或应用可能不安全", True),
+    ("https://accounts.google.com/v3/signin/challenge", "Verify it's you", False),
+    ("https://colab.research.google.com/", "This browser or app may not be secure", False),
+    ("https://accounts.google.com.evil/", "This browser or app may not be secure", False),
+    ("https://accounts.google.com/o/oauth2/v2/auth", "This browser or app may not be secure", False),
+])
+def test_ordinary_login_handoff_needs_specific_account_page_evidence(url, text, expected):
+    assert requires_ordinary_google_login(url, text) is expected
+
+
+@pytest.mark.asyncio
+async def test_login_worker_yields_profile_when_google_rejects_automated_browser():
+    client = FakeClient({"status": "auth_required", "autorun_enabled": True})
+    browser = FakeBrowser(url="https://accounts.google.com/v3/signin/rejected",
+                          text="This browser or app may not be secure")
+    await asyncio.wait_for(ColabBrowserWorker(client, browser).run(), timeout=3)
+    assert [status for status, _ in client.observations] == ["auth"]
+    details = client.observations[0][1]
+    assert details["auth_kind"] == "google_sign_in" and details["login_browser"] == "required"
+    assert details["runtime_active"] is False
+    assert client.resume_count == client.claim_count == browser.run_all_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_status", ["unavailable", "quota"])
+async def test_authorized_wait_yields_profile_without_changing_retry(provider_status):
+    retry_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    client = FakeClient({"status": "waiting_for_gpu", "autorun_enabled": True, "next_attempt_at": retry_at,
+                         "last_observation": {"status": provider_status}})
+    browser = FakeBrowser()
+    saved = dict(client.job)
+    await asyncio.wait_for(ColabBrowserWorker(client, browser).run(), timeout=3)
+    assert client.job == saved and client.observations == []
+    assert client.claim_count == browser.run_all_count == 0
 
 
 class TargetClosedError(RuntimeError):

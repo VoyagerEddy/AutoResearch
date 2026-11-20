@@ -74,25 +74,16 @@ class AppState:
                 'autorun_enabled': job.get('autorun_enabled', False),
                 'message': 'The browser worker will check availability through the normal Colab UI.'}
 
-    async def launch_colab(self, project_id: str, browser: str, *, resume_auth: bool = True) -> dict[str, Any]:
+    async def launch_colab(self, project_id: str, browser: str, *, resume_auth: bool = False) -> dict[str, Any]:
         """Persist explicit authorization, then launch or respect a saved cooldown."""
         async with self._colab_launch_lock:
-            job = self.colab.enable_autorun(project_id, browser)
-            if job['status'] == 'auth_required':
-                if not resume_auth:
-                    return {'status': 'auth_required', 'pid': job.get('worker_pid'),
-                            'project_id': project_id, 'autorun_enabled': True,
-                            'message': '请完成 Colab 登录、授权或页面操作，再点击继续；当前 GPU 可用性尚未确认。'}
-                job = self.colab.resume(project_id)
-            if job['worker_running']:
-                return {'status': 'worker_launched', 'pid': job['worker_pid'],
-                        'project_id': project_id, 'autorun_enabled': True,
-                        'message': 'The existing Colab browser worker is already running.'}
-            if not job['can_attempt'] and job['status'] not in {'running', 'gpu_available'}:
-                return {'status': 'retry_scheduled', 'pid': None, 'project_id': project_id,
-                        'autorun_enabled': True, 'next_attempt_at': job.get('next_attempt_at'),
-                        'message': 'The local service will launch the browser worker after the saved cooldown.'}
-            return await self._launch_colab_worker(job)
+            # Dashboard and ChatGPT use the same authorization and browser
+            # transitions. Worker startup is bounded by the shared profile lock.
+            result = await asyncio.to_thread(self.chatgpt.start_colab, project_id,
+                                             confirm_execute=True, resume_auth=resume_auth, browser=browser)
+            if result['status'] == 'browser_launched':
+                return {**result, 'status': 'worker_launched'}
+            return result
 
     async def check_colab(self, project_id: str, browser: str) -> dict[str, Any]:
         """A platform selection starts monitoring without resuming a manual pause."""
@@ -101,28 +92,46 @@ class AppState:
             return {'status': 'preparation_required' if not job.get('prepared') else job['status'],
                     'project_id': project_id, 'job': job, 'resource_agent_pid': None,
                     'message': '请先准备 Colab 实验。' if not job.get('prepared') else '当前试验已停止或结束。'}
-        job = self.colab.enable_autorun(project_id, browser)
-        monitor_pid = await self._ensure_colab_resource_monitor(job)
         result = await self.launch_colab(project_id, browser, resume_auth=False)
-        return {**result, 'job': self.colab.status(project_id), 'resource_agent_pid': monitor_pid}
+        return {**result, 'job': self.colab.status(project_id),
+                'resource_agent_pid': (result.get('resource_agent') or {}).get('pid')}
 
     async def launch_due_colab_jobs(self) -> list[dict[str, Any]]:
         """One bounded dispatch per tick; all workers share a browser profile."""
+        from .colab_browser_cli import ColabProfileBusy, launch_colab_login_browser, login_browser_is_running
+
         async with self._colab_launch_lock:
-            jobs = [self.colab.status(project.id) for project in self.db.list_projects(limit=10000)]
+            jobs = await asyncio.to_thread(lambda: [self.colab.status(project.id) for project in self.db.list_projects(limit=10000)])
             if any(job['worker_running'] for job in jobs):
                 return []
-            for job in jobs:
+            if login_browser_is_running(self.settings.root) is not None:
+                return []
+            for index, job in enumerate(jobs):
+                if job['status'] != 'auth_required' or not job.get('autorun_enabled') or job.get('source_current') is False:
+                    continue
+                project_id = job['project_id']
+                if job.get('ordinary_login'):
+                    jobs[index] = await asyncio.to_thread(self.colab.complete_ordinary_login, project_id)
+                    continue
+                details = (job.get('last_observation') or {}).get('details') or {}
+                if (details.get('auth_kind') == 'google_sign_in' and details.get('login_browser') == 'required'
+                        and not details.get('runtime_active') and not job.get('ordinary_login_recheck')):
+                    try:
+                        pid = await asyncio.to_thread(launch_colab_login_browser, self.settings.root,
+                                                      browser=job.get('browser', 'auto'))
+                    except (ColabBrowserError, OSError):
+                        logging.getLogger(__name__).warning('Could not open the ordinary Colab login window for %s', project_id)
+                        return []
+                    await asyncio.to_thread(self.colab.ordinary_login_opened, project_id, pid)
+                    return [{'status': 'login_browser_opened', 'pid': pid, 'project_id': project_id}]
+            for job in sorted(jobs, key=lambda item: item.get('next_attempt_at') or ''):
                 if not job.get('autorun_enabled') or not job['can_attempt']:
                     continue
                 try:
                     return [await self._launch_colab_worker(job)]
-                except ColabBrowserError as exc:
-                    # An open manual login window needs a person; do not keep
-                    # relaunching every scheduler tick or bypass its profile lock.
-                    self.colab.observe(job['project_id'], ColabObservationRequest(status='auth', details={
-                        'reason': str(exc), 'manual_action': True, 'scheduler': True}))
-                except OSError as exc:
+                except ColabProfileBusy:
+                    return []
+                except (ColabBrowserError, OSError) as exc:
                     self.colab.observe(job['project_id'], ColabObservationRequest(status='network', details={
                         'reason': str(exc), 'scheduler': True}))
                 return []
@@ -144,7 +153,7 @@ class AppState:
         launched = []
         for project in self.db.list_projects(limit=10000):
             job = self.colab.status(project.id)
-            if (not job.get('prepared') or not job.get('autorun_enabled')
+            if (not job.get('prepared') or not job.get('autorun_enabled') or job.get('source_current') is False
                     or job['status'] in {'completed', 'failed', 'cancelled', 'blocked'}):
                 continue
             pid = await self._ensure_colab_resource_monitor(job)
@@ -193,6 +202,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
+        tools = await mcp_server.list_tools()
         return {
             "ok": True,
             "version": "0.3.0",
@@ -200,6 +210,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "active_research": len(state.orchestrator._tasks),
             "active_experiments": len(state.experiments._tasks),
             "chatgpt_bridge": "ready",
+            "mcp_server_version": "0.3.1",
+            "mcp_tools": sorted(tool.name for tool in tools),
             "mcp_endpoint": f"{str(request.base_url).rstrip('/')}/mcp",
         }
 
@@ -379,11 +391,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/projects/{project_id}/colab/resume")
     async def resume_colab(project_id: str) -> dict[str, Any]:
         try:
-            job = state.colab.resume(project_id)
+            job = state.colab.status(project_id)
+            if job['status'] != 'auth_required':
+                raise ColabConflict('Only an authentication pause can be resumed immediately; GPU retry cooldown remains in force')
             if job.get('autorun_enabled'):
-                await state.launch_colab(project_id, job.get('browser', 'auto'))
-                job = state.colab.status(project_id)
-            return job
+                await state.launch_colab(project_id, job.get('browser', 'auto'), resume_auth=True)
+                return state.colab.status(project_id)
+            return state.colab.resume(project_id)
         except (LookupError, ValueError, OSError, ColabBrowserError) as exc:
             raise colab_error(exc) from exc
 
@@ -412,30 +426,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/projects/{project_id}/colab/login", status_code=202)
     async def launch_colab_login(project_id: str, request: ColabBrowserLaunchRequest) -> dict[str, Any]:
         try:
-            job = state.colab.status(project_id)
-            if job['status'] in {'running', 'gpu_available', 'attempting'}:
-                raise ColabConflict('Finish the active Colab runtime before changing the login browser')
-            from .colab_browser_cli import launch_colab_login_browser, worker_is_running
-
-            if worker_is_running(state.settings.root, project_id):
-                state.colab.cancel(project_id)
-                for _ in range(60):
-                    if not worker_is_running(state.settings.root, project_id):
-                        break
-                    await asyncio.sleep(0.5)
-                else:
-                    raise ColabConflict('The previous browser worker is still closing; try login again shortly')
-            if job.get('prepared'):
-                refreshed = await asyncio.to_thread(state.colab.prepare, project_id, ColabPrepareRequest(
-                    drive_root=job.get('drive_root', 'AutoResearch'), notebook_url=job.get('notebook_url', ''),
-                    retry_min_minutes=job.get('retry_min_minutes', 5), retry_max_minutes=job.get('retry_max_minutes', 10)))
-                if not refreshed.get('prepared'):
-                    raise ValueError(refreshed.get('blocked_reason') or 'Colab preparation failed')
-                state.colab.observe(project_id, ColabObservationRequest(status='auth', details={
-                    'reason': 'Complete Google sign-in in the ordinary Chrome window, close that window, then Start in AutoResearch.',
-                    'manual_action': True, 'login_browser': 'ordinary'}))
-            pid = await asyncio.to_thread(launch_colab_login_browser, state.settings.root, browser=request.browser)
-            return {'status': 'login_browser_launched', 'pid': pid, 'project_id': project_id}
+            return await asyncio.to_thread(state.chatgpt.open_colab_login, project_id, browser=request.browser)
         except (LookupError, ValueError, OSError, ColabBrowserError) as exc:
             raise colab_error(exc) from exc
 

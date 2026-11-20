@@ -58,14 +58,17 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
     server = MCPServer(
         name="autoresearch-local",
         title="AutoResearch Experiment Executor",
-        description="Stores research code, retrieves sources, invokes AutoDL, and returns experiment status and results for ChatGPT.",
-        version="0.2.0",
+        description="Persists ChatGPT-led research plans, code and decisions, executes experiments on free Colab or authorized AutoDL, and returns current-run evidence for ChatGPT analysis.",
+        version="0.3.1",
         instructions=(
             "ChatGPT owns research reasoning and result analysis; AutoResearch handles persistence and execution. "
             "Call list_research_projects or create_research_project first, then reuse the project ID with other tools. "
             "Call save_experiment_code when ChatGPT has written the code; call generate_experiment_code to delegate implementation to AutoResearch/OpenRouter. "
             "Before using AutoDL, call check_autodl_readiness; it never creates billable resources. "
             "For free Colab GPUs, call prepare_colab_experiment then start_colab_experiment with user authorization. Google login or Drive consent can require user action; a retry deadline is not GPU allocation. "
+            "Use get_colab_status and get_colab_resources to distinguish live observations from old results. After manual consent call resume_colab_experiment; bind_colab_notebook saves the public Drive recovery link. "
+            "Use get_colab_experiment_result for current-run Colab metrics and returned log evidence. Missing remote logs or metrics remain unknown, and acceptance does not count as full-data completion. "
+            "Save an explicit hypothesis/dataset/experiment coverage plan using save_research_plan, inspect get_research_workflow, then record_research_decision against the latest evidence after ChatGPT analysis. AutoResearch never substitutes its own model reasoning in this mode. "
             "Then call check_experiment_readiness to inspect entry points, data, and metric declarations; a passing static check does not validate scientific results. "
             "Obtain explicit user confirmation and set the relevant confirm parameter to true before billable AutoDL actions or remote execution. "
             "Never ask for or echo an AutoDL token, SSH password, or OpenRouter key in conversation."
@@ -373,6 +376,30 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
         return bridge.colab_status(project_id)
 
     @server.tool(
+        name="get_colab_resources", title="Get Current Colab Resource Observer State",
+        description="Reads the resource Agent's actual process and heartbeat state, last GPU observation, freshness, and next check. Historical available observations and a live heartbeat alone do not prove a GPU is available.",
+        annotations=READ_ONLY, structured_output=True,
+    )
+    def get_colab_resources(project_id: str) -> dict[str, Any]:
+        return bridge.colab_resources(project_id)
+
+    @server.tool(
+        name="open_colab_login", title="Open the Dedicated Google Login Browser",
+        description="Opens the dedicated ordinary Chrome/Edge window for Google sign-in, or points to the already active worker window. Close an ordinary login window after signing in; the scheduler will recheck sign-in and continue any authorized job. Credentials and verification stay in the browser.",
+        annotations=NETWORK_WRITE, structured_output=True,
+    )
+    def open_colab_login(project_id: str, browser: str = "auto") -> dict[str, Any]:
+        return bridge.open_colab_login(project_id, browser=browser)
+
+    @server.tool(
+        name="get_colab_experiment_result", title="Read Current Colab Experiment Evidence",
+        description="Returns validated metrics only from the prepared code and currently observed Colab runtime, completion scope, returned log tail or an explicit unknown, and next actions for ChatGPT. Does not read a remote Drive path as a local file; acceptance is not full-data completion.",
+        annotations=READ_ONLY, structured_output=True,
+    )
+    def get_colab_experiment_result(project_id: str) -> dict[str, Any]:
+        return bridge.colab_result(project_id)
+
+    @server.tool(
         name="prepare_colab_experiment", title="Prepare a Free Colab GPU Experiment",
         description="Exports a project notebook after validating its explicit full-state checkpoint and resume contract. Does not allocate a GPU or upload files. Uses random 5–10 minute GPU retries.",
         annotations=LOCAL_WRITE, structured_output=True,
@@ -384,11 +411,27 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="start_colab_experiment", title="Start the Colab Notebook Browser",
-        description="Starts the local Colab browser worker to request a free GPU and execute the prepared project through the normal notebook UI. Requires user authorization; Google sign-in and Drive permissions may need user action. No paid fallback.",
+        description="Authorizes the prepared free-GPU job and starts its browser worker and resource Agent. The worker handles sign-in state and checks real GPU allocation through the Colab UI. When ordinary availability is denied, its durable queue retries in 5–10 minutes; explicit account limits take precedence. For an authorization pause follow next_action.",
         annotations=REMOTE_EXECUTION, structured_output=True,
     )
     def start_colab_experiment(project_id: str, confirm_execute: bool) -> dict[str, Any]:
         return bridge.start_colab(project_id, confirm_execute=confirm_execute)
+
+    @server.tool(
+        name="bind_colab_notebook", title="Save a Verified Colab Drive Recovery Link",
+        description="Binds the public https://colab.research.google.com/drive/... notebook URL to the prepared source hash returned by get_colab_status. Verify that the Drive copy contains this prepared notebook first. Does not run cells, allocate compute, or bypass a retry deadline. Never send connection tokens.",
+        annotations=LOCAL_WRITE, structured_output=True,
+    )
+    def bind_colab_notebook(project_id: str, notebook_url: str, bundle_sha256: str) -> dict[str, Any]:
+        return bridge.bind_colab_notebook(project_id, notebook_url, bundle_sha256)
+
+    @server.tool(
+        name="resume_colab_experiment", title="Resume Colab After Manual Login or Consent",
+        description="Resumes only a recorded login or Drive authorization pause using the user's execution authorization. Set confirm_execute=true only when that authorization exists. Preserves GPU quota cooldowns and reuses an existing worker; never ask for passwords or codes.",
+        annotations=REMOTE_EXECUTION, structured_output=True,
+    )
+    def resume_colab_experiment(project_id: str, confirm_execute: bool) -> dict[str, Any]:
+        return bridge.resume_colab(project_id, confirm_execute=confirm_execute)
 
     @server.tool(
         name="cancel_colab_retries", title="Stop Colab GPU Retries",
@@ -397,5 +440,29 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
     )
     def cancel_colab_retries(project_id: str) -> dict[str, Any]:
         return bridge.cancel_colab(project_id)
+
+    @server.tool(
+        name="save_research_plan", title="Save the ChatGPT Research Coverage Plan",
+        description="Persists ChatGPT's explicit hypotheses, required datasets and experiment matrix, with implementation paths and success criteria. Full, acceptance and evaluation scopes stay distinct. Returns a versioned plan and coverage evidence; does not generate code, execute experiments or invoke another model.",
+        annotations=LOCAL_WRITE, structured_output=True,
+    )
+    def save_research_plan(project_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+        return bridge.save_research_plan(project_id, plan)
+
+    @server.tool(
+        name="get_research_workflow", title="Inspect ChatGPT Research Coverage and Evidence",
+        description="Returns the saved research plan, code and evidence identities, hypothesis/dataset/experiment coverage and current blockers. Planned work and acceptance results cannot count as completed full-data research. This is a read-only inspection, not scientific reasoning or execution.",
+        annotations=READ_ONLY, structured_output=True,
+    )
+    def get_research_workflow(project_id: str) -> dict[str, Any]:
+        return bridge.research_workflow(project_id)
+
+    @server.tool(
+        name="record_research_decision", title="Save ChatGPT's Evidence-Bound Research Decision",
+        description="Saves ChatGPT's advance/revise/stop/accept decision and analysis bound to the latest plan_id, plan_sha256, code_sha256 and evidence_id returned by get_research_workflow. Advance/accept require current full-data evidence. Does not invoke a model, start another experiment, or incur costs.",
+        annotations=LOCAL_WRITE, structured_output=True,
+    )
+    def record_research_decision(project_id: str, decision: dict[str, Any]) -> dict[str, Any]:
+        return bridge.record_research_decision(project_id, decision)
 
     return server

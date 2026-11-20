@@ -31,7 +31,7 @@ def config() -> dict:
 def project_service(tmp_path: Path):
     settings = Settings.load(tmp_path)
     db = Database(settings.data_dir / 'test.sqlite3')
-    project = db.create_project(ResearchRequest(topic='Colab speaker verification'), settings.workspace_dir)
+    project = db.create_project(ResearchRequest(topic='Colab experiment fixture'), settings.workspace_dir)
     generated = Path(project.workspace) / 'generated'
     generated.mkdir(parents=True)
     (generated / 'train.py').write_text('print("real project runner")\n', encoding='utf-8')
@@ -74,7 +74,7 @@ def test_preparation_is_not_an_attempt_and_source_export_excludes_inputs_and_sec
 def test_reprepare_changed_export_invalidates_saved_notebook_url(tmp_path, change):
     service, project_id, generated = project_service(tmp_path)
     first = service.prepare(project_id, ColabPrepareRequest())
-    url = 'https://colab.research.google.com/drive/saved-notebook'
+    url = 'https://colab.research.google.com/drive/fixture-saved'
     service.observe(project_id, ColabObservationRequest(status='auth', details={'browser_url': url}))
     assert service.status(project_id)['notebook_url'] == url
     request = ColabPrepareRequest()
@@ -98,7 +98,7 @@ def test_reprepare_changed_export_invalidates_saved_notebook_url(tmp_path, chang
 def test_reprepare_identical_source_preserves_hash_and_saved_url(tmp_path):
     service, project_id, _ = project_service(tmp_path)
     first = service.prepare(project_id, ColabPrepareRequest())
-    url = 'https://colab.research.google.com/drive/saved-notebook'
+    url = 'https://colab.research.google.com/drive/fixture-saved'
     service.observe(project_id, ColabObservationRequest(status='auth', details={'browser_url': url}))
     updated = service.prepare(project_id, ColabPrepareRequest())
     assert updated['bundle_sha256'] == first['bundle_sha256']
@@ -109,7 +109,7 @@ def test_reprepare_changed_source_retains_explicit_url_for_worker_validation(tmp
     service, project_id, generated = project_service(tmp_path)
     first = service.prepare(project_id, ColabPrepareRequest())
     (generated / 'train.py').write_text('print("updated runner")\n')
-    url = 'https://colab.research.google.com/drive/explicit-notebook'
+    url = 'https://colab.research.google.com/drive/fixture-explicit'
     updated = service.prepare(project_id, ColabPrepareRequest(notebook_url=url))
     assert updated['bundle_sha256'] != first['bundle_sha256']
     assert updated['notebook_url'] == url
@@ -168,8 +168,8 @@ def test_missing_checkpoint_contract_pauses_export_without_claiming_resume(tmp_p
 def test_service_completion_enforces_prepared_scientific_contract(tmp_path, mode):
     service, project_id, generated = project_service(tmp_path)
     spec = config()
-    spec['success_criteria'] = {'validation':'scientific_metrics','metrics_file':'campaign/metrics.json',
-                                'status_value':mode,'required_metrics':['B0_eer_percent','VQ_min_dcf']}
+    spec['success_criteria'] = {'validation':'scientific_metrics','metrics_file':'fixture/metrics.json',
+                                'status_value':mode,'required_metrics':['fixture_score','fixture_loss']}
     (generated/'experiment_manifest.json').write_text(json.dumps({'colab':spec}))
     service.prepare(project_id, ColabPrepareRequest())
     service.observe(project_id, ColabObservationRequest(status='running', details={'runtime_id':'current'}))
@@ -177,9 +177,9 @@ def test_service_completion_enforces_prepared_scientific_contract(tmp_path, mode
     with pytest.raises(ColabConflict, match='prepared scientific'):
         service.observe(project_id, ColabObservationRequest(status='completed',details=minimal))
     valid = {**minimal, 'completion_kind':mode,'scientific_metrics_produced':mode=='campaign_complete',
-             'metrics_file':'campaign/metrics.json','metrics':{'B0_eer_percent':5.0,'VQ_min_dcf':0.4}}
+             'metrics_file':'fixture/metrics.json','metrics':{'fixture_score':5.0,'fixture_loss':0.4}}
     for key, bad in [('completion_kind','process_exit'), ('scientific_metrics_produced', mode!='campaign_complete'),
-                     ('metrics_file','other.json'), ('metrics',{'B0_eer_percent':5.0,'VQ_min_dcf':float('nan')})]:
+                     ('metrics_file','other.json'), ('metrics',{'fixture_score':5.0,'fixture_loss':float('nan')})]:
         with pytest.raises(ColabConflict):
             service.observe(project_id, ColabObservationRequest(status='completed',details={**valid,key:bad}))
         assert service.status(project_id)['status'] == 'running'
@@ -262,7 +262,7 @@ def test_dead_worker_recovery_preserves_runtime_and_first_reattaches(tmp_path, m
     service.prepare(project_id, ColabPrepareRequest())
     service.enable_autorun(project_id, 'chrome')
     service.attempt(project_id)
-    url = 'https://colab.research.google.com/drive/saved-owned-notebook'
+    url = 'https://colab.research.google.com/drive/fixture-saved'
     active = service.observe(project_id, ColabObservationRequest(status=observed, details={
         'runtime_id': 'known-runtime', 'started_at': clock.isoformat(), 'browser_url': url}))
     assert active['status'] == expected_status  # Child PID handoff has a short grace.
@@ -502,7 +502,7 @@ def test_notebook_binding_persists_public_drive_url_without_changing_observation
     prepared = service.prepare(project_id,ColabPrepareRequest())
     quota = service.observe(project_id,ColabObservationRequest(status='quota'))
     before = service._read(project_id)
-    url = 'https://colab.research.google.com/drive/owned-notebook'
+    url = 'https://colab.research.google.com/drive/fixture-owned'
     result = service.bind_notebook(project_id,ColabNotebookBindingRequest(notebook_url=url,bundle_sha256=prepared['bundle_sha256']))
     assert result['notebook_url'] == result['browser_url'] == url
     for name in ('status','attempt_count','last_observation','next_attempt_at','provider_retry_not_before','lease_until'):
@@ -516,8 +516,8 @@ def test_notebook_binding_persists_public_drive_url_without_changing_observation
 
 
 @pytest.mark.parametrize('url', ['https://colab.research.google.com/notebooks/empty.ipynb',
-    'https://colab.research.google.com/drive/owned#private-connection',
-    'https://colab.research.google.com/drive/owned?token=private',
+    'https://colab.research.google.com/drive/fixture-owned#private-connection',
+    'https://colab.research.google.com/drive/fixture-owned?token=private',
     'https://colab.research.google.com:8443/drive/owned', 'https://drive.google.com/drive/owned'])
 def test_notebook_binding_rejects_unsaved_or_private_connection_url(tmp_path,url):
     service, project_id, _ = project_service(tmp_path)
@@ -533,7 +533,7 @@ def test_notebook_binding_api_updates_metadata_only(tmp_path):
         client.post(f'/api/chatgpt/projects/{project_id}/code',json={
             'files':[{'path':'train.py','content':'print("train")'}],'experiment_manifest':{'colab':config()}})
         prepared = client.post(f'/api/projects/{project_id}/colab/prepare',json={}).json()
-        payload = {'notebook_url':'https://colab.research.google.com/drive/new-owned-copy','bundle_sha256':prepared['bundle_sha256']}
+        payload = {'notebook_url':'https://colab.research.google.com/drive/fixture-copy','bundle_sha256':prepared['bundle_sha256']}
         bound = client.post(f'/api/projects/{project_id}/colab/notebook-binding',json=payload)
         assert bound.status_code == 200 and bound.json()['status']=='queued'
         assert bound.json()['attempt_count']==0 and bound.json()['last_observation'] is None
@@ -766,7 +766,11 @@ async def test_scheduler_skips_unauthorized_and_paused_or_terminal_jobs(tmp_path
 
 def test_launch_api_persists_authorization_without_shortening_cooldown(tmp_path, monkeypatch):
     from autoresearch import colab_browser_cli
+    from autoresearch.services import colab_resource_monitor
     calls = []
+    monitored = []
+    monkeypatch.setattr(colab_resource_monitor, 'launch_resource_monitor',
+                        lambda root, project, **kwargs: monitored.append(project) or 9876)
     monkeypatch.setattr(colab_browser_cli, 'worker_is_running', lambda *args: None)
     monkeypatch.setattr(colab_browser_cli, 'launch_colab_worker', lambda *args, **kwargs: calls.append(args) or 123)
     app = create_app(Settings.load(tmp_path))
@@ -784,6 +788,7 @@ def test_launch_api_persists_authorization_without_shortening_cooldown(tmp_path,
         assert result.json()['next_attempt_at'] == quota['next_attempt_at']
         persisted = client.get(f'/api/projects/{project_id}/colab').json()
         assert persisted['autorun_enabled'] is True and persisted['browser'] == 'chrome'
+        assert monitored == [project_id]
         assert not calls
         client.post(f'/api/projects/{project_id}/colab/cancel', json={})
         assert client.get(f'/api/projects/{project_id}/colab').json()['autorun_enabled'] is False

@@ -195,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser", choices=("auto", "chrome", "edge"), default="auto")
     parser.add_argument("--executable-path", type=Path)
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument("--notebook-bridge", action="store_true", help="Use the optional official notebook bridge for exact cell inspection")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     return parser
 
@@ -205,7 +206,12 @@ async def run(args: argparse.Namespace) -> None:
     if login_browser_is_running(root):
         raise ColabBrowserError("Close the ordinary Google login browser window before starting the Colab worker")
     profile = args.profile_dir or root / "data" / "colab-browser" / "profile"
-    options = ColabBrowserOptions(profile_dir=profile, browser=args.browser, executable_path=args.executable_path)
+    # Routine free-GPU allocation uses Colab's notebook UI and can start
+    # after ordinary Google login. An installed sidecar is not a prerequisite.
+    bridge_enabled = (getattr(args, "notebook_bridge", False)
+                      or os.environ.get("AUTORESEARCH_COLAB_NOTEBOOK_BRIDGE", "").strip() == "1")
+    options = ColabBrowserOptions(profile_dir=profile, browser=args.browser, executable_path=args.executable_path,
+                                  notebook_bridge=bridge_enabled)
     client = ColabJobClient(args.api_url, project_id)
     try:
         job = await client.status()
@@ -253,12 +259,16 @@ def launch_colab_worker(
         return _launch_colab_worker_locked(root, project_id, api_url=api_url, browser=browser)
 
 
+class ColabProfileBusy(ColabBrowserError):
+    """Another browser currently owns the shared Colab profile."""
+
+
 def _launch_colab_worker_locked(root: Path, project_id: str, *, api_url: str, browser: str) -> int:
     existing_pid = worker_is_running(root, project_id)
     if existing_pid is not None:
         return existing_pid
     if login_browser_is_running(root):
-        raise ColabBrowserError("Close the ordinary Google login browser window before starting the Colab worker")
+        raise ColabProfileBusy("The ordinary Google login browser is using the Colab profile")
     log_dir = root / "data" / "colab-browser"
     for metadata in log_dir.glob("*.worker.json"):
         other_id = metadata.name[:-len(".worker.json")]
@@ -267,13 +277,16 @@ def _launch_colab_worker_locked(root: Path, project_id: str, *, api_url: str, br
         except ValueError:
             continue
         if running is not None:
-            raise ColabBrowserError("A Colab worker already uses this browser profile; finish or cancel that job first")
+            raise ColabProfileBusy("Another Colab job is using the shared browser profile")
     profile = log_dir / "profile"
     # A child may own the profile just before it can publish its real PID.
     # Testing that lock under the launcher lock avoids spawning a loser that
     # could overwrite the live child's metadata.
-    with WorkerLock(profile.with_name(f"{profile.name}.lock")):
-        pass
+    try:
+        with WorkerLock(profile.with_name(f"{profile.name}.lock")):
+            pass
+    except ColabBrowserError as exc:
+        raise ColabProfileBusy("The prior Colab browser is still releasing the shared profile") from exc
     command = [
         sys.executable, "-u", "-m", "autoresearch.colab_browser_cli",
         "--project", project_id, "--root", str(root), "--api-url", api_url,

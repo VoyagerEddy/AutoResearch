@@ -183,6 +183,164 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
             raise
     """)
     code("""
+        # AUTORESEARCH_PREFLIGHT_GATE: no bulk data request precedes this cell.
+        import importlib, signal, tempfile
+        RUNTIME_PREFLIGHT = dict(schema_version=1, project_id=PROJECT_ID, runtime_id=RUNTIME_ID,
+                                 phase='preflight', status='checking',
+                                 scientific_metrics_produced=False)
+
+        def preflight_disk(path):
+            try:
+                usage = shutil.disk_usage(path)
+            except OSError as exc:
+                return dict(filesystem_available_bytes=None, filesystem_space_status='unknown',
+                            filesystem_error_type=type(exc).__name__, cloud_quota_status='unknown')
+            return dict(filesystem_total_bytes=usage.total,
+                        filesystem_used_bytes=usage.used,
+                        filesystem_available_bytes=usage.free,
+                        filesystem_space_status='measured', cloud_quota_status='unknown')
+
+        def run_preflight_command(command, timeout_seconds, log_path, environment):
+            # Use the same shell and durable log transport as project execution.
+            # stdout goes directly to the log so a silent child cannot bypass
+            # the wall-clock timeout by blocking a pipe reader.
+            with open(log_path, 'a', encoding='utf-8', buffering=1) as log:
+                process = subprocess.Popen(command, shell=True, executable='/bin/bash',
+                    stdout=log, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                    env=environment, start_new_session=True)
+                try:
+                    returncode = process.wait(timeout=timeout_seconds)
+                except BaseException:
+                    if process.poll() is None:
+                        if os.name == 'posix':
+                            try:
+                                os.killpg(process.pid, signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+                        else:
+                            process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            if os.name == 'posix':
+                                try:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                            else:
+                                process.kill()
+                            process.wait(timeout=5)
+                    raise
+            with open(log_path, 'rb') as saved:
+                saved.seek(0, os.SEEK_END)
+                saved.seek(max(0, saved.tell() - 8192))
+                tail = saved.read().decode('utf-8', errors='replace')
+            if tail:
+                print(tail, end='' if tail.endswith('\\n') else '\\n', flush=True)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, command, output=tail)
+            return tail
+
+        preflight_log = DRIVE_PROJECT / 'results' / ('preflight_' + RUNTIME_ID + '.log')
+        try:
+            drive_evidence = preflight_disk(DRIVE_PROJECT)
+            probe = DRIVE_PROJECT / ('.preflight_' + RUNTIME_ID + '.tmp')
+            probe_created = False
+            try:
+                with open(probe, 'xb') as handle:
+                    probe_created = True
+                    handle.write(RUNTIME_ID.encode('utf-8'))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if probe.read_bytes() != RUNTIME_ID.encode('utf-8'):
+                    raise RuntimeError('Drive preflight write/read verification failed')
+                drive_evidence['write_verified'] = True
+            finally:
+                if probe_created:
+                    probe.unlink(missing_ok=True)
+            RUNTIME_PREFLIGHT['drive'] = drive_evidence
+            transfer = config.get('full_data_transfer')
+            scratch = pathlib.Path('/content/autoresearch-full-data') if transfer else SOURCE.parent
+            if scratch.is_symlink():
+                raise RuntimeError('Preflight scratch directory must not be linked')
+            scratch.mkdir(parents=True, exist_ok=True)
+            RUNTIME_PREFLIGHT['scratch'] = preflight_disk(scratch)
+            if transfer:
+                budget = estimate_ephemeral_disk_budget(scratch, transfer)
+                RUNTIME_PREFLIGHT['scratch']['corpus_budget'] = budget
+                if not budget['enough']:
+                    raise RuntimeError('Insufficient Colab ephemeral disk space for the declared full corpus; stop before bulk upload.')
+            requirements = config.get('runtime_requirements') or {}
+            framework = requirements.get('framework')
+            RUNTIME_PREFLIGHT['framework'] = dict(status='not_requested')
+            if framework is None and (requirements.get('require_cuda') or requirements.get('match_torchaudio')):
+                raise ValueError('Runtime framework must be declared for explicit CUDA or TorchAudio requirements')
+            if framework is not None:
+                if framework != 'pytorch':
+                    raise ValueError('Unsupported explicit runtime framework requirement')
+                torch = importlib.import_module('torch')
+                framework_evidence = dict(name='pytorch', torch_version=str(torch.__version__),
+                                          cuda_available=bool(torch.cuda.is_available()))
+                RUNTIME_PREFLIGHT['framework'] = framework_evidence
+                if requirements.get('match_torchaudio'):
+                    torchaudio = importlib.import_module('torchaudio')
+                    framework_evidence['torchaudio_version'] = str(torchaudio.__version__)
+                    if str(torch.__version__).split('+')[0] != str(torchaudio.__version__).split('+')[0]:
+                        raise RuntimeError('Torch and TorchAudio versions must match before bulk upload')
+                if requirements.get('require_cuda') and not framework_evidence['cuda_available']:
+                    raise RuntimeError('No actual CUDA GPU has been allocated for the declared PyTorch project')
+                if framework_evidence['cuda_available']:
+                    framework_evidence.update(cuda_name=torch.cuda.get_device_name(0),
+                        cuda_total_memory_bytes=int(torch.cuda.get_device_properties(0).total_memory))
+                framework_evidence['status'] = 'passed'
+            preflight_command = config.get('preflight_command') or ''
+            if preflight_command:
+                timeout_seconds = config.get('preflight_timeout_seconds', 900)
+                if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 3600:
+                    raise ValueError('Preflight timeout must be an integer between 1 and 3600 seconds')
+                deadline_text = os.environ.get('AUTORESEARCH_SESSION_DEADLINE_UTC')
+                if deadline_text:
+                    deadline = datetime.datetime.fromisoformat(deadline_text.replace('Z', '+00:00'))
+                    remaining = (deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 180
+                    if remaining <= 0:
+                        raise RuntimeError('Session budget is exhausted before project preflight')
+                    timeout_seconds = min(timeout_seconds, remaining)
+                # Project preflight may inspect inputs and populate pinned model
+                # inputs, but its checkpoints/results have a separate namespace.
+                # They can never satisfy the formal experiment's resume/metrics.
+                probe_root = pathlib.Path(tempfile.mkdtemp(prefix='preflight_', dir=SOURCE))
+                environment = os.environ.copy()
+                environment.update(AUTORESEARCH_PREFLIGHT='1',
+                    AUTORESEARCH_CHECKPOINT_DIR=str(probe_root / 'checkpoints'),
+                    AUTORESEARCH_RESULTS_DIR=str(probe_root / 'results'))
+                RUNTIME_PREFLIGHT['project_command'] = dict(status='running',
+                    timeout_seconds=timeout_seconds, log_path=str(preflight_log))
+                report('starting', phase='preflight', preflight=RUNTIME_PREFLIGHT)
+                output_tail = run_preflight_command(preflight_command, timeout_seconds, preflight_log, environment)
+                RUNTIME_PREFLIGHT['project_command'].update(status='passed', returncode=0,
+                    output_tail=output_tail)
+            else:
+                RUNTIME_PREFLIGHT['project_command'] = dict(status='not_configured')
+            RUNTIME_PREFLIGHT['status'] = 'passed'
+            preflight_path = DRIVE_PROJECT / 'results' / ('preflight_' + RUNTIME_ID + '.json')
+            preflight_path.write_text(json.dumps(RUNTIME_PREFLIGHT, ensure_ascii=False, indent=2), encoding='utf-8')
+            report('starting', phase='preflight', preflight=RUNTIME_PREFLIGHT,
+                   preflight_path=str(preflight_path))
+        except BaseException as exc:
+            RUNTIME_PREFLIGHT.update(status='failed', error_type=type(exc).__name__, reason=str(exc))
+            if RUNTIME_PREFLIGHT.get('project_command', {}).get('status') == 'running':
+                RUNTIME_PREFLIGHT['project_command'].update(status='failed',
+                    returncode=getattr(exc, 'returncode', None), timed_out=isinstance(exc, subprocess.TimeoutExpired))
+                if preflight_log.is_file():
+                    with open(preflight_log, 'rb') as saved:
+                        saved.seek(0, os.SEEK_END)
+                        saved.seek(max(0, saved.tell() - 8192))
+                        RUNTIME_PREFLIGHT['project_command']['output_tail'] = saved.read().decode('utf-8', errors='replace')
+            report('failed', reason='Runtime preflight failed before bulk upload: ' + str(exc),
+                   preflight=RUNTIME_PREFLIGHT, log_path=str(preflight_log))
+            raise
+    """)
+    code("""
         transfer = config.get('full_data_transfer')
         if transfer:
             import gc
@@ -201,6 +359,9 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                 reason = 'Insufficient Colab ephemeral disk space for the declared full corpus; stop before bulk upload.'
                 report('failed', reason=reason, disk_budget=disk_budget)
                 raise RuntimeError(reason)
+            if (globals().get('RUNTIME_PREFLIGHT', {}).get('status') != 'passed'
+                    or RUNTIME_PREFLIGHT.get('runtime_id') != RUNTIME_ID):
+                raise RuntimeError('A successful current-runtime preflight is required before bulk upload')
             for item in transfer['files']:
                 relative = relative_data_path(item['path'])
                 if item['kind'] == 'metadata':
@@ -280,13 +441,17 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
     code("""
         checkpoint_dir = DRIVE_PROJECT / 'checkpoints'
         results_dir = DRIVE_PROJECT / 'results'
+        preflight_evidence = globals().get('RUNTIME_PREFLIGHT', dict(status='not_run'))
+        if (config.get('preflight_command') or config.get('runtime_requirements') or config.get('full_data_transfer')):
+            if preflight_evidence.get('status') != 'passed' or preflight_evidence.get('runtime_id') != RUNTIME_ID:
+                raise RuntimeError('A successful current-runtime preflight is required before experiment execution')
         # Checkpoint implementation belongs to the project. No generic model
         # state is invented here; export requires an explicit full-resume contract.
         found_checkpoint = any(any(checkpoint_dir.rglob(name)) for name in config['checkpoint']['files'])
         command = config['checkpoint']['resume_command'] if found_checkpoint else config['run_command']
         prepare_command = config.get('prepare_command', '')
         report('running', checkpoint_dir=str(checkpoint_dir), results_dir=str(results_dir),
-               resumed=found_checkpoint)
+               resumed=found_checkpoint, preflight=preflight_evidence)
         log_path = results_dir / ('session_' + RUNTIME_ID + '.log')
         try:
             with open(log_path, 'a', encoding='utf-8', buffering=1) as log:
@@ -303,12 +468,13 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                         raise subprocess.CalledProcessError(returncode, step)
             validated = validate_scientific_result(results_dir, config.get('success_criteria'))
             report('completed', returncode=0, checkpoint_dir=str(checkpoint_dir),
-                   results_dir=str(results_dir), log_path=str(log_path), **validated)
+                   results_dir=str(results_dir), log_path=str(log_path), preflight=preflight_evidence, **validated)
         except BaseException as exc:
             exitcode = getattr(exc, 'returncode', None)
             resumable = exitcode is not None and exitcode == config['checkpoint'].get('session_exit_code')
             report('disconnected' if resumable else 'failed', returncode=exitcode,
-                   reason=str(exc), checkpoint_dir=str(checkpoint_dir), log_path=str(log_path))
+                   reason=str(exc), checkpoint_dir=str(checkpoint_dir), log_path=str(log_path),
+                   preflight=preflight_evidence)
             raise
     """)
     return {"nbformat": 4, "nbformat_minor": 5, "metadata": {

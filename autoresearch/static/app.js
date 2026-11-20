@@ -1,4 +1,9 @@
-const state = { projects: [], current: null, settings: null, connection: null, autodl: null, instanceCreating: false, creationUncertain: false, poller: null, connectionPoller: null, experimentId: null, colab: null, colabBusy: false, colabCheckedProjectId: null, colabResourceAgent: null, colabResourceAgentUnavailable: false };
+const state = {
+  projects: [], current: null, selectedId: null, colabFirst: false,
+  connection: null, colab: null, colabResourceAgent: null,
+  colabResourceAgentUnavailable: false, experimentResults: null,
+  refreshing: false, lastConfigurationCheck: 0,
+};
 const phaseLabels = {
   queued: "Queued", planning: "Planning", searching: "Source Search", synthesizing: "Method Design",
   generating: "Code Generation", ready: "Code Saved", experiment: "Remote Experiment", analyzing: "Result Analysis",
@@ -7,162 +12,120 @@ const phaseLabels = {
 };
 
 const $ = (id) => document.getElementById(id);
+const projectPath = (id) => `/api/projects/${encodeURIComponent(id)}`;
 
-async function api(path, options = {}) {
+async function api(path) {
   const controller = new AbortController();
-  const { timeoutMs = 12000, ...requestOptions } = options;
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), 12000);
   try {
-    const response = await fetch(path, {
-      ...requestOptions,
-      signal: requestOptions.signal || controller.signal,
-      headers: { "Content-Type": "application/json", ...(requestOptions.headers || {}) }
-    });
-    let data = null;
-    try { data = await response.json(); } catch (_) { data = {}; }
+    const response = await fetch(path, { signal: controller.signal, cache: "no-store" });
+    const data = await response.json();
     if (!response.ok) {
-      const detail = data.detail;
+      const detail = data?.detail;
       const error = new Error(typeof detail === "string" ? detail : (detail?.message || `Request failed (${response.status})`));
-      error.code = detail?.code;
       error.status = response.status;
       throw error;
     }
     return data;
   } catch (error) {
-    if (error.name === "AbortError" || error instanceof TypeError) {
-      const connectionError = new Error(error.name === "AbortError" ? "The local service timed out. Make sure the startup window is still running." : "Could not connect to the local service. Run start.cmd again.");
-      connectionError.code = "connection_uncertain";
-      throw connectionError;
-    }
+    if (error.name === "AbortError") throw new Error("The local service timed out");
     throw error;
-  } finally { clearTimeout(timeout); }
-}
-
-function toast(message, error = false) {
-  const node = $("toast");
-  node.textContent = message;
-  node.className = `toast show${error ? " error" : ""}`;
-  clearTimeout(node._timer);
-  node._timer = setTimeout(() => node.className = "toast", 3500);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function formatTime(value) {
-  try { return new Date(value).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
-  catch (_) { return ""; }
+  const time = Date.parse(value || "");
+  return Number.isFinite(time)
+    ? new Date(time).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "";
+}
+
+function showEmpty(title, message) {
+  $("emptyTitle").textContent = title;
+  $("emptyMessage").textContent = message;
+  $("emptyView").classList.remove("hidden");
+  $("projectView").classList.add("hidden");
 }
 
 async function bootstrap() {
+  const query = new URLSearchParams(location.search);
+  state.selectedId = query.get("project");
+  state.colabFirst = query.get("compute") === "colab";
+  if (!state.colabFirst) $("computePanels").prepend($("autodlPanel"));
+  await refreshDashboard();
+  setInterval(refreshDashboard, 5000);
+}
+
+async function refreshDashboard() {
+  if (state.refreshing) return;
+  state.refreshing = true;
   try {
-    const health = await api("/api/health");
-    $("healthDot").classList.add("ok");
-    $("healthText").textContent = "Local service and ChatGPT tools are ready";
-    $("mcpEndpoint").textContent = health.mcp_endpoint;
-    [state.settings, state.connection] = await Promise.all([
-      api("/api/settings"), api("/api/chatgpt/connection")
-    ]);
-    applySettings();
-    renderConnection();
-    await refreshAutoDL();
-    clearInterval(state.connectionPoller);
-    state.connectionPoller = setInterval(refreshConnection, 5000);
+    const refreshConfiguration = !state.lastConfigurationCheck || Date.now() - state.lastConfigurationCheck >= 30000;
+    const connection = refreshConnection();
+    const configuration = refreshConfiguration ? loadConfiguration() : null;
     await loadProjects();
-    const requested = new URLSearchParams(location.search).get("project");
-    const requestedCompute = new URLSearchParams(location.search).get("compute");
-    if (requestedCompute === "colab") {
-      $("computeProvider").value = "colab";
-      updateComputeProvider();
+    if (!state.selectedId) {
+      showEmpty("No research projects yet", "Projects created through the AutoResearch plugin in ChatGPT will appear here.");
+    } else {
+      await refreshProject(state.selectedId, refreshConfiguration);
     }
-    if (requested && state.projects.some((project) => project.id === requested)) await selectProject(requested);
+    await Promise.all([connection, configuration]);
   } catch (error) {
-    $("healthText").textContent = "Local service unavailable";
-    toast(error.message, true);
+    if (!state.current) showEmpty("Project status unavailable", error.message);
+  } finally {
+    state.refreshing = false;
   }
+}
+
+async function refreshConnection() {
+  const [health, connection] = await Promise.allSettled([
+    api("/api/health"), api("/api/chatgpt/connection")
+  ]);
+  const ready = health.status === "fulfilled" && health.value.ok === true;
+  $("healthDot").classList.toggle("ok", ready);
+  $("healthText").textContent = ready ? "Local service ready" : "Local service unavailable";
+  $("localMcpStatus").textContent = ready ? "Local MCP ready" : "Local MCP unavailable";
+  state.connection = connection.status === "fulfilled" ? connection.value : null;
+  renderConnection();
 }
 
 function renderConnection() {
   const c = state.connection || {};
-  const setStep = (id, ready, readyText, waitingText) => {
-    const node = $(id); if (!node) return;
-    node.classList.toggle("ready", Boolean(ready));
-    node.textContent = `${ready ? "✓" : "○"} ${ready ? readyText : waitingText}`;
-  };
-  setStep("tunnelInstallStatus", c.tunnel_client_installed, "tunnel-client installed", "tunnel-client not installed");
-  setStep("tunnelConfigStatus", c.tunnel_configured, `Tunnel configured ${c.tunnel_id_hint || ""}`, "Tunnel not configured");
-  setStep("tunnelRunStatus", c.tunnel_ready, "Tunnel ready", c.tunnel_process_running ? "Tunnel process running; connection not ready" : "Tunnel not running");
-  $("startChatgpt").disabled = !c.tunnel_configured;
-  $("settingsStartChatgpt").disabled = !c.tunnel_configured;
-  $("setupChatgpt").textContent = c.tunnel_configured ? "Reconfigure Connection" : "Set Up Connection";
-  $("settingsTunnelStatus").textContent = c.tunnel_ready
-    ? "Tunnel connected and available in ChatGPT"
-    : (c.tunnel_process_running ? "Process started; waiting for the Tunnel connection" : (c.tunnel_configured ? "Configuration saved; Tunnel is not running" : "Initial setup is incomplete"));
+  $("tunnelInstallStatus").textContent = c.tunnel_client_installed ? "tunnel-client installed" : "tunnel-client status unavailable";
+  $("tunnelConfigStatus").textContent = c.tunnel_configured ? "Tunnel configured" : "Tunnel configuration unavailable";
+  let status = "ChatGPT connection unavailable";
+  if (c.tunnel_ready) status = "ChatGPT tunnel ready";
+  else if (c.tunnel_process_running) status = "ChatGPT tunnel starting · connection not ready";
+  else if (c.tunnel_configured) status = "ChatGPT tunnel stopped";
+  else if (state.connection) status = "ChatGPT tunnel setup incomplete";
+  $("tunnelRunStatus").textContent = status;
+  $("tunnelRunStatus").classList.toggle("ready", Boolean(c.tunnel_ready));
 }
 
-async function refreshAutoDL(verifyApi = false) {
-  const button = $("checkAutoDL");
-  button.disabled = true;
-  try {
-    state.autodl = await api(`/api/autodl/preflight?verify_api=${verifyApi}`, { timeoutMs: 45000 });
-    const result = state.autodl;
-    const headline = result.ready
-      ? (result.verified ? "AutoDL API connected; balance and GPU inventory are not yet verified." : "Required AutoDL settings are saved; API, balance, and GPU inventory are not yet verified.")
-      : `Cannot create an instance yet: ${result.blocking_issues.map((issue) => issue.message).join("; ")}`;
-    const messages = [headline, ...result.warnings.map((warning) => warning.message)].join("\n");
-    for (const id of ["autodlReadiness", "settingsAutoDLStatus"]) {
-      $(id).textContent = messages;
-      $(id).className = `form-status${result.ready ? "" : " error"}`;
-    }
-    $("createInstance").disabled = !result.ready || state.instanceCreating || state.creationUncertain;
-    return result;
-  } catch (error) {
-    state.autodl = null;
-    $("createInstance").disabled = true;
-    for (const id of ["autodlReadiness", "settingsAutoDLStatus"]) {
-      $(id).textContent = `Could not check AutoDL: ${error.message}`;
-      $(id).className = "form-status error";
-    }
-    return null;
-  } finally { button.disabled = false; }
-}
-
-async function refreshConnection() {
-  try { state.connection = await api("/api/chatgpt/connection"); renderConnection(); }
-  catch (_) {}
-}
-
-async function launchChatgptConnection(action) {
-  try {
-    await api("/api/chatgpt/connection/launch", {
-      method: "POST", body: JSON.stringify({ action, confirm_launch: true })
-    });
-    toast(action === "Setup" ? "Connection setup wizard opened" : "ChatGPT connection window opened");
-    setTimeout(refreshConnection, 1500);
-  } catch (error) { toast(error.message, true); }
-}
-
-function applySettings() {
-  const s = state.settings || {};
-  $("gpuOrder").textContent = (s.autodl_gpu_specs || ["v-48g", "5090-p"]).join(" → ");
-  $("monitorPolicy").textContent = `Every ${s.monitor_seconds || 30}s · Up to ${s.max_iterations || 3} rounds`;
-  $("settingModel").value = s.openrouter_model || "openrouter/free";
-  $("settingImageUuid").value = s.autodl_image_uuid || "";
-  $("settingGpuSpecs").value = (s.autodl_gpu_specs || []).join(",");
-  $("settingRemote").value = s.github_remote_url || "";
-  updateWorkflowMode();
-}
-
-function updateWorkflowMode() {
-  const collaborative = $("workflowMode").value === "chatgpt";
-  $("researchForm").classList.toggle("collaborative", collaborative);
-  document.querySelectorAll(".autonomous-option").forEach((node) => node.classList.toggle("hidden", collaborative));
-  $("modelHint").textContent = collaborative
-    ? "ChatGPT handles reasoning; AutoResearch waits for tool calls"
-    : (state.settings?.openrouter_configured ? `OpenRouter · ${state.settings.openrouter_model}` : "An offline baseline will be generated without an API key");
-  $("startResearch").innerHTML = collaborative ? "Create Collaborative Project <b>→</b>" : "Start Autonomous Research <b>→</b>";
+async function loadConfiguration() {
+  state.lastConfigurationCheck = Date.now();
+  const [settings, readiness] = await Promise.allSettled([
+    api("/api/settings"), api("/api/autodl/preflight?verify_api=false")
+  ]);
+  const s = settings.status === "fulfilled" ? settings.value : null;
+  $("gpuOrder").textContent = s?.autodl_gpu_specs?.join(" → ") || "—";
+  $("monitorPolicy").textContent = s ? `Every ${s.monitor_seconds}s · Up to ${s.max_iterations} rounds` : "—";
+  const report = readiness.status === "fulfilled" ? readiness.value : null;
+  const messages = report?.ready
+    ? ["AutoDL configuration available", ...(report.warnings || []).map((warning) => warning.message)]
+    : (report?.blocking_issues || []).map((issue) => issue.message);
+  $("autodlReadiness").textContent = messages.join("\n") || "AutoDL readiness unavailable";
+  $("autodlReadiness").className = `status-message${report?.ready ? "" : " error"}`;
 }
 
 async function loadProjects() {
-  state.projects = await api("/api/projects");
-  renderProjectList();
+  const projects = await api("/api/projects");
+  if (!state.selectedId && projects.length) state.selectedId = projects[0].id;
+  const changed = JSON.stringify(projects) !== JSON.stringify(state.projects);
+  state.projects = projects;
+  if (changed) renderProjectList();
 }
 
 function renderProjectList() {
@@ -170,9 +133,13 @@ function renderProjectList() {
   list.replaceChildren();
   for (const project of state.projects) {
     const button = document.createElement("button");
-    button.className = `project-item${state.current?.id === project.id ? " active" : ""}`;
-    const title = document.createElement("strong"); title.textContent = project.topic;
-    const meta = document.createElement("span"); meta.textContent = `${phaseLabels[project.phase] || project.phase} · ${project.progress}%`;
+    button.type = "button";
+    button.className = `project-item${state.selectedId === project.id ? " active" : ""}`;
+    if (state.selectedId === project.id) button.setAttribute("aria-current", "true");
+    const title = document.createElement("strong");
+    title.textContent = project.topic;
+    const meta = document.createElement("span");
+    meta.textContent = `${phaseLabels[project.phase] || project.phase} · ${project.progress}%`;
     button.append(title, meta);
     button.onclick = () => selectProject(project.id);
     list.append(button);
@@ -180,36 +147,57 @@ function renderProjectList() {
 }
 
 async function selectProject(id) {
-  if (state.current?.id !== id) state.colabCheckedProjectId = null;
-  state.current = await api(`/api/projects/${id}`);
-  state.experimentId = null;
-  state.colab = null;
-  state.colabResourceAgent = null;
-  state.colabResourceAgentUnavailable = false;
-  $("createView").classList.add("hidden");
-  $("projectView").classList.remove("hidden");
-  $("pageTitle").textContent = "Research Workspace";
-  $("openCode").disabled = false;
-  $("syncGit").disabled = state.current.status !== "ready";
-  history.replaceState(null, "", `?project=${encodeURIComponent(id)}&compute=${$("computeProvider").value === "colab" ? "colab" : "autodl"}`);
-  renderProject();
+  if (id === state.selectedId) return;
+  state.selectedId = id;
   renderProjectList();
-  await Promise.all([loadEvents(), loadSources(), loadManifest(), loadExperiments(), loadExperimentReadiness(), loadColab()]);
-  if (state.current?.id === id) await ensureSelectedColabCheck();
-  beginPolling();
+  showEmpty("Loading project", "Reading the selected project's status.");
+  const query = new URLSearchParams({ project: id });
+  if (state.colabFirst) query.set("compute", "colab");
+  history.replaceState(null, "", `?${query}`);
+  try {
+    await refreshProject(id);
+  } catch (error) {
+    if (state.selectedId === id) showEmpty("Project status unavailable", error.message);
+  }
+}
+
+async function refreshProject(id, refreshReadiness = false) {
+  const project = state.projects.find((item) => item.id === id) || await api(projectPath(id));
+  if (state.selectedId !== id) return;
+  const changingProject = state.current?.id !== id;
+  state.current = project;
+  if (changingProject) {
+    state.colab = null;
+    state.colabResourceAgent = null;
+    state.colabResourceAgentUnavailable = false;
+    state.experimentResults = null;
+    $("eventList").replaceChildren();
+    $("sourceList").replaceChildren();
+    $("sourceCount").textContent = "0";
+    $("experimentResults").replaceChildren();
+    $("experimentStatus").textContent = "Checking experiment status";
+    $("experimentReadiness").className = "status-message";
+    $("experimentReadiness").textContent = "Checking experiment requirements…";
+    renderColab();
+  }
+  renderProject();
+  $("emptyView").classList.add("hidden");
+  $("projectView").classList.remove("hidden");
+  await Promise.allSettled([
+    loadEvents(), loadSources(), loadExperiments(), loadColab(),
+    changingProject || refreshReadiness ? loadExperimentReadiness() : null
+  ]);
 }
 
 function renderProject() {
   const p = state.current;
-  if (!p) return;
   $("projectTopic").textContent = p.topic;
   $("projectId").textContent = p.id;
-  $("projectSummary").textContent = p.error || p.summary || "The research agent is working and continuously saving artifacts to the local workspace.";
+  $("projectSummary").textContent = p.error || p.summary || "";
   $("statusBadge").textContent = phaseLabels[p.phase] || p.phase;
   $("statusBadge").className = `status-badge${p.status === "failed" ? " failed" : ""}`;
   $("progressText").textContent = `${p.progress}%`;
   $("progressRing").style.setProperty("--progress", `${p.progress * 3.6}deg`);
-  $("syncGit").disabled = p.status !== "ready";
   const stageByPhase = {
     queued: 0, planning: 0, chatgpt_thinking: 0, searching: 1, synthesizing: 2,
     generating: 3, ready: 4, experiment: 4, analyzing: 4, completed: 4,
@@ -223,10 +211,15 @@ function renderProject() {
 }
 
 async function loadEvents() {
-  if (!state.current) return;
-  const events = await api(`/api/projects/${state.current.id}/events`);
-  const list = $("eventList"); list.replaceChildren();
-  if (!events.length) { list.innerHTML = '<div class="empty">Waiting for the agent to start…</div>'; return; }
+  const projectId = state.current.id;
+  const events = await api(`${projectPath(projectId)}/events`);
+  if (state.current?.id !== projectId) return;
+  const list = $("eventList");
+  list.replaceChildren();
+  if (!events.length) {
+    list.innerHTML = '<div class="empty">No research activity recorded</div>';
+    return;
+  }
   for (const event of events.slice().reverse()) {
     const row = document.createElement("div"); row.className = `event ${event.level}`;
     const dot = document.createElement("i");
@@ -238,11 +231,16 @@ async function loadEvents() {
 }
 
 async function loadSources() {
-  if (!state.current) return;
-  const sources = await api(`/api/projects/${state.current.id}/sources`);
+  const projectId = state.current.id;
+  const sources = await api(`${projectPath(projectId)}/sources`);
+  if (state.current?.id !== projectId) return;
   $("sourceCount").textContent = sources.length;
-  const list = $("sourceList"); list.replaceChildren();
-  if (!sources.length) { list.innerHTML = '<div class="empty">Retrieved sources will appear here</div>'; return; }
+  const list = $("sourceList");
+  list.replaceChildren();
+  if (!sources.length) {
+    list.innerHTML = '<div class="empty">No sources retrieved</div>';
+    return;
+  }
   for (const source of sources) {
     const a = document.createElement("a"); a.className = "source";
     if (/^https:\/\//.test(source.url)) { a.href = source.url; a.target = "_blank"; a.rel = "noreferrer"; }
@@ -254,51 +252,44 @@ async function loadSources() {
   }
 }
 
-async function loadManifest() {
-  if (!state.current) return;
-  const manifest = await api(`/api/projects/${state.current.id}/manifest`);
-  $("remoteCommand").value = manifest.run_command || "";
-}
-
 async function loadExperimentReadiness() {
-  if (!state.current) return;
   const projectId = state.current.id;
-  $("checkExperimentReadiness").disabled = true;
   try {
-    const report = await api(`/api/projects/${projectId}/readiness`);
+    const report = await api(`${projectPath(projectId)}/readiness`);
     if (state.current?.id !== projectId) return;
-    const details = report.blocking_issues.map((item) => `${item.path || item.code}: ${item.message}`);
+    const details = report.blocking_issues.map((item) => `${item.path || item.code} · ${item.message}`);
     $("experimentReadiness").textContent = report.ready
-      ? "The experiment package passed static checks. Dependencies, GPU behavior, data content, and scientific results still require execution."
-      : `Experiment readiness blocked by ${details.length} item(s):\n${details.join("\n")}`;
-    $("experimentReadiness").className = `form-status${report.ready ? "" : " error"}`;
+      ? "Experiment files passed static checks"
+      : ["Experiment readiness blocked", ...details].join("\n");
+    $("experimentReadiness").className = `status-message${report.ready ? "" : " error"}`;
   } catch (error) {
-    if (state.current?.id === projectId) {
-      $("experimentReadiness").textContent = `Experiment check unavailable: ${error.message}`;
-      $("experimentReadiness").className = "form-status error";
-    }
-  } finally { $("checkExperimentReadiness").disabled = false; }
+    if (state.current?.id !== projectId) return;
+    $("experimentReadiness").textContent = `Experiment readiness unavailable · ${error.message}`;
+    $("experimentReadiness").className = "status-message error";
+  }
 }
-
-$("checkExperimentReadiness").onclick = loadExperimentReadiness;
 
 async function loadExperiments() {
-  if (!state.current) return;
-  const experiments = await api(`/api/projects/${state.current.id}/experiments`);
-  const list = $("experimentResults"); list.replaceChildren();
+  const projectId = state.current.id;
+  const experiments = await api(`${projectPath(projectId)}/experiments`);
+  if (state.current?.id !== projectId) return;
+  const serialized = JSON.stringify(experiments);
+  if (state.experimentResults === serialized) return;
+  state.experimentResults = serialized;
+  const list = $("experimentResults");
+  const openLogs = new Set(Array.from(list.querySelectorAll("details[open]"), (log) => log.parentElement.dataset.experimentId));
+  list.replaceChildren();
   if (!experiments.length) {
-    state.experimentId = null;
-    list.innerHTML = '<div class="empty compact">Experiment status, metrics, and logs will appear here</div>';
+    list.innerHTML = '<div class="empty compact">No experiments recorded</div>';
     $("experimentStatus").textContent = "Not started";
     return;
   }
-  const active = experiments.find((item) => !["completed", "failed"].includes(item.status));
-  state.experimentId = active ? active.id : null;
   const newest = experiments[0];
   const statusLabels = { preparing: "Preparing", uploading: "Uploading", running: "Running", analyzing: "Awaiting analysis", completed: "Completed", failed: "Failed" };
-  $("experimentStatus").textContent = `${statusLabels[newest.status] || newest.status} · ${newest.id}`;
+  $("experimentStatus").textContent = statusLabels[newest.status] || newest.status;
   for (const experiment of experiments) {
     const card = document.createElement("article"); card.className = `experiment-result ${experiment.status}`;
+    card.dataset.experimentId = experiment.id;
     const head = document.createElement("div"); head.className = "result-head";
     const title = document.createElement("strong"); title.textContent = `Experiment ${experiment.id}`;
     const badge = document.createElement("span"); badge.textContent = statusLabels[experiment.status] || experiment.status;
@@ -310,44 +301,18 @@ async function loadExperiments() {
       const metrics = document.createElement("pre"); metrics.textContent = JSON.stringify(result.metrics, null, 2);
       card.append(metrics);
     }
-    if (experiment.error) { const error = document.createElement("p"); error.className = "result-error"; error.textContent = experiment.error; card.append(error); }
+    if (experiment.error) {
+      const error = document.createElement("p"); error.className = "result-error"; error.textContent = experiment.error;
+      card.append(error);
+    }
     if (result.log_tail) {
       const details = document.createElement("details");
+      details.open = openLogs.has(experiment.id);
       const summary = document.createElement("summary"); summary.textContent = "View log tail";
       const log = document.createElement("pre"); log.textContent = String(result.log_tail).slice(-5000);
       details.append(summary, log); card.append(details);
     }
-    if (["completed", "failed"].includes(experiment.status)) {
-      const analyze = document.createElement("button"); analyze.type = "button"; analyze.className = "ghost analyze-result";
-      analyze.textContent = "Copy ChatGPT Analysis Request";
-      analyze.onclick = () => copyText(`Call AutoResearch get_experiment_result, analyze experiment ${experiment.id}, then use record_chatgpt_analysis to save the conclusions to project ${experiment.project_id}.`, "Analysis request copied");
-      card.append(analyze);
-    }
     list.append(card);
-  }
-}
-
-function beginPolling() {
-  clearInterval(state.poller);
-  state.poller = setInterval(async () => {
-    if (!state.current) return;
-    try {
-      state.current = await api(`/api/projects/${state.current.id}`);
-      renderProject();
-      await Promise.all([loadEvents(), loadSources(), loadExperiments(), loadColab()]);
-      await loadProjects();
-      if (state.experimentId) await refreshExperiment();
-    } catch (_) {}
-  }, 2500);
-}
-
-function updateComputeProvider() {
-  const isColab = $("computeProvider").value === "colab";
-  $("autodlPanel").classList.toggle("hidden", isColab);
-  $("colabPanel").classList.toggle("hidden", !isColab);
-  $("toggleExperiment").classList.toggle("hidden", isColab);
-  if (state.current) {
-    history.replaceState(null, "", `?project=${encodeURIComponent(state.current.id)}&compute=${isColab ? "colab" : "autodl"}`);
   }
 }
 
@@ -358,43 +323,49 @@ function renderColab() {
     checking: "Requesting GPU / 正在申请", waiting: "Waiting to retry / 等待重试", retry_wait: "Waiting to retry / 等待重试",
     attempting: "Requesting GPU / 正在申请", waiting_for_gpu: "Waiting for GPU retry / 等待 GPU 重试",
     waiting_for_connection: "Connection unavailable / 等待恢复连接", gpu_available: "GPU allocated / 已分配 GPU",
-    available: "GPU allocated / 已分配 GPU", running: "Training / 训练中", completed: "Completed / 已完成",
-    auth: "Login or authorization needed / 等待登录或授权", awaiting_auth: "Login or authorization needed / 等待登录或授权",
-    auth_required: "Needs login or page action / 等待登录或页面操作", disconnected: "Session disconnected / 会话已断开",
+    available: "GPU allocated / 已分配 GPU", running: "Running / 运行中", completed: "Completed / 已完成",
+    auth: "Waiting for Google authorization / 等待 Google 授权", awaiting_auth: "Waiting for Google authorization / 等待 Google 授权",
+    auth_required: "Browser step pending / 浏览器步骤待完成", disconnected: "Session disconnected / 会话已断开",
     failed: "Failed / 失败", cancelled: "Retry stopped / 已停止重试", blocked: "Preparation blocked / 准备受阻"
   };
-  const completed = job.last_observation?.details || {};
+  const completed = job.completion || {};
   const completionLabels = {
-    campaign_complete: "Official development experiment completed / 正式开发集实验完成",
+    campaign_complete: "Experiment completed / 实验已完成",
     acceptance_passed: "Resume acceptance passed / 断线续训验收通过",
     process_exit: "Program finished / 程序运行结束"
   };
-  $("colabStatus").textContent = (job.status === "completed" && completionLabels[completed.completion_kind]) || labels[job.status] || job.status || labels.idle;
+  const currentSource = job.source_current !== false;
+  $("colabStatus").textContent = currentSource
+    ? (job.status === "completed" && completionLabels[completed.completion_kind]) || labels[job.status] || job.status || "Checking status"
+    : "Code changed / 准备版本已过期";
   const lines = [];
-  if (job.status === "completed" && completed.completion_kind === "acceptance_passed") lines.push("功能验收通过；正式论文实验仍需完成训练与评测。");
-  if (job.status === "completed" && completed.completion_kind === "campaign_complete") lines.push("已完成官方开发集评测；改进是否有效请根据配对结果分析。");
-  if (job.status === "completed" && completed.metrics) {
-    for (const name of ["B0_eer_percent", "VQ_eer_percent", "B0_min_dcf", "VQ_min_dcf"]) {
-      if (Number.isFinite(completed.metrics[name])) lines.push(`${name}: ${completed.metrics[name].toFixed(4)}`);
+  if (!currentSource) lines.push("项目代码已更新，已准备的 Notebook 对应此前版本。");
+  if (currentSource && job.status === "completed" && completed.completion_kind === "acceptance_passed") lines.push("断线续训功能验收通过，正式实验待完成。");
+  if (currentSource && job.status === "completed") {
+    for (const [name, value] of Object.entries(completed.metrics || {})) {
+      if (Number.isFinite(value)) lines.push(`${name} · ${value}`);
     }
   }
-  if (job.blocked_reason) lines.push(job.blocked_reason);
-  if (job.last_observation?.message) lines.push(job.last_observation.message);
-  if (job.next_attempt_at) lines.push(`Next attempt / 下次申请: ${new Date(job.next_attempt_at).toLocaleString("zh-CN")}`);
-  if (job.attempt_count) lines.push(`Browser attempts / 浏览器连接次数: ${job.attempt_count}`);
-  if (job.drive_project_dir) lines.push(`Persistent files / 持久保存: ${job.drive_project_dir}`);
-  $("colabDetails").textContent = lines.join("\n") || (job.prepared ? "已准备实验；选择 Colab 后自动启动资源检测。" : "请先准备项目的 Colab 实验，再选择 Colab 开始资源检测。");
-  $("colabDetails").className = `form-status${job.blocked_reason || job.status === "failed" ? " error" : ""}`;
-  $("prepareColab").disabled = state.colabBusy || ["running", "checking", "attempting", "gpu_available"].includes(job.status);
-  $("loginColab").disabled = state.colabBusy || ["running", "checking", "attempting", "gpu_available"].includes(job.status);
-  const liveWorker = job.worker_running !== false;
-  $("startColab").disabled = state.colabBusy || !job.prepared || ["completed", "failed", "cancelled"].includes(job.status) || (liveWorker && ["running", "checking", "attempting", "gpu_available"].includes(job.status));
-  $("startColab").textContent = job.status === "auth_required" ? "Resume After Login / 登录后继续" : (["running", "gpu_available"].includes(job.status) ? "Resume Monitoring / 恢复监控" : "Start Free GPU Trial / 申请并运行");
-  $("cancelColab").disabled = state.colabBusy || !job.prepared || ["cancelled", "completed", "failed"].includes(job.status);
+  if (job.status === "auth_required") {
+    const authKind = job.last_observation?.details?.auth_kind;
+    const authStatus = {
+      google_sign_in: "Waiting for Google sign-in / 等待 Google 登录",
+      drive_consent: "Waiting for Google Drive authorization / 等待 Google Drive 授权",
+      experiment_inputs: "Waiting for experiment inputs / 等待实验输入"
+    };
+    lines.push(authStatus[authKind] || "Waiting for Colab browser / 等待 Colab 浏览器状态");
+  } else {
+    if (job.blocked_reason) lines.push(job.blocked_reason);
+    if (job.last_observation?.message) lines.push(job.last_observation.message);
+  }
+  if (job.next_attempt_at) lines.push(`Next attempt / 下次申请 · ${colabResourceTime(job.next_attempt_at)}`);
+  if (job.attempt_count) lines.push(`Browser attempts / 浏览器连接次数 · ${job.attempt_count}`);
+  if (job.drive_project_dir) lines.push(`Persistent files / 持久保存 · ${job.drive_project_dir}`);
+  $("colabDetails").textContent = lines.join("\n") || (job.prepared ? "已准备 Colab 实验。" : state.colab ? "尚无 Colab 实验。" : "正在读取 Colab 状态。");
+  $("colabDetails").className = `status-message${job.blocked_reason || job.status === "failed" ? " error" : ""}`;
   $("colabDownloads").classList.toggle("hidden", !job.prepared);
-  // Download targets always use this local project's export endpoints.
-  if (state.current) {
-    const base = `/api/projects/${encodeURIComponent(state.current.id)}/colab`;
+  if (job.prepared && state.current) {
+    const base = `${projectPath(state.current.id)}/colab`;
     $("downloadColabNotebook").href = `${base}/notebook.ipynb`;
     $("downloadColabBundle").href = `${base}/bundle.zip`;
     $("downloadColabInputs").href = `${base}/inputs.zip`;
@@ -405,16 +376,16 @@ function renderColab() {
 
 function colabResourceView(snapshot, job, now = Date.now()) {
   const heartbeatTime = Date.parse(snapshot?.heartbeat_at || "");
-  const heartbeatFresh = Number.isFinite(heartbeatTime) && now - heartbeatTime <= 45000 && now >= heartbeatTime - 10000;
+  const heartbeatFresh = snapshot?.agent_heartbeat_fresh !== false && Number.isFinite(heartbeatTime) && now - heartbeatTime <= 45000 && now >= heartbeatTime - 10000;
   const checkedTime = Date.parse(snapshot?.last_checked_at || "");
   const checkFresh = Number.isFinite(checkedTime) && now - checkedTime <= 45000 && now >= checkedTime - 10000;
-  const checking = snapshot?.agent_state === "checking";
   const active = ["watching", "checking"].includes(snapshot?.agent_state);
-  const jobKnown = typeof job?.status === "string";
-  const allocated = snapshot?.worker_running === true && job?.worker_running === true && ["gpu_available", "available", "running"].includes(snapshot?.job_status) && ["gpu_available", "available", "running"].includes(job?.status);
+  const allocated = ["gpu_available", "available", "running"];
+  const hasGpu = job?.source_current !== false && snapshot?.worker_running === true && job?.worker_running === true
+    && allocated.includes(snapshot?.job_status) && allocated.includes(job?.status);
   let availability = "unknown";
-  if (heartbeatFresh && active && snapshot?.availability === "available" && allocated) availability = "available";
-  if (heartbeatFresh && checkFresh && active && jobKnown && snapshot?.availability === "unavailable" && !checking) availability = "unavailable";
+  if (heartbeatFresh && active && snapshot?.availability === "available" && hasGpu) availability = "available";
+  if (heartbeatFresh && checkFresh && snapshot?.agent_state === "watching" && snapshot?.availability === "unavailable" && job?.status === "waiting_for_gpu") availability = "unavailable";
   const agentLabels = {
     watching: "持续监测中", checking: "正在检查 GPU", quota_wait: "等待额度冷却",
     auth_required: "等待登录或授权", stopped: "已停止", offline: "监测 Agent 离线"
@@ -423,12 +394,16 @@ function colabResourceView(snapshot, job, now = Date.now()) {
     available: "当前账号已分配 GPU", unavailable: "当前账号暂不可用", quota: "当前账号不可用（额度限制）",
     network: "连接失败，资源状态未确认", auth: "需要登录或授权，资源状态未确认", unknown: "尚未确认"
   };
+  let agentLabel = "监测 Agent 尚未启动";
+  if (snapshot?.agent_state === "stopped") agentLabel = agentLabels.stopped;
+  else if (heartbeatFresh) agentLabel = agentLabels[snapshot.agent_state] || "监测中";
+  else if (snapshot?.heartbeat_at) agentLabel = "监测 Agent 离线 · 状态已过期";
   return {
     availability,
-    availabilityLabel: { available: "有 · 当前账号已分配 GPU", unavailable: "暂不可用 · 最近一次申请结果", unknown: "待确认 · 等待下次实际检查" }[availability],
-    agentLabel: snapshot ? (heartbeatFresh ? (agentLabels[snapshot.agent_state] || "监测中") : "监测 Agent 离线 · 状态已过期") : "监测 Agent 尚未启动",
+    availabilityLabel: { available: "有 · 当前账号已分配 GPU", unavailable: "暂不可用 · 最近一次申请结果", unknown: "待确认" }[availability],
+    agentLabel,
     lastResultLabel: resultLabels[snapshot?.last_result] || resultLabels.unknown,
-    nextCheck: snapshot?.next_check_at || job?.next_attempt_at || null,
+    nextCheck: job?.next_attempt_at || snapshot?.next_check_at || null,
     heartbeatFresh
   };
 }
@@ -440,23 +415,22 @@ function colabResourceTime(value) {
 
 function renderColabResourceAgent() {
   const snapshot = state.colabResourceAgent?.project_id === state.current?.id ? state.colabResourceAgent : null;
-  const view = colabResourceView(snapshot, state.colab || {});
-  if (!snapshot && state.colabResourceAgentUnavailable) view.agentLabel = "监测状态暂时不可用";
+  const view = colabResourceView(snapshot, state.colab);
   $("colabResourceAvailability").textContent = view.availabilityLabel;
   $("colabResourceAvailability").className = `resource-availability ${view.availability}`;
-  $("colabResourceAgentState").textContent = view.agentLabel;
+  $("colabResourceAgentState").textContent = state.colabResourceAgentUnavailable ? "监测状态暂时不可用" : view.agentLabel;
   $("colabResourceHeartbeat").textContent = colabResourceTime(snapshot?.heartbeat_at);
   $("colabResourceLastResult").textContent = view.lastResultLabel;
   $("colabResourceLastChecked").textContent = colabResourceTime(snapshot?.last_checked_at);
   $("colabResourceNextCheck").textContent = colabResourceTime(view.nextCheck);
-  $("colabResourceMessage").textContent = snapshot?.message || "已准备的项目选择 Colab 后，专用 Agent 自动监测资源；需要登录或授权时，完成页面操作后继续。";
+  $("colabResourceMessage").textContent = snapshot?.heartbeat_at ? snapshot.message || "" : "";
 }
 
 async function loadColabResourceAgent(projectId) {
   try {
-    const snapshot = await api(`/static/colab-resource-status/${encodeURIComponent(projectId)}.json`, { cache: "no-store" });
-    if (snapshot.project_id !== projectId) throw new Error("Resource status belongs to another project");
+    const snapshot = await api(`${projectPath(projectId)}/colab/resources`);
     if (state.current?.id !== projectId) return;
+    if (snapshot.project_id !== projectId) throw new Error("Resource status belongs to another project");
     state.colabResourceAgent = snapshot;
     state.colabResourceAgentUnavailable = false;
   } catch (error) {
@@ -468,301 +442,23 @@ async function loadColabResourceAgent(projectId) {
 }
 
 async function loadColab() {
-  if (!state.current) return;
   const projectId = state.current.id;
   const loadJob = async () => {
     try {
-      const job = await api(`/api/projects/${encodeURIComponent(projectId)}/colab`);
+      const job = await api(`${projectPath(projectId)}/colab`);
       if (state.current?.id !== projectId) return;
       state.colab = job;
       renderColab();
     } catch (error) {
       if (state.current?.id !== projectId) return;
       state.colab = null;
-      state.colabResourceAgent = null;
-      state.colabResourceAgentUnavailable = true;
       renderColab();
-      $("colabDetails").textContent = `Colab status unavailable: ${error.message}`;
+      $("colabStatus").textContent = "Status unavailable";
+      $("colabDetails").textContent = `Colab status unavailable · ${error.message}`;
+      $("colabDetails").className = "status-message error";
     }
   };
   await Promise.all([loadJob(), loadColabResourceAgent(projectId)]);
-}
-
-async function ensureSelectedColabCheck() {
-  if ($("computeProvider").value !== "colab" || !state.current || !state.colab?.prepared || state.colabBusy) return;
-  const projectId = state.current.id;
-  if (state.colabCheckedProjectId === projectId || ["completed", "failed", "cancelled", "blocked"].includes(state.colab.status)) return;
-  state.colabCheckedProjectId = projectId;
-  state.colabBusy = true;
-  renderColab();
-  let checkMessage = "";
-  try {
-    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/colab/check`, {
-      method: "POST", timeoutMs: 20000, body: JSON.stringify({ browser: state.colab.browser || "chrome" })
-    });
-    if (state.current?.id !== projectId) return;
-    if (result.job) state.colab = result.job;
-    checkMessage = result.message || "";
-    await loadColabResourceAgent(projectId);
-  } catch (error) {
-    if (state.current?.id !== projectId) return;
-    state.colabCheckedProjectId = null;
-    checkMessage = `Colab 检测未启动: ${error.message}`;
-    toast(error.message, true);
-  } finally {
-    state.colabBusy = false;
-    if (state.current?.id === projectId) {
-      renderColab();
-      if (checkMessage) $("colabDetails").textContent = [checkMessage, $("colabDetails").textContent].join("\n");
-    }
-    else await ensureSelectedColabCheck();
-  }
-}
-
-async function selectComputeProvider() {
-  updateComputeProvider();
-  await ensureSelectedColabCheck();
-}
-
-$("computeProvider").addEventListener("change", selectComputeProvider);
-$("loginColab").onclick = async () => {
-  if (!state.current || state.colabBusy) return;
-  state.colabBusy = true; renderColab();
-  try {
-    await api(`/api/projects/${encodeURIComponent(state.current.id)}/colab/login`, {
-      method: "POST", timeoutMs: 60000, body: JSON.stringify({ browser: "chrome" })
-    });
-    toast("Complete Google login, close that Chrome window, then Start / 登录后关闭该窗口，再启动试验");
-  } catch (error) { toast(error.message, true); }
-  finally { state.colabBusy = false; await loadColab(); }
-};
-$("prepareColab").onclick = async () => {
-  if (!state.current || state.colabBusy) return;
-  state.colabBusy = true; renderColab();
-  const projectId = state.current.id;
-  try {
-    const job = await api(`/api/projects/${encodeURIComponent(projectId)}/colab/prepare`, {
-      method: "POST", timeoutMs: 60000, body: JSON.stringify({
-        drive_root: $("colabDriveRoot").value.trim() || "AutoResearch",
-        notebook_url: $("colabNotebookUrl").value.trim(), retry_min_minutes: 5, retry_max_minutes: 10
-      })
-    });
-    if (state.current?.id === projectId) state.colab = job;
-    toast("Colab notebook prepared / 实验已准备");
-  } catch (error) { toast(error.message, true); }
-  finally { state.colabBusy = false; await loadColab(); }
-};
-$("startColab").onclick = async () => {
-  if (!state.current || state.colabBusy || !state.colab?.prepared) return;
-  state.colabBusy = true; renderColab();
-  try {
-    const action = state.colab.status === "auth_required" && state.colab.worker_running !== false ? "resume" : "launch";
-    await api(`/api/projects/${encodeURIComponent(state.current.id)}/colab/${action}`, {
-      method: "POST", timeoutMs: 20000, body: JSON.stringify({ confirm_execute: true })
-    });
-    toast(action === "resume" ? "Colab worker resumed / 工作器继续运行" : "Colab browser opened. Complete Google login if prompted.");
-  } catch (error) { toast(error.message, true); }
-  finally { state.colabBusy = false; await loadColab(); }
-};
-$("cancelColab").onclick = async () => {
-  if (!state.current || state.colabBusy) return;
-  state.colabBusy = true; renderColab();
-  try {
-    state.colab = await api(`/api/projects/${encodeURIComponent(state.current.id)}/colab/cancel`, { method: "POST" });
-    toast("GPU retries stopped. An active notebook must be stopped in Colab.");
-  } catch (error) { toast(error.message, true); }
-  finally { state.colabBusy = false; await loadColab(); }
-};
-
-$("researchForm").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const button = event.submitter; button.disabled = true; button.textContent = "Creating…";
-  try {
-    const collaborative = $("workflowMode").value === "chatgpt";
-    const result = collaborative
-      ? await api("/api/chatgpt/projects", { method: "POST", body: JSON.stringify({ topic: $("topic").value, notes: $("notes").value }) })
-      : await api("/api/research", { method: "POST", body: JSON.stringify({
-          topic: $("topic").value, notes: $("notes").value,
-          max_sources: Number($("maxSources").value), download_papers: $("downloadPapers").checked
-        })});
-    const project = collaborative ? result.project : result;
-    await loadProjects(); await selectProject(project.id);
-    if (collaborative) toast(`Collaborative project ${project.id} created. Use this project ID in ChatGPT.`);
-  } catch (error) { toast(error.message, true); }
-  finally { button.disabled = false; updateWorkflowMode(); }
-});
-
-$("newProject").onclick = () => {
-  state.current = null; clearInterval(state.poller);
-  $("projectView").classList.add("hidden"); $("createView").classList.remove("hidden");
-  history.replaceState(null, "", location.pathname);
-  $("pageTitle").textContent = "Turn an Idea into a Reproducible Experiment";
-  $("openCode").disabled = true; $("syncGit").disabled = true; renderProjectList();
-};
-
-function copyText(value, message) {
-  if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(value).then(() => toast(message)).catch(() => toast("Copy failed. Select the text manually.", true));
-  } else { toast("This browser does not support automatic copying. Select the text manually.", true); }
-}
-
-$("workflowMode").addEventListener("change", updateWorkflowMode);
-$("copyMcp").onclick = () => copyText($("mcpEndpoint").textContent, "MCP address copied");
-$("copyProjectId").onclick = () => copyText($("projectId").textContent, "Project ID copied");
-$("setupChatgpt").onclick = () => launchChatgptConnection("Setup");
-$("startChatgpt").onclick = () => launchChatgptConnection("Run");
-$("settingsSetupChatgpt").onclick = () => launchChatgptConnection("Setup");
-$("settingsStartChatgpt").onclick = () => launchChatgptConnection("Run");
-
-$("openCode").onclick = async () => {
-  try { await api(`/api/projects/${state.current.id}/open`, { method: "POST" }); toast("Sent to VS Code"); }
-  catch (error) { toast(error.message, true); }
-};
-
-$("syncGit").onclick = async () => {
-  if (!state.settings?.github_remote_url) { $("settingsDialog").showModal(); return toast("Configure a GitHub repository first", true); }
-  try {
-    const result = await api("/api/git/sync", { method: "POST", body: JSON.stringify({ project_id: state.current.id }) });
-    toast(result.pushed ? "Experiment code pushed to GitHub" : "Code committed to local Git");
-  } catch (error) { toast(error.message, true); }
-};
-
-$("settingsButton").onclick = () => {
-  $("settingsStatus").textContent = "";
-  $("settingsStatus").className = "form-status";
-  $("settingsDialog").showModal();
-};
-document.querySelectorAll(".close-settings").forEach((button) => {
-  button.addEventListener("click", () => $("settingsDialog").close());
-});
-$("settingsForm").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const saveButton = $("saveSettings");
-  const status = $("settingsStatus");
-  saveButton.disabled = true;
-  saveButton.textContent = "Saving…";
-  status.className = "form-status";
-  status.textContent = "Writing local configuration…";
-  const payload = {
-    openrouter_model: $("settingModel").value,
-    autodl_image_uuid: $("settingImageUuid").value,
-    autodl_gpu_specs: $("settingGpuSpecs").value,
-    github_remote_url: $("settingRemote").value
-  };
-  if ($("settingOpenRouterKey").value) payload.openrouter_api_key = $("settingOpenRouterKey").value;
-  if ($("settingAutoDLToken").value) payload.autodl_token = $("settingAutoDLToken").value;
-  try {
-    state.settings = await api("/api/settings", { method: "PATCH", body: JSON.stringify(payload) });
-    $("settingOpenRouterKey").value = ""; $("settingAutoDLToken").value = "";
-    applySettings();
-    await refreshAutoDL();
-    status.textContent = "Settings saved and applied immediately.";
-    toast("Settings saved locally");
-    setTimeout(() => { if ($("settingsDialog").open) $("settingsDialog").close(); }, 450);
-  } catch (error) {
-    status.className = "form-status error";
-    status.textContent = error.message;
-    toast(error.message, true);
-  } finally {
-    saveButton.disabled = false;
-    saveButton.textContent = "Save Settings";
-  }
-});
-
-$("toggleExperiment").onclick = () => $("experimentForm").classList.toggle("hidden");
-
-$("checkAutoDL").onclick = () => refreshAutoDL(true);
-
-async function launchAutoDLLogin(action) {
-  const button = action === "Setup" ? $("setupAutoDLLogin") : $("openAutoDLLogin");
-  button.disabled = true;
-  try {
-    await api("/api/autodl/browser-login/launch", {
-      method: "POST",
-      body: JSON.stringify({
-        action, browser: "auto", open_page: "console", keep_open: true, confirm_launch: true
-      })
-    });
-    toast(action === "Setup"
-      ? "AutoDL encrypted login setup opened in a private console."
-      : "AutoDL automatic login opened. Complete verification in the new windows.");
-  } catch (error) { toast(error.message, true); }
-  finally { button.disabled = false; }
-}
-
-$("setupAutoDLLogin").onclick = () => launchAutoDLLogin("Setup");
-$("openAutoDLLogin").onclick = () => launchAutoDLLogin("Login");
-
-$("createInstance").onclick = async () => {
-  if (state.instanceCreating || state.creationUncertain) return;
-  state.instanceCreating = true;
-  $("createInstance").disabled = true;
-  let creationRequested = false;
-  try {
-    const readiness = await refreshAutoDL();
-    if (!readiness?.ready) return;
-    if (!confirm("AutoDL Pro instances are billed after startup. Create the preferred GPU instance?")) return;
-    creationRequested = true;
-    const result = await api("/api/autodl/instances", { method: "POST", body: JSON.stringify({ confirm_billable: true }), timeoutMs: 120000 });
-    if (typeof result.instance_uuid !== "string" || !result.instance_uuid) {
-      const error = new Error("The creation response has no instance UUID. Check the instance list first.");
-      error.code = "autodl_create_uncertain";
-      throw error;
-    }
-    $("instanceUuid").value = result.instance_uuid;
-    toast(`Instance ${result.instance_uuid} is being created (${result.gpu_spec})`);
-  } catch (error) {
-    if (creationRequested && ["autodl_create_uncertain", "connection_uncertain"].includes(error.code)) {
-      state.creationUncertain = true;
-      $("createInstance").textContent = "Creation result unknown; check instances";
-      $("autodlReadiness").textContent = "The creation result is unknown and retries have stopped. Check the AutoDL console and confirm that no new instance exists before reloading this page.";
-    }
-    toast(error.message, true);
-  } finally {
-    state.instanceCreating = false;
-    $("createInstance").disabled = !state.autodl?.ready || state.creationUncertain;
-  }
-};
-
-$("loadSsh").onclick = async () => {
-  const id = $("instanceUuid").value.trim(); if (!id) return toast("Enter an instance UUID first", true);
-  try {
-    const result = await api(`/api/autodl/instances/${encodeURIComponent(id)}`);
-    if (!result.ssh) return toast(`Instance status: ${result.status}. SSH information is not available yet.`, true);
-    $("sshHost").value = result.ssh.host || ""; $("sshPort").value = result.ssh.port || 22;
-    $("sshUser").value = result.ssh.username || "root"; $("sshPassword").value = result.ssh.password || "";
-    toast("SSH information loaded");
-  } catch (error) { toast(error.message, true); }
-};
-
-$("experimentForm").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!confirm("The generated code will be uploaded to the remote host and the displayed command will run. Continue?")) return;
-  const payload = {
-    project_id: state.current.id,
-    instance_uuid: $("instanceUuid").value || null,
-    connection: { host: $("sshHost").value, port: Number($("sshPort").value), username: $("sshUser").value, password: $("sshPassword").value || null },
-    command: $("remoteCommand").value,
-    max_iterations: Number($("maxIterations").value),
-    allow_release_replacement: $("allowRelease").checked,
-    recover_busy_gpu: true,
-    confirm_execute: true
-  };
-  try {
-    const result = await api("/api/experiments", { method: "POST", body: JSON.stringify(payload) });
-    state.experimentId = result.experiment_id; $("experimentStatus").textContent = "Preparing"; beginPolling(); toast("Experiment started");
-  } catch (error) { toast(error.message, true); }
-});
-
-async function refreshExperiment() {
-  const result = await api(`/api/experiments/${state.experimentId}`);
-  const labels = { preparing: "Preparing", uploading: "Uploading", running: `Running · Round ${result.iteration}`, analyzing: "Analyzing", completed: "Completed", failed: "Failed" };
-  $("experimentStatus").textContent = labels[result.status] || result.status;
-  if (["completed", "failed"].includes(result.status)) {
-    if (result.status === "failed" && result.error) toast(result.error, true);
-    state.experimentId = null;
-    await loadExperiments();
-  }
 }
 
 bootstrap();

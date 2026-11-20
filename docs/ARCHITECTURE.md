@@ -10,10 +10,12 @@ ChatGPT native model → Secure MCP Tunnel → /mcp → ChatGPTBridge
                                                    ├→ ExperimentManager → AutoDL / SSH
                                                    └→ SQLite event log
 
-Web UI → FastAPI → ResearchOrchestrator → OpenRouter
-                          ├──────────────→ Search providers
-                          ├──────────────→ ArtifactStore
-                          └──────────────→ SQLite event log
+Read-only dashboard → FastAPI status and artifact reads
+
+Local research API → ResearchOrchestrator → OpenRouter
+                          ├────────────────→ Search providers
+                          ├────────────────→ ArtifactStore
+                          └────────────────→ SQLite event log
 
 ExperimentManager → SSHRunner → AutoDL instance
                  ├→ AutoDL Pro API (provisioning/recovery)
@@ -25,7 +27,7 @@ ExperimentManager → SSHRunner → AutoDL instance
 
 SQLite tables `projects`, `events`, `sources`, and `experiments` are the source of truth for the UI and state recovery. Events form an append-only log; the projects table retains the current projection.
 
-ChatGPT and the web UI share one `AppState`, SQLite database, and workspace. MCP results include a project ID and dashboard deep link. The UI reloads events and experiments every 2.5 seconds, so operations started through ChatGPT appear in the same workbench.
+ChatGPT tools and the dashboard read from the same `AppState`, SQLite database, and workspace. MCP responses include a project ID and dashboard link. The dashboard polls project progress, Colab resources, and experiment results for operations started through ChatGPT.
 
 ## Capability boundaries
 

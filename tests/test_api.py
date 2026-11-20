@@ -19,7 +19,8 @@ def test_chatgpt_connection_launch_requires_confirmation(tmp_path: Path) -> None
     with TestClient(create_app(Settings.load(tmp_path))) as client:
         status = client.get("/api/chatgpt/connection")
         assert status.status_code == 200
-        assert status.json()["local_mcp_url"].endswith("/mcp")
+        assert status.json()["local_mcp_ready"] is False
+        assert status.json()["local_mcp_url"] is None
 
         response = client.post(
             "/api/chatgpt/connection/launch",
