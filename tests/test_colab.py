@@ -75,7 +75,7 @@ def test_reprepare_changed_export_invalidates_saved_notebook_url(tmp_path, chang
     service, project_id, generated = project_service(tmp_path)
     first = service.prepare(project_id, ColabPrepareRequest())
     url = 'https://colab.research.google.com/drive/fixture-saved'
-    service.observe(project_id, ColabObservationRequest(status='auth', details={'browser_url': url}))
+    service.bind_notebook(project_id, ColabNotebookBindingRequest(notebook_url=url, bundle_sha256=first['bundle_sha256']))
     assert service.status(project_id)['notebook_url'] == url
     request = ColabPrepareRequest()
     if change == 'source':
@@ -88,6 +88,7 @@ def test_reprepare_changed_export_invalidates_saved_notebook_url(tmp_path, chang
         request = ColabPrepareRequest(drive_root='OtherAutoResearch')
     updated = service.prepare(project_id, request)
     assert updated['notebook_url'] == updated['browser_url'] == ''
+    assert 'notebook_bundle_sha256' not in updated and 'notebook_bound_at' not in updated
     if change != 'drive_root':
         assert updated['bundle_sha256'] != first['bundle_sha256']
     notebook = json.loads(service.export_path(project_id, 'notebook').read_text(encoding='utf-8'))
@@ -539,6 +540,76 @@ def test_notebook_binding_api_updates_metadata_only(tmp_path):
         assert bound.json()['attempt_count']==0 and bound.json()['last_observation'] is None
         assert client.post(f'/api/projects/{project_id}/colab/notebook-binding',json={**payload,'bundle_sha256':'0'*64}).status_code == 409
         assert client.post('/api/projects/missing/colab/notebook-binding',json=payload).status_code == 404
+
+
+@pytest.mark.parametrize('overrides,expected', [
+    ({}, 'queued'),
+    ({'torchaudio_version': '2.9.1+cu128'}, 'blocked'),
+    ({'torch_version': '2.9'}, 'blocked'),
+    ({'torch_version': '2.9.1+cpu'}, 'blocked'),
+    ({'match_torchaudio': False}, 'blocked'),
+])
+def test_runtime_requirements_validate_pinned_cuda_pair(tmp_path, overrides, expected):
+    service, project_id, generated = project_service(tmp_path)
+    requirements = {'framework': 'pytorch', 'require_cuda': True, 'match_torchaudio': True,
+                    'torch_version': '2.9.1+cu126', 'torchaudio_version': '2.9.1+cu126', **overrides}
+    spec = {**config(), 'runtime_requirements': requirements}
+    (generated / 'experiment_manifest.json').write_text(json.dumps({'colab': spec}), encoding='utf-8')
+    job = service.prepare(project_id, ColabPrepareRequest())
+    assert job['status'] == expected
+    if expected == 'queued':
+        assert job['runtime_requirements'] == requirements
+
+
+def test_stage_and_release_receipt_preserve_the_terminal_result(tmp_path):
+    app = create_app(Settings.load(tmp_path))
+    with TestClient(app) as client:
+        project_id = client.post('/api/chatgpt/projects', json={'topic': 'Runtime lifecycle fixture'}).json()['project']['id']
+        client.post(f'/api/chatgpt/projects/{project_id}/code', json={
+            'files': [{'path': 'train.py', 'content': 'print("train")'}], 'experiment_manifest': {'colab': config()}})
+        root = f'/api/projects/{project_id}/colab'
+        prepared = client.post(f'{root}/prepare', json={}).json()
+        digest = prepared['bundle_sha256']
+        assert client.post(f'{root}/stage', json={'stage': 'requesting_gpu'}).status_code == 409
+        app.state.autoresearch.colab.enable_autorun(project_id, 'chrome')
+        client.post(f'{root}/notebook-binding', json={
+            'notebook_url': 'https://colab.research.google.com/drive/fixture-copy', 'bundle_sha256': digest})
+        assert client.post(f'{root}/attempt', json={}).json()['stage'] == 'opening_notebook'
+        assert client.post(f'{root}/stage', json={'stage': 'requesting_gpu'}).json()['stage'] == 'requesting_gpu'
+        vm = {'runtime_id': 'fixture-vm', 'started_at': datetime.now(timezone.utc).isoformat()}
+        assert client.post(f'{root}/observations', json={'status': 'available', 'details': vm}).json()['stage'] == 'runtime_setup'
+        assert client.post(f'{root}/stage', json={'stage': 'preparing_data'}).json()['stage'] == 'preparing_data'
+        assert client.post(f'{root}/observations', json={'status': 'running', 'details': vm}).json()['stage'] == 'training'
+        receipt = {'runtime_id': vm['runtime_id'], 'bundle_sha256': digest, 'status': 'released'}
+        assert client.post(f'{root}/runtime-release', json=receipt).status_code == 409
+        done = client.post(f'{root}/observations', json={'status': 'completed', 'details': {
+            **vm, 'bundle_sha256': digest, 'returncode': 0,
+            'runtime_release_requested': True, 'runtime_release_safe': True,
+        }}).json()
+        assert done['status'] == 'completed' and done['runtime_release']['status'] == 'pending'
+        assert client.post(f'{root}/runtime-release', json={**receipt, 'runtime_id': 'stale-vm'}).status_code == 409
+        released = client.post(f'{root}/runtime-release', json=receipt).json()
+        assert released['status'] == 'released'
+        assert client.post(f'{root}/runtime-release', json=receipt).json() == released
+        last = client.get(root).json()
+        assert last['runtime_release'] == released
+        assert last['last_observation'] == done['last_observation']
+        assert last['completion'] == done['completion']
+
+
+def test_failed_runtime_without_persisted_evidence_does_not_request_release(tmp_path):
+    service, project_id, _ = project_service(tmp_path)
+    prepared = service.prepare(project_id, ColabPrepareRequest())
+    service.enable_autorun(project_id, 'chrome')
+    service.bind_notebook(project_id, ColabNotebookBindingRequest(
+        notebook_url='https://colab.research.google.com/drive/fixture-copy', bundle_sha256=prepared['bundle_sha256']))
+    vm = {'runtime_id': 'fixture-vm', 'started_at': datetime.now(timezone.utc).isoformat()}
+    service.observe(project_id, ColabObservationRequest(status='available', details=vm))
+    stopped = service.observe(project_id, ColabObservationRequest(status='failed', details={
+        **vm, 'bundle_sha256': prepared['bundle_sha256'], 'runtime_release_requested': True,
+    }))
+    assert stopped['status'] == 'failed'
+    assert 'runtime_release' not in stopped
 
 
 def test_authorization_continuation_is_durable_and_cannot_follow_another_runtime(tmp_path):

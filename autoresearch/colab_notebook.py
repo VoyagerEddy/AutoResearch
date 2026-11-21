@@ -54,7 +54,10 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
             _last_report_status = status
             record = dict(project_id=PROJECT_ID, runtime_id=RUNTIME_ID,
                           started_at=STARTED_AT, status=status, **details)
-            print('AUTORESEARCH_COLAB_STATUS ' + json.dumps(record), flush=True)
+            marker = 'AUTORESEARCH_COLAB_STATUS ' + json.dumps(record)
+            release_safe = details.get('runtime_release_safe') is True
+            if not release_safe:
+                print(marker, flush=True)
             if DRIVE_PROJECT is not None:
                 target = DRIVE_PROJECT / 'session_status.json'
                 temp = target.with_suffix('.json.tmp')
@@ -63,6 +66,10 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temp, target)
+            elif release_safe:
+                raise RuntimeError('A release-safe report requires persistent Drive evidence')
+            if release_safe:
+                print(marker, flush=True)
         report('starting')
         try:
             gpu = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'],
@@ -184,7 +191,7 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
     """)
     code("""
         # AUTORESEARCH_PREFLIGHT_GATE: no bulk data request precedes this cell.
-        import importlib, signal, tempfile
+        import importlib, math, signal, tempfile
         RUNTIME_PREFLIGHT = dict(schema_version=1, project_id=PROJECT_ID, runtime_id=RUNTIME_ID,
                                  phase='preflight', status='checking',
                                  scientific_metrics_produced=False)
@@ -199,6 +206,41 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                         filesystem_used_bytes=usage.used,
                         filesystem_available_bytes=usage.free,
                         filesystem_space_status='measured', cloud_quota_status='unknown')
+
+        def preflight_cuda(torch):
+            sample = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda:0', dtype=torch.float32)
+            product = sample @ sample
+            torch.cuda.synchronize()
+            if not torch.isfinite(product).all().item() or product.tolist() != [[7.0, 10.0], [15.0, 22.0]]:
+                raise RuntimeError('CUDA matrix multiplication failed its finite-value and expected-result check')
+            return dict(status='passed', operation='float32_matmul', synchronized=True)
+
+        def preflight_torchaudio(torch, torchaudio):
+            samples = torch.arange(800, dtype=torch.float32)
+            waveform = (torch.sin(samples * (2.0 * math.pi * 440.0 / 8000)) * 0.1).unsqueeze(0)
+            waveform = torchaudio.functional.resample(waveform, 8000, 16000)
+            if list(waveform.shape) != [1, 1600] or not torch.isfinite(waveform).all().item():
+                raise RuntimeError('TorchAudio resample produced unexpected or non-finite samples')
+            features = torchaudio.compliance.kaldi.fbank(waveform * (1 << 15),
+                num_mel_bins=80, frame_length=25.0, frame_shift=10.0, dither=0.0,
+                sample_frequency=16000.0, window_type='hamming', use_energy=False)
+            if list(features.shape) != [8, 80] or not torch.isfinite(features).all().item():
+                raise RuntimeError('TorchAudio Kaldi fbank produced unexpected or non-finite features')
+            return dict(status='passed', source_rate=8000, input_rate=16000, feature_shape=list(features.shape))
+
+        def save_preflight_evidence(path):
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                                prefix='.' + path.name, delete=False) as handle:
+                    temporary = pathlib.Path(handle.name)
+                    json.dump(RUNTIME_PREFLIGHT, handle, ensure_ascii=False, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
         def run_preflight_command(command, timeout_seconds, log_path, environment):
             # Use the same shell and durable log transport as project execution.
@@ -242,6 +284,7 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
             return tail
 
         preflight_log = DRIVE_PROJECT / 'results' / ('preflight_' + RUNTIME_ID + '.log')
+        preflight_path = preflight_log.with_suffix('.json')
         try:
             drive_evidence = preflight_disk(DRIVE_PROJECT)
             probe = DRIVE_PROJECT / ('.preflight_' + RUNTIME_ID + '.tmp')
@@ -273,25 +316,41 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
             requirements = config.get('runtime_requirements') or {}
             framework = requirements.get('framework')
             RUNTIME_PREFLIGHT['framework'] = dict(status='not_requested')
-            if framework is None and (requirements.get('require_cuda') or requirements.get('match_torchaudio')):
-                raise ValueError('Runtime framework must be declared for explicit CUDA or TorchAudio requirements')
+            if framework is None and any(requirements.get(key) for key in
+                                         ('require_cuda', 'match_torchaudio', 'torch_version', 'torchaudio_version')):
+                raise ValueError('Runtime framework must be declared for CUDA, TorchAudio or version requirements')
+            if requirements.get('torchaudio_version') and not requirements.get('match_torchaudio'):
+                raise ValueError('TorchAudio version pin requires match_torchaudio')
             if framework is not None:
                 if framework != 'pytorch':
                     raise ValueError('Unsupported explicit runtime framework requirement')
-                torch = importlib.import_module('torch')
-                framework_evidence = dict(name='pytorch', torch_version=str(torch.__version__),
-                                          cuda_available=bool(torch.cuda.is_available()))
+                framework_evidence = dict(name='pytorch', status='checking')
                 RUNTIME_PREFLIGHT['framework'] = framework_evidence
+                torch = importlib.import_module('torch')
+                framework_evidence.update(torch_version=str(torch.__version__),
+                                          cuda_available=bool(torch.cuda.is_available()))
+                pinned_torch = requirements.get('torch_version')
+                if pinned_torch and framework_evidence['torch_version'] != pinned_torch:
+                    raise RuntimeError('Expected Torch ' + pinned_torch + ', found ' + framework_evidence['torch_version'])
                 if requirements.get('match_torchaudio'):
                     torchaudio = importlib.import_module('torchaudio')
                     framework_evidence['torchaudio_version'] = str(torchaudio.__version__)
-                    if str(torch.__version__).split('+')[0] != str(torchaudio.__version__).split('+')[0]:
+                    pinned_audio = requirements.get('torchaudio_version')
+                    if pinned_audio and framework_evidence['torchaudio_version'] != pinned_audio:
+                        raise RuntimeError('Expected TorchAudio ' + pinned_audio + ', found ' + framework_evidence['torchaudio_version'])
+                    if framework_evidence['torch_version'].split('+')[0] != framework_evidence['torchaudio_version'].split('+')[0]:
                         raise RuntimeError('Torch and TorchAudio versions must match before bulk upload')
                 if requirements.get('require_cuda') and not framework_evidence['cuda_available']:
                     raise RuntimeError('No actual CUDA GPU has been allocated for the declared PyTorch project')
                 if framework_evidence['cuda_available']:
                     framework_evidence.update(cuda_name=torch.cuda.get_device_name(0),
                         cuda_total_memory_bytes=int(torch.cuda.get_device_properties(0).total_memory))
+                if requirements.get('require_cuda'):
+                    framework_evidence['cuda_smoke'] = dict(status='checking')
+                    framework_evidence['cuda_smoke'] = preflight_cuda(torch)
+                if requirements.get('match_torchaudio'):
+                    framework_evidence['torchaudio_smoke'] = dict(status='checking')
+                    framework_evidence['torchaudio_smoke'] = preflight_torchaudio(torch, torchaudio)
                 framework_evidence['status'] = 'passed'
             preflight_command = config.get('preflight_command') or ''
             if preflight_command:
@@ -322,12 +381,17 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
             else:
                 RUNTIME_PREFLIGHT['project_command'] = dict(status='not_configured')
             RUNTIME_PREFLIGHT['status'] = 'passed'
-            preflight_path = DRIVE_PROJECT / 'results' / ('preflight_' + RUNTIME_ID + '.json')
-            preflight_path.write_text(json.dumps(RUNTIME_PREFLIGHT, ensure_ascii=False, indent=2), encoding='utf-8')
+            save_preflight_evidence(preflight_path)
             report('starting', phase='preflight', preflight=RUNTIME_PREFLIGHT,
                    preflight_path=str(preflight_path))
         except BaseException as exc:
             RUNTIME_PREFLIGHT.update(status='failed', error_type=type(exc).__name__, reason=str(exc))
+            framework_evidence = RUNTIME_PREFLIGHT.get('framework', {})
+            if framework_evidence.get('status') == 'checking':
+                framework_evidence['status'] = 'failed'
+                for probe in ('cuda_smoke', 'torchaudio_smoke'):
+                    if framework_evidence.get(probe, {}).get('status') == 'checking':
+                        framework_evidence[probe]['status'] = 'failed'
             if RUNTIME_PREFLIGHT.get('project_command', {}).get('status') == 'running':
                 RUNTIME_PREFLIGHT['project_command'].update(status='failed',
                     returncode=getattr(exc, 'returncode', None), timed_out=isinstance(exc, subprocess.TimeoutExpired))
@@ -336,8 +400,16 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                         saved.seek(0, os.SEEK_END)
                         saved.seek(max(0, saved.tell() - 8192))
                         RUNTIME_PREFLIGHT['project_command']['output_tail'] = saved.read().decode('utf-8', errors='replace')
+            release = {}
+            if RUNTIME_PREFLIGHT.get('drive', {}).get('write_verified') is True:
+                try:
+                    save_preflight_evidence(preflight_path)
+                except OSError as save_error:
+                    RUNTIME_PREFLIGHT['persistence_error'] = type(save_error).__name__
+                else:
+                    release = dict(runtime_release_safe=True, preflight_path=str(preflight_path))
             report('failed', reason='Runtime preflight failed before bulk upload: ' + str(exc),
-                   preflight=RUNTIME_PREFLIGHT, log_path=str(preflight_log))
+                   preflight=RUNTIME_PREFLIGHT, log_path=str(preflight_log), **release)
             raise
     """)
     code("""
@@ -362,6 +434,7 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
             if (globals().get('RUNTIME_PREFLIGHT', {}).get('status') != 'passed'
                     or RUNTIME_PREFLIGHT.get('runtime_id') != RUNTIME_ID):
                 raise RuntimeError('A successful current-runtime preflight is required before bulk upload')
+            report('starting', phase='preparing_data', preflight=RUNTIME_PREFLIGHT)
             for item in transfer['files']:
                 relative = relative_data_path(item['path'])
                 if item['kind'] == 'metadata':
@@ -445,17 +518,44 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
         if (config.get('preflight_command') or config.get('runtime_requirements') or config.get('full_data_transfer')):
             if preflight_evidence.get('status') != 'passed' or preflight_evidence.get('runtime_id') != RUNTIME_ID:
                 raise RuntimeError('A successful current-runtime preflight is required before experiment execution')
+        drive_verified = (preflight_evidence.get('status') == 'passed'
+                          and preflight_evidence.get('runtime_id') == RUNTIME_ID
+                          and preflight_evidence.get('drive', {}).get('write_verified') is True)
         # Checkpoint implementation belongs to the project. No generic model
         # state is invented here; export requires an explicit full-resume contract.
-        found_checkpoint = any(any(checkpoint_dir.rglob(name)) for name in config['checkpoint']['files'])
-        command = config['checkpoint']['resume_command'] if found_checkpoint else config['run_command']
+        checkpoint = config['checkpoint']
+        found_checkpoint = any(any(checkpoint_dir.rglob(name)) for name in checkpoint['files'])
+        command = checkpoint['resume_command'] if found_checkpoint else config['run_command']
+        session_exit_code = checkpoint.get('session_exit_code')
+        check_resume_safety = (drive_verified and checkpoint.get('full_training_state') is True
+                               and checkpoint.get('resume_supported') is True
+                               and type(session_exit_code) is int and session_exit_code > 0)
+
+        def checkpoint_stamps():
+            root = checkpoint_dir.resolve()
+            stamps = {}
+            if checkpoint_dir.is_symlink() or not root.is_relative_to(DRIVE_PROJECT.resolve()):
+                return stamps
+            for name in checkpoint['files']:
+                for path in checkpoint_dir.rglob(name):
+                    if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root):
+                        info = path.stat()
+                        if info.st_size:
+                            stamps[path] = (info.st_mtime_ns, info.st_size)
+            return stamps
+
         prepare_command = config.get('prepare_command', '')
+        steps = ([prepare_command] if prepare_command else []) + [command]
         report('running', checkpoint_dir=str(checkpoint_dir), results_dir=str(results_dir),
                resumed=found_checkpoint, preflight=preflight_evidence)
         log_path = results_dir / ('session_' + RUNTIME_ID + '.log')
+        run_started = False
         try:
             with open(log_path, 'a', encoding='utf-8', buffering=1) as log:
-                for step in ([prepare_command] if prepare_command else []) + [command]:
+                for index, step in enumerate(steps):
+                    if index == len(steps) - 1:
+                        checkpoint_before_run = checkpoint_stamps() if check_resume_safety else {}
+                        run_started = True
                     print('Executing:', step, flush=True)
                     process = subprocess.Popen(step, shell=True, executable='/bin/bash',
                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -464,17 +564,29 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                         print(line, end='', flush=True)
                         log.write(line)
                     returncode = process.wait()
+                    log.flush()
+                    os.fsync(log.fileno())
                     if returncode:
                         raise subprocess.CalledProcessError(returncode, step)
             validated = validate_scientific_result(results_dir, config.get('success_criteria'))
+            if drive_verified and validated.get('metrics_file'):
+                validated['runtime_release_safe'] = True
             report('completed', returncode=0, checkpoint_dir=str(checkpoint_dir),
                    results_dir=str(results_dir), log_path=str(log_path), preflight=preflight_evidence, **validated)
         except BaseException as exc:
             exitcode = getattr(exc, 'returncode', None)
-            resumable = exitcode is not None and exitcode == config['checkpoint'].get('session_exit_code')
+            resumable = exitcode is not None and exitcode == session_exit_code
+            release = {}
+            if resumable and run_started and check_resume_safety:
+                try:
+                    current_checkpoints = checkpoint_stamps()
+                except OSError:
+                    current_checkpoints = {}
+                if any(checkpoint_before_run.get(path) != stamp for path, stamp in current_checkpoints.items()):
+                    release = dict(runtime_release_safe=True)
             report('disconnected' if resumable else 'failed', returncode=exitcode,
                    reason=str(exc), checkpoint_dir=str(checkpoint_dir), log_path=str(log_path),
-                   preflight=preflight_evidence)
+                   preflight=preflight_evidence, **release)
             raise
     """)
     return {"nbformat": 4, "nbformat_minor": 5, "metadata": {

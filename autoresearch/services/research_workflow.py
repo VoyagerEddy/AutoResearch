@@ -317,6 +317,9 @@ class ResearchWorkflowService:
                       research_experiment_ids=experiment_ids,
                       validation_scope="full" if full else "acceptance",
                       reason="Current prepared scientific contract completed; research interpretation is pending")
+        if "paired_seeds" in completion:
+            result.update(paired_seeds=completion["paired_seeds"],
+                          research_effect_validated=completion["research_effect_validated"])
         return result
 
     def save_plan(self, project_id: str, plan: dict[str, Any]) -> dict[str, Any]:
@@ -426,6 +429,7 @@ class ResearchWorkflowService:
         return {**base, "status": status, "plan_id": identity, "parent_plan_id": record.get("parent_plan_id"),
                 "plan_sha256": record["plan_sha256"], "plan": plan, "evidence_id": evidence_id, "evidence": evidence,
                 "coverage": coverage, "all_required_experiments_completed": complete,
+                "research_effect_validated": bool(complete and evidence.get("research_effect_validated")),
                 "missing_required_metrics": missing_metrics,
                 "analysis_required": bool(complete and not (decision_current and latest["action"] == "accept")),
                 "latest_decision": latest, "latest_decision_is_current": decision_current,

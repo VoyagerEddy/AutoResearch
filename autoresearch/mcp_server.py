@@ -393,7 +393,7 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
 
     @server.tool(
         name="get_colab_experiment_result", title="Read Current Colab Experiment Evidence",
-        description="Returns validated metrics only from the prepared code and currently observed Colab runtime, completion scope, returned log tail or an explicit unknown, and next actions for ChatGPT. Does not read a remote Drive path as a local file; acceptance is not full-data completion.",
+        description="Returns validated metrics from the prepared code and currently observed Colab runtime, including per-seed comparisons and the confirmation outcome when declared. Includes completion scope, a returned log tail or an explicit unknown, and next actions for ChatGPT. Acceptance is not full-data completion.",
         annotations=READ_ONLY, structured_output=True,
     )
     def get_colab_experiment_result(project_id: str) -> dict[str, Any]:

@@ -26,7 +26,10 @@ from urllib.parse import urlparse
 from ..colab_notebook import build_notebook
 from ..config import Settings
 from ..db import Database
-from ..domain import ColabNotebookBindingRequest, ColabObservationRequest, ColabPrepareRequest
+from ..domain import (
+    ColabNotebookBindingRequest, ColabObservationRequest, ColabPrepareRequest,
+    ColabRuntimeReleaseRequest,
+)
 from .artifacts import ArtifactStore
 
 
@@ -47,6 +50,7 @@ EXCLUDED_NAMES = ArtifactStore.BLOCKED_NAMES | {
 SECRET_PATTERN = re.compile(r'(?:sk-[A-Za-z0-9_-]{24,}|gh[pousr]_[A-Za-z0-9]{30,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)')
 RETRY_STATUSES = {'queued', 'waiting_for_gpu', 'waiting_for_connection', 'disconnected'}
 TERMINAL_STATUSES = {'completed', 'failed', 'cancelled', 'blocked'}
+FRAMEWORK_VERSION = re.compile(r'[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:\+(?:cu[0-9]{3,4}|cpu))?')
 
 
 def _utc() -> datetime:
@@ -348,6 +352,11 @@ class ColabService:
                 worker_pid = worker_is_running(self.settings.root, project_id)
             except ImportError:
                 worker_pid = None
+            release = job.get('runtime_release') or {}
+            if (release.get('status') == 'pending' and worker_pid is None
+                    and (now - _parse(release['requested_at'])).total_seconds() >= 60):
+                release.update(status='unknown', reported_at=_stamp(now), reason='worker_exited')
+                self._write(project_id, job)
             if (job.get('prepared') and job.get('autorun_enabled')
                     and job['status'] in {'running', 'gpu_available'} and worker_pid is None):
                 # A new child needs time to replace the Windows venv-launcher
@@ -399,6 +408,7 @@ class ColabService:
                 self._write(project_id, job)
             job['source_current'] = self.source_matches_prepared_bundle(project_id)
             job['can_attempt'] = bool(job.get('prepared') and job['source_current'] is not False and job['status'] in RETRY_STATUSES
+                and release.get('status') != 'pending'
                 and job.get('next_attempt_at') and _parse(job['next_attempt_at']) <= now)
             job['queue_only'] = job['status'] in RETRY_STATUSES
             job['rules_url'] = 'https://research.google.com/colaboratory/faq.html'
@@ -466,13 +476,26 @@ class ColabService:
         if type(timeout) is not int or not 1 <= timeout <= 3600:
             raise ValueError('Colab preflight_timeout_seconds must be between 1 and 3600')
         runtime = config.get('runtime_requirements', {})
-        if not isinstance(runtime, dict) or set(runtime) - {'framework', 'require_cuda', 'match_torchaudio'}:
+        runtime_keys = {'framework', 'require_cuda', 'match_torchaudio', 'torch_version', 'torchaudio_version'}
+        if not isinstance(runtime, dict) or set(runtime) - runtime_keys:
             raise ValueError('Invalid Colab runtime_requirements')
         if runtime.get('framework') not in (None, 'pytorch') or any(
                 key in runtime and type(runtime[key]) is not bool for key in ('require_cuda', 'match_torchaudio')):
             raise ValueError('Invalid Colab runtime_requirements')
         if runtime.get('framework') is None and (runtime.get('require_cuda') or runtime.get('match_torchaudio')):
             raise ValueError('A runtime framework is required for CUDA or TorchAudio checks')
+        for key in ('torch_version', 'torchaudio_version'):
+            if key not in runtime:
+                continue
+            version = runtime[key]
+            if runtime.get('framework') != 'pytorch' or not isinstance(version, str) or not FRAMEWORK_VERSION.fullmatch(version):
+                raise ValueError(f'Colab {key} requires PyTorch and an exact package version')
+            if runtime.get('require_cuda') and '+cu' not in version:
+                raise ValueError(f'Colab {key} must include its CUDA wheel tag when CUDA is required')
+        if 'torchaudio_version' in runtime and runtime.get('match_torchaudio') is not True:
+            raise ValueError('Colab torchaudio_version requires match_torchaudio=true')
+        if {'torch_version', 'torchaudio_version'} <= runtime.keys() and runtime['torch_version'] != runtime['torchaudio_version']:
+            raise ValueError('Colab Torch and TorchAudio must pin the same release and wheel variant')
         self._source_exclusions(generated)
         required = config.get('required_drive_paths', [])
         if not isinstance(required, list) or len(required) > 100:
@@ -648,6 +671,8 @@ class ColabService:
             job = self._read(project_id)
             if job['status'] in {'running', 'attempting', 'gpu_available'}:
                 raise ColabConflict('A Colab attempt or experiment is active; cancel before preparing again')
+            if (job.get('runtime_release') or {}).get('status') == 'pending':
+                raise ColabConflict('Wait for the current Colab runtime release observation before preparing again')
             project = self.db.get_project(project_id)
             generated = Path(project.workspace) / 'generated'
             directory = self._directory(project_id)
@@ -655,6 +680,7 @@ class ColabService:
             now = _stamp(_utc())
             previous_bundle_sha256 = job.get('bundle_sha256')
             previous_drive_root = job.get('drive_root')
+            previous_notebook_url = job.get('notebook_url', '')
             job.update(project_id=project_id, retry_min_minutes=request.retry_min_minutes,
                        retry_max_minutes=request.retry_max_minutes, drive_root=drive_root,
                        drive_project_dir=f'/content/drive/MyDrive/{drive_root}/{project_id}',
@@ -695,6 +721,9 @@ class ColabService:
                 # opening its old URL would ignore this newly prepared export.
                 job['notebook_url'] = ''
                 job['browser_url'] = ''
+            if changed_source or changed_drive_root or (url and url != previous_notebook_url):
+                job.pop('notebook_bundle_sha256', None)
+                job.pop('notebook_bound_at', None)
             keep_cooldown = previous_status in {'waiting_for_gpu', 'waiting_for_connection', 'disconnected'} and previous_next and _parse(previous_next) > _utc()
             job.update(prepared=True, status=previous_status if keep_cooldown else 'queued',
                        next_attempt_at=previous_next if keep_cooldown else now, lease_until=None,
@@ -702,6 +731,7 @@ class ColabService:
                        notebook_download_url=f'/api/projects/{project_id}/colab/notebook.ipynb',
                        bundle_url=f'/api/projects/{project_id}/colab/bundle.zip',
                        checkpoint_contract=config['checkpoint'], success_criteria=config.get('success_criteria'),
+                       runtime_requirements=config.get('runtime_requirements'),
                        **stats, **input_stats)
             job.pop('completion', None)
             job['data_upload_files'] = transfer['data_upload_files']
@@ -711,7 +741,8 @@ class ColabService:
                 # notebook after the project was prepared for a full campaign.
                 # Provider cooldowns remain independent of that source identity.
                 for key in ('recovery', 'authorization_continuation', 'runtime_id', 'runtime_started_at', 'running_at', 'finished_at',
-                            'last_connection_observation', 'ordinary_login', 'ordinary_login_recheck'):
+                            'last_connection_observation', 'ordinary_login', 'ordinary_login_recheck',
+                            'stage', 'stage_updated_at'):
                     job.pop(key, None)
                 job['last_observation'] = None
                 job['last_attempt_at'] = None
@@ -724,8 +755,10 @@ class ColabService:
             job = self.status(project_id)
             if not job['can_attempt']:
                 raise ColabConflict('Colab job is not due for an attempt')
+            now = _utc()
             job.update(status='attempting', attempt_count=job['attempt_count'] + 1,
-                       last_attempt_at=_stamp(_utc()), lease_until=_stamp(_utc() + timedelta(minutes=10)),
+                       last_attempt_at=_stamp(now), lease_until=_stamp(now + timedelta(minutes=10)),
+                       stage='opening_notebook', stage_updated_at=_stamp(now),
                        next_attempt_at=None, blocked_reason='')
             self._write(project_id, job)
             return self.status(project_id)
@@ -757,6 +790,51 @@ class ColabService:
             # This operation deliberately changes only the notebook metadata.
             return dict(job)
 
+    def record_stage(self, project_id: str, stage: str) -> dict[str, Any]:
+        with self._transaction(project_id):
+            job = self._read(project_id)
+            if job['status'] not in {'attempting', 'gpu_available', 'running'}:
+                raise ColabConflict('The Colab job is not executing a browser stage')
+            if job.get('stage') != stage:
+                job.update(stage=stage, stage_updated_at=_stamp(_utc()))
+                self._write(project_id, job)
+            return {'stage': stage, 'stage_updated_at': job.get('stage_updated_at')}
+
+    @staticmethod
+    def _pending_release(job: dict[str, Any], request: ColabObservationRequest, observed_at: str) -> dict[str, str] | None:
+        details = request.details
+        if (request.status not in {'completed', 'failed', 'disconnected'}
+                or details.get('runtime_release_requested') is not True or details.get('runtime_release_safe') is not True):
+            return None
+        runtime_id = details.get('runtime_id')
+        source = details.get('bundle_sha256')
+        if not runtime_id or runtime_id != job.get('runtime_id') or not source or source != job.get('bundle_sha256'):
+            return None
+        if source != job.get('notebook_bundle_sha256') or not job.get('notebook_url') or not job.get('autorun_enabled'):
+            return None
+        try:
+            if _parse(details.get('started_at')) != _parse(job.get('runtime_started_at')):
+                return None
+        except (TypeError, ValueError):
+            return None
+        return {'status': 'pending', 'runtime_id': runtime_id, 'bundle_sha256': source, 'requested_at': observed_at}
+
+    def record_runtime_release(self, project_id: str, request: ColabRuntimeReleaseRequest) -> dict[str, Any]:
+        with self._transaction(project_id):
+            job = self._read(project_id)
+            receipt = job.get('runtime_release') or {}
+            if (request.runtime_id != receipt.get('runtime_id') or request.bundle_sha256 != receipt.get('bundle_sha256')
+                    or request.runtime_id != job.get('runtime_id') or request.bundle_sha256 != job.get('bundle_sha256')):
+                raise ColabConflict('Runtime release confirmation does not match the current terminal observation')
+            if receipt.get('status') == request.status:
+                return dict(receipt)
+            if receipt.get('status') != 'pending':
+                raise ColabConflict('No Colab runtime release is pending')
+            receipt.update(status=request.status, reported_at=_stamp(_utc()))
+            self._write(project_id, job)
+            self.db.add_event(project_id, 'colab', 'Colab runtime release observed.', details=dict(receipt))
+            return dict(receipt)
+
     def observe(self, project_id: str, request: ColabObservationRequest) -> dict[str, Any]:
         serialized = json.dumps(request.details, ensure_ascii=False)
         if len(serialized) > 20_000:
@@ -778,6 +856,7 @@ class ColabService:
                     raise ColabConflict(str(exc)) from None
                 job['completion'] = completion
             observed_at = _stamp(_utc())
+            release = self._pending_release(job, request, observed_at)
             # A local browser/network failure must not replace a provider GPU
             # cooldown with a shorter connection retry, including after restart.
             provider_until = job.get('provider_retry_not_before')
@@ -801,6 +880,18 @@ class ColabService:
                         'network': 'waiting_for_connection', 'disconnected': 'disconnected',
                         'running': 'running', 'completed': 'completed', 'failed': 'failed'}
             job['status'] = statuses[request.status]
+            stage = None
+            if request.status == 'available' and job.get('stage') not in {'preparing_data', 'training'}:
+                stage = 'runtime_setup'
+            elif request.status == 'running':
+                stage = 'training'
+            elif request.status == 'auth':
+                stage = {'drive_consent': 'drive_authorization', 'google_sign_in': 'google_sign_in'}.get(
+                    request.details.get('auth_kind'), 'awaiting_action')
+            if stage and stage != job.get('stage'):
+                job.update(stage=stage, stage_updated_at=observed_at)
+            if release:
+                job['runtime_release'] = release
             if request.status in {'unavailable', 'quota', 'network', 'disconnected'}:
                 minimum = request.retry_after_minutes
                 if request.status=='quota':

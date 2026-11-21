@@ -52,6 +52,33 @@ Notebook 通过正常 Drive 挂载保存 `inputs/`、`checkpoints/`、`results/`
 Colab 断开时仍可能丢失最后一次 checkpoint 之后的训练进度。
 工作器通过当前 notebook 输出的运行 ID 和退出码判断结果，不把历史输出当成当前成功。
 全量上传前，notebook 会检查 Drive 写入和临时盘容量，并执行项目声明的预检命令。
+PyTorch 项目可以在 `runtime_requirements` 声明精确的 `torch_version` 和 `torchaudio_version`，并在
+`setup_commands` 安装对应的 wheel。预检在分配到的 GPU 上执行同步的 CUDA 运算，要求 TorchAudio
+时还会用合成音频运行重采样和 Kaldi FBank。版本、预检错误及当前阶段可在状态中查看。
+
+以下片段是 CUDA 12.6 的配套环境配置，可并入 `experiment_manifest.json` 的 `colab` 对象。
+
+```json
+{
+  "setup_commands": [
+    "python -m pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.9.1+cu126 torchvision==0.24.1+cu126 torchaudio==2.9.1+cu126"
+  ],
+  "runtime_requirements": {
+    "framework": "pytorch",
+    "require_cuda": true,
+    "match_torchaudio": true,
+    "torch_version": "2.9.1+cu126",
+    "torchaudio_version": "2.9.1+cu126"
+  }
+}
+```
+
+使用已绑定的 Drive notebook，并启用官方 Colab Notebook MCP 辅助进程时，工作器收到已安全
+保存的终态后，会通过 Colab 界面释放它自己启动并核验过的运行时。已有项目需要重新导出
+Notebook 才能使用新版预检和释放标记。
+结果先写入作业状态，释放回执独立保存。状态 `released` 表示界面已确认断开，`unknown` 表示需要
+核对 Colab 会话。重新接管的运行时、手工启动的运行时和未确认持久保存的失败会话由原会话管理。
+状态诊断会区分活跃会话占满和 GPU 用量限制，并保留 Colab 的重试等待。
 
 ChatGPT 使用 `get_colab_status` 查看登录、授权或排队状态，使用 `get_colab_resources`
 查看 Agent 的最近一次检测。完成后调用 `get_colab_experiment_result` 获取当前运行的指标，

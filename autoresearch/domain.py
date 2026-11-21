@@ -90,6 +90,19 @@ class ColabNotebookBindingRequest(BaseModel):
     bundle_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
 
 
+class ColabStageRequest(BaseModel):
+    stage: Literal[
+        "opening_notebook", "verifying_notebook", "loading_saved_notebook",
+        "requesting_gpu", "starting_notebook", "runtime_setup", "preparing_data",
+    ]
+
+
+class ColabRuntimeReleaseRequest(BaseModel):
+    runtime_id: str = Field(min_length=1, max_length=200)
+    bundle_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    status: Literal["released", "unknown"]
+
+
 class ColabBrowserLaunchRequest(BaseModel):
     browser: Literal["auto", "chrome", "edge"] = "auto"
 

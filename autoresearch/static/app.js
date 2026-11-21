@@ -340,6 +340,25 @@ function renderColab() {
     : "Code changed / 准备版本已过期";
   const lines = [];
   if (!currentSource) lines.push("项目代码已更新，已准备的 Notebook 对应此前版本。");
+  const stageLabels = {
+    opening_notebook: "打开 Notebook", verifying_notebook: "校验并保存 Notebook", loading_saved_notebook: "打开已保存的 Notebook",
+    requesting_gpu: "申请免费 GPU", starting_notebook: "启动 Notebook", runtime_setup: "安装依赖和运行时预检",
+    preparing_data: "准备实验数据", training: "训练与评测", drive_authorization: "等待 Drive 授权",
+    google_sign_in: "等待 Google 登录", awaiting_action: "等待浏览器操作"
+  };
+  if (stageLabels[job.stage]) lines.push(`阶段 · ${stageLabels[job.stage]}`);
+  const diagnostics = job.diagnostics || {};
+  const providerReasons = {session_capacity: "Colab 活跃会话已满", usage_quota: "Colab GPU 用量达到限制"};
+  if (providerReasons[diagnostics.provider_reason]) lines.push(providerReasons[diagnostics.provider_reason]);
+  const requirements = job.runtime_requirements || {};
+  for (const [name, key] of [["PyTorch", "torch_version"], ["TorchAudio", "torchaudio_version"]]) {
+    if (diagnostics[key] || requirements[key]) {
+      lines.push(`${name} · ${diagnostics[key] || "待检测"}${requirements[key] ? ` / 要求 ${requirements[key]}` : ""}`);
+    }
+  }
+  if (diagnostics.preflight_error) lines.push(diagnostics.preflight_error);
+  const releaseLabels = {pending: "正在确认 GPU 会话释放", released: "已确认释放 GPU 会话", unknown: "GPU 会话释放待核查"};
+  if (releaseLabels[job.runtime_release?.status]) lines.push(releaseLabels[job.runtime_release.status]);
   if (currentSource && job.status === "completed" && completed.completion_kind === "acceptance_passed") lines.push("断线续训功能验收通过，正式实验待完成。");
   if (currentSource && job.status === "completed") {
     for (const [name, value] of Object.entries(completed.metrics || {})) {

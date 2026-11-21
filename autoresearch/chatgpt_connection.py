@@ -184,14 +184,15 @@ def _tunnel_health() -> tuple[bool, bool]:
         ):
             try:
                 response = client.get(f"http://127.0.0.1:8080/{endpoint}")
-                payload = response.json()
-                checks.append(
-                    response.status_code == 200
-                    and isinstance(payload, dict)
-                    and payload.get("status") in expected
-                )
-            except (httpx.HTTPError, ValueError, TypeError):
+            except httpx.HTTPError:
                 checks.append(False)
+                continue
+            try:
+                payload = response.json()
+                status = payload.get("status") if isinstance(payload, dict) else None
+            except ValueError:
+                status = response.text.strip()
+            checks.append(response.status_code == 200 and isinstance(status, str) and status in expected)
     return checks[0], checks[1]
 
 

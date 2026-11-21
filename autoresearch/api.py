@@ -27,6 +27,8 @@ from .domain import (
     ColabNotebookBindingRequest,
     ColabObservationRequest,
     ColabPrepareRequest,
+    ColabRuntimeReleaseRequest,
+    ColabStageRequest,
     ExperimentStartRequest,
     GitSyncRequest,
     ResearchNoteRequest,
@@ -345,7 +347,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/projects/{project_id}/colab")
     async def get_colab_status(project_id: str) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(state.colab.status, project_id)
+            job = await asyncio.to_thread(state.colab.status, project_id)
+            return {**job, "diagnostics": state.chatgpt._colab_diagnostics(job)}
         except (LookupError, ValueError, OSError) as exc:
             raise colab_error(exc) from exc
 
@@ -386,6 +389,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             return await asyncio.to_thread(state.colab.bind_notebook,project_id,request)
         except (LookupError,ValueError,OSError) as exc:
+            raise colab_error(exc) from exc
+
+    @app.post("/api/projects/{project_id}/colab/stage")
+    async def record_colab_stage(project_id: str, request: ColabStageRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(state.colab.record_stage, project_id, request.stage)
+        except (LookupError, ValueError, OSError) as exc:
+            raise colab_error(exc) from exc
+
+    @app.post("/api/projects/{project_id}/colab/runtime-release")
+    async def record_colab_runtime_release(project_id: str, request: ColabRuntimeReleaseRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(state.colab.record_runtime_release, project_id, request)
+        except (LookupError, ValueError, OSError) as exc:
             raise colab_error(exc) from exc
 
     @app.post("/api/projects/{project_id}/colab/resume")

@@ -140,6 +140,20 @@ test('Colab waiting state displays a retry deadline without claiming GPU allocat
   assert.equal(app.nodes.get('downloadColabNotebook').href, '/api/projects/sample-project/colab/notebook.ipynb');
 });
 
+test('Colab shows the runtime phase, environment mismatch and release confirmation', () => {
+  const app = ui();
+  vm.runInContext(`state.current = {id: 'sample-project'};
+    state.colab = {prepared: true, status: 'failed', stage: 'runtime_setup', runtime_release: {status: 'released'},
+      runtime_requirements: {torch_version: '2.9.1+cu126'},
+      diagnostics: {torch_version: '2.14.1+cu130', preflight_error: 'Exact PyTorch version differs'}};
+    renderColab();`, app.context);
+  const details = app.nodes.get('colabDetails').textContent;
+  assert.match(details, /安装依赖和运行时预检/);
+  assert.match(details, /2\.14\.1\+cu130 \/ 要求 2\.9\.1\+cu126/);
+  assert.match(details, /Exact PyTorch version differs/);
+  assert.match(details, /已确认释放 GPU 会话/);
+});
+
 test('Colab authorization is displayed as status without a dashboard action', async () => {
   const calls = [];
   const app = ui(async (url, options) => {

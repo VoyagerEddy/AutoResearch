@@ -233,8 +233,12 @@ class ChatGPTBridge:
             "full_experiment_complete": kind == "campaign_complete",
             "acceptance_complete": kind == "acceptance_passed",
             "scientific_metrics_produced": bool(completion and completion.get("scientific_metrics_produced")),
-            "research_effect_validated": False,
+            "research_effect_validated": bool(completion and completion.get("research_effect_validated")),
             "metrics": completion.get("metrics", {}) if completion else {},
+            "paired_seeds": completion.get("paired_seeds", {}) if completion else {},
+            "stage": job.get("stage"),
+            "runtime_release": job.get("runtime_release"),
+            "diagnostics": self._colab_diagnostics(job),
             "completion_kind": kind,
             "returncode": details.get("returncode") if current_runtime else None,
             "log_tail": log_tail,
@@ -276,10 +280,12 @@ class ChatGPTBridge:
                   "worker_running", "created_at", "updated_at", "running_at", "finished_at",
                   "runtime_id", "bundle_sha256", "source_current", "source_file_count", "source_bytes",
                   "input_bundle_bytes", "drive_project_dir", "success_criteria", "source_manifest_sha256",
-                  "notebook_download_url", "bundle_url", "input_bundle_url")
+                  "notebook_download_url", "bundle_url", "input_bundle_url", "stage", "stage_updated_at",
+                  "runtime_release", "runtime_requirements")
         public = {key: job[key] for key in fields if key in job}
         public["blocked_reason"] = cls._public_text(str(job.get("blocked_reason") or ""))
         public["action_required"] = job.get("status") == "auth_required"
+        public["diagnostics"] = cls._colab_diagnostics(job)
         for key in ("notebook_url", "browser_url"):
             if isinstance(job.get(key), str):
                 public[key] = cls._public_url(job[key])
@@ -295,10 +301,37 @@ class ChatGPTBridge:
             public["checkpoint_contract"] = {key: contract[key] for key in ("directory", "interval_seconds", "resume_supported", "full_training_state", "files") if key in contract}
         return public
 
+    @classmethod
+    def _colab_diagnostics(cls, job: dict[str, Any]) -> dict[str, Any]:
+        details = (job.get("last_observation") or {}).get("details") or {}
+        diagnostics = {}
+        reason = details.get("provider_reason")
+        if reason in ("session_capacity", "usage_quota"):
+            diagnostics["provider_reason"] = reason
+        preflight = details.get("preflight")
+        if isinstance(preflight, dict):
+            if preflight.get("status") in ("checking", "passed", "failed"):
+                diagnostics["preflight_status"] = preflight["status"]
+            if isinstance(preflight.get("reason"), str):
+                diagnostics["preflight_error"] = cls._public_text(preflight["reason"][:500])
+            framework = preflight.get("framework")
+            if isinstance(framework, dict):
+                for key in ("torch_version", "torchaudio_version"):
+                    value = framework.get(key)
+                    if isinstance(value, str) and re.fullmatch(r"[0-9A-Za-z.+_-]{1,64}", value):
+                        diagnostics[key] = value
+                for key in ("cuda_smoke", "torchaudio_smoke"):
+                    probe = framework.get(key)
+                    if isinstance(probe, dict) and probe.get("status") in ("passed", "failed"):
+                        diagnostics[key] = probe["status"]
+        return diagnostics
+
     @staticmethod
     def _colab_next_action(job: dict[str, Any]) -> dict[str, Any]:
         status = job.get("status")
-        if not job.get("prepared") or status in {"not_prepared", "blocked", "cancelled", "failed"}:
+        if (job.get("runtime_release") or {}).get("status") == "pending":
+            action, message = "observe_runtime_release", "The worker is verifying release of the completed or safely stopped Colab runtime."
+        elif not job.get("prepared") or status in {"not_prepared", "blocked", "cancelled", "failed"}:
             action, message = "prepare_experiment", "Review the manifest, code, inputs and failure evidence, then prepare the Colab notebook."
         elif job.get("source_current") is False:
             action, message = "prepare_experiment", "Code changed after this notebook was prepared; prepare a new source snapshot before executing or using results."

@@ -7,8 +7,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Awaitable, Callable, Iterator, Mapping
 from urllib.parse import parse_qs, urlparse, urlunparse
+from uuid import UUID
 
 import httpx
 
@@ -31,6 +32,14 @@ DATA_READY_PREFIX = 'AUTORESEARCH_COLAB_DATA_READY '
 INPUTS_PREFIX = "AUTORESEARCH_COLAB_UPLOAD_INPUTS "
 INPUTS_READY_PREFIX = 'AUTORESEARCH_COLAB_INPUTS_READY '
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+_DISCONNECTED_LABELS = (
+    "Connect", "Reconnect", "Disconnected", "Reconnect to runtime", "Connect to a hosted runtime",
+    "Connect to a new runtime", "Connect Connect to a new runtime", "Connect T4 Connect to a new runtime",
+    "连接", "重新连接", "已断开连接", "连接到托管运行时", "连接到代码执行程序",
+)
+_DELETE_RUNTIME = r"Disconnect and delete runtime[.…]*"
+_CONFIRM_DELETE_RUNTIME = r"(?:Disconnect and delete runtime\??|Delete runtime\??|Are you sure you want to disconnect and delete (?:the |this )?runtime\?)"
+_GPU_EVIDENCE = re.compile(r"[A-Za-z0-9 ._()/+-]{1,120},\s*[1-9]\d*(?:\.\d+)?\s*(?:MiB|GiB|MB|GB)")
 _UI_CONTROLS = (
     'button, a[href], select, input[type="radio"], input[type="text"], input[type="search"], [role="textbox"], [role="button"], '
     '[role="menuitem"], [role="tab"], [role="radio"], '
@@ -53,6 +62,7 @@ _GOOGLE_INSECURE_BROWSER_TEXT = (
     "这个浏览器或应用可能不安全",
     "此瀏覽器或應用程式可能不安全",
 )
+_SESSION_CAPACITY_PATTERN = re.compile(r"\btoo many (?:active )?sessions\b|活动会话过多|活跃会话过多")
 _QUOTA_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # A GPU advisory also mentions usage limits. Only an actual connection
     # denial or a reached/exceeded limit establishes a quota failure.
@@ -60,7 +70,6 @@ _QUOTA_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"\busage limits? in colab[.!:;\s]+(?:you\s+)?(?:cannot|can't|can’t|unable to)\s+(?:currently\s+)?connect\s+to\s+(?:a\s+)?gpu\b",
     r"\b(?:gpu\s+)?usage limits?\s+(?:(?:has|have) been\s+)?(?:reached|exceeded)\b",
     r"\b(?:you have|you've|you’ve)\s+(?:reached|exceeded)\s+(?:your|the)\s+(?:gpu\s+)?(?:usage|session) limits?\b",
-    r"\btoo many (?:active )?sessions\b",
     r"已(?:经)?(?:达到|超出)(?:您(?:的)?|你的)?使用(?:量)?(?:限制|限额)",
     r"(?:您|你)?(?:目前|当前)?无法连接到\s*gpu[^。.!?]{0,80}(?:原因是|由于)[^。.!?]{0,40}使用(?:量)?(?:限制|限额)",
 ))
@@ -328,7 +337,7 @@ def classify_colab_page(url: str, visible_text: str) -> str | None:
     text = re.sub(r"\s+", " ", visible_text.casefold())
     if classify_colab_authorization(url, visible_text):
         return "auth"
-    if any(pattern.search(text) for pattern in _QUOTA_PATTERNS):
+    if _SESSION_CAPACITY_PATTERN.search(text) or any(pattern.search(text) for pattern in _QUOTA_PATTERNS):
         return "quota"
     if any(x in text for x in _UNAVAILABLE_TEXT):
         return "unavailable"
@@ -467,6 +476,65 @@ def marker_is_current(marker: Mapping[str, Any], attempt_started: datetime) -> b
         return False
 
 
+@dataclass(slots=True)
+class OwnedRuntimeLaunch:
+    """In-memory proof of a worker's own Run all on a disconnected notebook."""
+
+    page: Any
+    project_id: str
+    notebook_url: str
+    bundle_sha256: str
+    action_started_at: datetime
+    navigated: bool = False
+
+    def on_navigation(self, frame: Any) -> None:
+        if frame is self.page.main_frame:
+            self.navigated = True
+
+    def matches_page(self, page: Any) -> bool:
+        if self.navigated or page is not self.page or page.is_closed():
+            return False
+        try:
+            current = urlparse(validate_colab_url(page.url))._replace(query="", fragment="").geturl()
+        except ValueError:
+            return False
+        return current == self.notebook_url
+
+    def matches_job(self, job: Mapping[str, Any]) -> bool:
+        return (
+            job.get("prepared") is True and job.get("source_current") is True
+            and job.get("project_id") == self.project_id and job.get("notebook_url") == self.notebook_url
+            and job.get("bundle_sha256") == job.get("notebook_bundle_sha256") == self.bundle_sha256
+        )
+
+    def confirms_terminal(self, markers: list[dict[str, Any]], terminal: Mapping[str, Any]) -> bool:
+        runtime_id = terminal.get("runtime_id")
+        started_at = terminal.get("started_at")
+        if terminal.get("runtime_release_safe") is not True:
+            return False
+        try:
+            if not isinstance(runtime_id, str) or str(UUID(runtime_id)) != runtime_id:
+                return False
+            started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if started.tzinfo is None or not (
+            self.action_started_at - timedelta(seconds=5) <= started
+            <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        ):
+            return False
+        starts = [item for item in markers if item.get("status") == "starting"]
+        if not starts or (starts[-1].get("runtime_id"), starts[-1].get("started_at")) != (runtime_id, started_at):
+            return False
+        current = [item for item in markers if item.get("runtime_id") == runtime_id and item.get("started_at") == started_at]
+        last = current[-1]
+        return (
+            last.get("status") == terminal.get("status") and last.get("runtime_release_safe") is True
+            and any(item.get("status") == "available" and _GPU_EVIDENCE.fullmatch(str(item.get("gpu", "")).strip())
+                    for item in current)
+        )
+
+
 def input_bundle_markers(text: str, prefix: str, project_id: str, runtime_id: str) -> Iterator[dict[str, Any]]:
     for line in text.splitlines():
         line = line.strip()
@@ -534,6 +602,18 @@ class ColabJobClient:
             'notebook_url':notebook_url,'bundle_sha256':bundle_sha256})
         response.raise_for_status()
         return response.json()
+
+    async def record_stage(self, stage: str) -> None:
+        response = await self.client.post(f"{self.path}/stage", json={"stage": stage})
+        # A legacy service or a job that has just stopped cannot accept a new stage.
+        if response.status_code not in {404, 409}:
+            response.raise_for_status()
+
+    async def runtime_release(self, *, runtime_id: str, bundle_sha256: str, status: str) -> None:
+        response = await self.client.post(f"{self.path}/runtime-release", json={
+            "runtime_id": runtime_id, "bundle_sha256": bundle_sha256, "status": status,
+        })
+        response.raise_for_status()
 
     async def observe(self, status: str, *, retry_after_minutes: int | None = None, **details: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {"status": status, "details": details}
@@ -1464,16 +1544,119 @@ class ColabBrowserSession:
             raise ManualColabAction("Select Runtime > Run all in the visible notebook")
 
     async def has_disconnected_runtime_control(self) -> bool:
-        labels = {control_label(value) for value in (
-            "Connect", "Reconnect", "Disconnected", "Reconnect to runtime", "Connect to a hosted runtime",
-            "Connect T4 Connect to a new runtime",
-            "连接", "重新连接", "已断开连接", "连接到托管运行时", "连接到代码执行程序",
-        )}
+        labels = {control_label(value) for value in _DISCONNECTED_LABELS}
         matched = [
             item for item in await self.controls() if
             item["role"] in {"button", "combobox"} and control_label(re.sub(r'\s+',' ',item["name"])) in labels
         ]
         return len(matched) == 1
+
+    async def _visible_role_matches(self, scope: Any, roles: tuple[str, ...], name: str | None = None) -> list[Any]:
+        options = {} if name is None else {"name": re.compile(rf"^(?:{name})$", re.IGNORECASE)}
+        matches = []
+        for role in roles:
+            for control in await scope.get_by_role(role, **options).all():
+                if await control.is_visible():
+                    matches.append(control)
+        return matches
+
+    async def _main_notebook_is_disconnected(self, page: Any) -> bool:
+        labels = "|".join(re.escape(label) for label in _DISCONNECTED_LABELS)
+        controls = await self._visible_role_matches(page, ("button", "combobox"), labels)
+        return len(controls) == 1 and not await controls[0].is_disabled()
+
+    async def arm_runtime_release(self, job: Mapping[str, Any]) -> OwnedRuntimeLaunch | None:
+        """Track a future allocation only when the bound tab is disconnected."""
+        url = job.get("notebook_url")
+        digest = job.get("bundle_sha256")
+        project_id = job.get("project_id")
+        if (self._notebook_mcp is None or not self._notebook_mcp.status().get("connected")
+                or not isinstance(project_id, str) or not isinstance(digest, str)
+                or not isinstance(url, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                or not re.fullmatch(r"https://colab\.research\.google\.com/drive/[A-Za-z0-9_-]{1,200}", url)):
+            return None
+        launch = OwnedRuntimeLaunch(self.page, project_id, url, digest, datetime.now(timezone.utc))
+        if not launch.matches_job(job) or not launch.matches_page(self.page):
+            return None
+        try:
+            if (await self._visible_role_matches(launch.page, ("dialog", "alertdialog"))
+                    or not await self._main_notebook_is_disconnected(launch.page) or not launch.matches_page(self.page)):
+                return None
+        except Exception as exc:
+            if is_browser_closed_error(exc):
+                raise
+            return None
+        launch.page.on("framenavigated", launch.on_navigation)
+        return launch
+
+    async def _verify_owned_terminal(self, launch: OwnedRuntimeLaunch, job: Mapping[str, Any],
+                                     terminal: Mapping[str, Any]) -> bool:
+        bridge = self._notebook_mcp
+        if bridge is None or not bridge.status().get("connected") or not launch.matches_page(self.page):
+            return False
+        response = await bridge.request("call_tool", name="get_cells", arguments={"includeOutputs": True}, timeout=15)
+        if not mcp_cells_match(mcp_notebook_cells(response), prepared_notebook_cells(job)):
+            return False
+        await self.ensure_mcp_registered_notebook(response)
+        markers = parse_status_markers(mcp_stream_output_text(response), launch.project_id)
+        return launch.matches_page(self.page) and launch.confirms_terminal(markers, terminal)
+
+    async def release_owned_runtime(self, launch: OwnedRuntimeLaunch, job: Mapping[str, Any],
+                                    terminal: Mapping[str, Any], may_release: Callable[[], Awaitable[bool]],
+                                    *, timeout_seconds: float = 8) -> str:
+        """Use only the current notebook's Runtime menu after durable terminal proof."""
+        page = launch.page
+        dialog_roles = ("dialog", "alertdialog")
+        if (not launch.matches_job(job) or not await self._verify_owned_terminal(launch, job, terminal)
+                or await self._main_notebook_is_disconnected(page)
+                or await self._visible_role_matches(page, dialog_roles)):
+            return "unknown"
+        menu = await self._visible_role_matches(page, ("button", "menuitem"), r"Runtime")
+        if len(menu) != 1 or await menu[0].is_disabled() or not launch.matches_page(self.page):
+            return "unknown"
+        await menu[0].click(timeout=3_000)
+        open_menus = await self._visible_role_matches(page, ("menu",))
+        if len(open_menus) > 1:
+            return "unknown"
+        action = (await self._visible_role_matches(open_menus[0], ("menuitem", "button"), _DELETE_RUNTIME)
+                  if open_menus else await self._visible_role_matches(page, ("menuitem",), _DELETE_RUNTIME))
+        if (len(action) != 1 or await action[0].is_disabled()
+                or not await may_release() or not launch.matches_page(self.page)):
+            return "unknown"
+        await action[0].click(timeout=3_000)
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while launch.matches_page(self.page):
+            dialogs = await self._visible_role_matches(page, dialog_roles)
+            if dialogs or asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.2)
+        else:
+            return "unknown"
+        if len(dialogs) != 1 or not await self._verify_owned_terminal(launch, job, terminal) or not await may_release():
+            return "unknown"
+        dialogs = await self._visible_role_matches(page, dialog_roles)
+        if len(dialogs) != 1:
+            return "unknown"
+        known = await self._visible_role_matches(page, dialog_roles, _CONFIRM_DELETE_RUNTIME)
+        scope = known[0] if len(known) == 1 else dialogs[0]
+        if not known:
+            known = await self._visible_role_matches(scope, ("heading",), _CONFIRM_DELETE_RUNTIME)
+        if len(known) != 1 or not launch.matches_page(self.page):
+            return "unknown"
+        confirm = await self._visible_role_matches(scope, ("button",), r"Yes|OK|Delete runtime|Disconnect and delete(?: runtime)?")
+        if len(confirm) != 1 or await confirm[0].is_disabled() or not launch.matches_page(self.page):
+            return "unknown"
+        await confirm[0].click(timeout=3_000)
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while launch.matches_page(self.page):
+            if not await self._visible_role_matches(page, dialog_roles) and await self._main_notebook_is_disconnected(page):
+                return "released"
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.2)
+        return "unknown"
 
     async def upload_source_bundle(self, bundle_path: Path) -> bool:
         bundle_path = bundle_path.resolve(strict=True)
@@ -1537,6 +1720,70 @@ class ColabBrowserWorker:
         self._continuation_task: asyncio.Task[Any] | None = None
         self._input_submission: dict[str,Any] | None = None
         self._data_submissions: dict[tuple[str,str,str],dict[str,Any]] = {}
+        self._owned_launch: OwnedRuntimeLaunch | None = None
+        self._reported_stage: str | None = None
+
+    def _forget_owned_launch(self) -> None:
+        if self._owned_launch is not None:
+            launch, self._owned_launch = self._owned_launch, None
+            launch.page.remove_listener("framenavigated", launch.on_navigation)
+
+    async def _record_runtime_terminal(self, status: str, reason: str, job: Mapping[str, Any],
+                                       marker: Mapping[str, Any], markers: list[dict[str, Any]],
+                                       details: dict[str, Any]) -> None:
+        launch = self._owned_launch
+        may_request = (
+            launch is not None and launch.project_id == self.client.project_id
+            and launch.matches_job(job) and launch.matches_page(self.browser.page)
+            and self.runtime_id == marker.get("runtime_id") and status == marker.get("status")
+            and launch.confirms_terminal(markers, marker)
+        )
+        details = {key: value for key, value in details.items() if key not in {"runtime_release_requested", "bundle_sha256"}}
+        if may_request:
+            details = {**details, "runtime_release_requested": True, "bundle_sha256": launch.bundle_sha256}
+        try:
+            persisted = await self._observation(status, reason, **details)
+            if not may_request:
+                return
+            runtime_id = marker["runtime_id"]
+
+            def pending(state: Mapping[str, Any]) -> bool:
+                receipt = state.get("runtime_release")
+                return (
+                    isinstance(receipt, dict) and receipt.get("status") == "pending"
+                    and receipt.get("runtime_id") == runtime_id and receipt.get("bundle_sha256") == launch.bundle_sha256
+                    and launch.matches_job(state)
+                )
+
+            if not pending(persisted):
+                return
+
+            async def may_release() -> bool:
+                return pending(await self.client.status())
+
+            try:
+                outcome = await self.browser.release_owned_runtime(launch, job, marker, may_release)
+            except Exception as exc:
+                self.log("Owned Colab runtime release could not be verified (" + type(exc).__name__ + ")")
+                outcome = "unknown"
+            try:
+                await self.client.runtime_release(runtime_id=runtime_id, bundle_sha256=launch.bundle_sha256, status=outcome)
+            except Exception as exc:
+                self.log("Could not save the Colab runtime release receipt (" + type(exc).__name__ + ")")
+        finally:
+            self._forget_owned_launch()
+
+    async def _record_stage(self, stage: str) -> None:
+        if stage == self._reported_stage:
+            return
+        record_stage = getattr(self.client, 'record_stage', None)
+        if record_stage is not None:
+            try:
+                await record_stage(stage)
+            except httpx.HTTPError:
+                self.log('Could not report Colab browser stage: ' + stage)
+                return
+        self._reported_stage = stage
 
     async def _tick_authorization_continuation(self, job: Mapping[str,Any]) -> None:
         state = self._authorization_continuation
@@ -1628,13 +1875,13 @@ class ColabBrowserWorker:
     def log(self, message: str) -> None:
         print(f"{datetime.now(timezone.utc).isoformat()} {message}", flush=True)
 
-    async def _observation(self, status: str, reason: str = "", *, retry_after_minutes: int | None = None, **details: Any) -> None:
+    async def _observation(self, status: str, reason: str = "", *, retry_after_minutes: int | None = None, **details: Any) -> dict[str, Any]:
         self.log(f"Colab observation: {status}: {reason}")
         try:
             details["browser_url"] = public_colab_url(self.browser.page.url)
         except ValueError:
             pass
-        await self.client.observe(status, reason=reason, retry_after_minutes=retry_after_minutes, **details)
+        return await self.client.observe(status, reason=reason, retry_after_minutes=retry_after_minutes, **details)
 
     async def _provider_observation(self, status: str, text: str) -> None:
         cooldown = provider_cooldown_minutes(text)
@@ -1651,6 +1898,12 @@ class ColabBrowserWorker:
             # wording without private authentication or account details.
             details["provider_ui_text"] = sanitize_provider_ui_text(text)
         reason = "Colab displayed a provider message"
+        if status == 'quota':
+            normalized = re.sub(r'\s+', ' ', text.casefold())
+            capacity = _SESSION_CAPACITY_PATTERN.search(normalized) is not None
+            details['provider_reason'] = 'session_capacity' if capacity else 'usage_quota'
+            reason = ('Colab reports too many active sessions' if capacity
+                      else 'Colab reports a GPU usage limit')
         if status == "auth":
             kind = classify_colab_authorization(self.browser.page.url, text) or "authorization"
             reason = colab_authorization_reason(kind)
@@ -1870,6 +2123,7 @@ class ColabBrowserWorker:
             if self._continuation_task is not None:
                 self._continuation_task.cancel()
                 await asyncio.gather(self._continuation_task,return_exceptions=True)
+            self._forget_owned_launch()
 
     async def _run(self) -> None:
         initial = await self.client.status()
@@ -1964,7 +2218,9 @@ class ColabBrowserWorker:
                     await self._monitor(job)
                     await asyncio.sleep(self.browser.options.poll_seconds)
                     continue
+                self._forget_owned_launch()
                 self.attempt_started = datetime.now(timezone.utc)
+                self._reported_stage = None
                 self.runtime_id = None
                 self.running_reported = False
                 self.available_reported = False
@@ -1982,6 +2238,7 @@ class ColabBrowserWorker:
                 self._disconnect_seen_at = None
                 stage = "opening or importing the notebook"
                 try:
+                    await self._record_stage('opening_notebook')
                     await self.browser.open_notebook(job)
                     text = await self.browser.visible_text()
                     page_status = classify_colab_page(self.browser.page.url, text)
@@ -1989,6 +2246,7 @@ class ColabBrowserWorker:
                         await self._provider_observation(page_status, text)
                         continue
                     stage = "verifying and saving the notebook"
+                    await self._record_stage('verifying_notebook')
                     await self.browser.ensure_prepared_notebook(job)
                     saved_url = await self.browser.save_prepared_notebook(job)
                     await self.client.bind_notebook(notebook_url=saved_url,bundle_sha256=str(job['bundle_sha256']))
@@ -1997,6 +2255,7 @@ class ColabBrowserWorker:
                     # A Drive copy is a different notebook. Reconnect and verify
                     # its exact source/native cell ownership before allocation.
                     stage = "opening the saved notebook"
+                    await self._record_stage('loading_saved_notebook')
                     await self.browser.open_notebook(job)
                     await self.browser.ensure_prepared_notebook(job)
                     previous_output = await self.browser.output_text()
@@ -2004,14 +2263,22 @@ class ColabBrowserWorker:
                         item["runtime_id"] for item in parse_status_markers(previous_output, self.client.project_id)
                     }
                     stage = "selecting a free GPU in Colab"
+                    await self._record_stage('requesting_gpu')
+                    if job.get("project_id") == self.client.project_id and job.get("source_current") is True:
+                        self._owned_launch = await self.browser.arm_runtime_release(job)
                     await self.browser.select_free_gpu()
                     stage = "starting the notebook"
+                    await self._record_stage('starting_notebook')
+                    if self._owned_launch is not None:
+                        self._owned_launch.action_started_at = datetime.now(timezone.utc)
                     await self.browser.run_all()
                     self.log("Requested Run all through the standard Colab interface; waiting for actual notebook output")
                 except ManualColabAction as exc:
+                    self._forget_owned_launch()
                     await self._manual_observation(str(exc))
                     continue
                 except Exception as exc:
+                    self._forget_owned_launch()
                     if is_browser_closed_error(exc):
                         raise
                     await self._observation("network", safe_local_error_reason(exc, f"Colab connection failed while {stage}"))
@@ -2096,6 +2363,8 @@ class ColabBrowserWorker:
                 self.runtime_id = marker["runtime_id"]
             if marker["runtime_id"] != self.runtime_id:
                 continue
+            if marker_status == 'starting' and marker.get('phase') == 'preparing_data' and not self.running_reported:
+                await self._record_stage('preparing_data')
             if marker_status == "available" and not self.available_reported:
                 await self._observation("available", "Notebook verified a usable CUDA GPU", **marker_details)
                 self.available_reported = True
@@ -2117,7 +2386,8 @@ class ColabBrowserWorker:
                 self.attempt_started = None
                 return
             if marker_status == "disconnected":
-                await self._observation("disconnected", "Experiment saved its checkpoint at the configured session budget", **marker_details)
+                await self._record_runtime_terminal("disconnected", "Experiment saved its checkpoint at the configured session budget",
+                                                    job, marker, markers, marker_details)
                 self.attempt_started = None
                 self.runtime_id = None
                 return
@@ -2129,14 +2399,17 @@ class ColabBrowserWorker:
                 await self._observation("running", "The experiment subprocess started", **marker_details)
                 self.running_reported = True
             if marker_status == "failed":
-                await self._observation("failed", "Notebook execution failed; inspect Drive results and saved checkpoints", **marker_details)
+                await self._record_runtime_terminal("failed", "Notebook execution failed; inspect Drive results and saved checkpoints",
+                                                    job, marker, markers, marker_details)
                 self.attempt_started = None
                 return
             if marker_status == "completed":
                 if marker.get("returncode") != 0 or not self.running_reported:
-                    await self._observation("failed", "Invalid completion marker; successful execution was not established", **marker_details)
+                    await self._record_runtime_terminal("failed", "Invalid completion marker; successful execution was not established",
+                                                        job, marker, markers, marker_details)
                 else:
-                    await self._observation("completed", "Notebook reported experiment exit code 0", **marker_details)
+                    await self._record_runtime_terminal("completed", "Notebook reported experiment exit code 0",
+                                                        job, marker, markers, marker_details)
                 self.attempt_started = None
                 return
         if self.runtime_id and DATA_UPLOAD_PREFIX in outputs:
@@ -2144,6 +2417,8 @@ class ColabBrowserWorker:
 
             current_requests=[item for item in parse_data_upload_requests(outputs,self.client.project_id)
                               if item['runtime_id']==self.runtime_id]
+            if current_requests and not self.running_reported:
+                await self._record_stage('preparing_data')
             for request in current_requests[-1:]:
                 if request['runtime_id'] != self.runtime_id:
                     continue

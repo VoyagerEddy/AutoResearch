@@ -15,6 +15,7 @@ import uuid
 import pytest
 
 from autoresearch.colab_notebook import build_notebook
+from autoresearch.services.colab_data import validate_scientific_result
 
 
 def notebook_cells(config):
@@ -204,23 +205,97 @@ def test_explicit_pytorch_contract_fails_before_project_execution(tmp_path, monk
     monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('Incompatible framework executed a child'))
     with pytest.raises(RuntimeError, match='versions must match' if failure == 'version' else 'No actual CUDA GPU'):
         exec(gate_source(config), namespace)
-    assert events[-1]['status'] == 'failed'
+    failed = events[-1]
+    assert failed['status'] == 'failed' and failed['runtime_release_safe'] is True
+    assert json.loads(Path(failed['preflight_path']).read_text(encoding='utf-8')) == failed['preflight']
 
 
-def test_explicit_pytorch_contract_records_verified_device_and_versions(tmp_path, monkeypatch):
-    config = {'runtime_requirements': {'framework': 'pytorch', 'require_cuda': True, 'match_torchaudio': True}}
-    namespace, events = context(tmp_path, config, monkeypatch)
-    fake_torch = SimpleNamespace(__version__='2.6.0+cu124', cuda=SimpleNamespace(
-        is_available=lambda: True, get_device_name=lambda index: 'fixture GPU',
-        get_device_properties=lambda index: SimpleNamespace(total_memory=12345)))
-    fake_audio = SimpleNamespace(__version__='2.6.0+cu124')
+def install_framework_fixture(monkeypatch, *, audio_version='2.9.1+cu126', cuda_result=None, audio_shape=(8, 80)):
+    calls = []
+
+    class Tensor:
+        def __init__(self, shape, values=None):
+            self.shape = shape
+            self.values = values
+
+        def __matmul__(self, other):
+            assert self.shape == other.shape == (2, 2)
+            calls.append('cuda matmul')
+            return Tensor((2, 2), cuda_result or [[7.0, 10.0], [15.0, 22.0]])
+
+        def __mul__(self, value):
+            return self
+
+        def unsqueeze(self, axis):
+            assert axis == 0
+            return Tensor((1, *self.shape))
+
+        def tolist(self):
+            return self.values
+
+    def cuda_tensor(value, *, device, dtype):
+        assert device == 'cuda:0' and dtype == 'float32'
+        return Tensor((2, 2))
+
+    def resample(waveform, old_rate, new_rate):
+        assert waveform.shape == (1, 800) and (old_rate, new_rate) == (8000, 16000)
+        calls.append('resample')
+        return Tensor((1, 1600))
+
+    def fbank(waveform, **kwargs):
+        assert waveform.shape == (1, 1600) and kwargs['window_type'] == 'hamming'
+        assert kwargs['sample_frequency'] == 16000 and kwargs['num_mel_bins'] == 80
+        calls.append('fbank')
+        return Tensor(audio_shape)
+
+    fake_torch = SimpleNamespace(
+        __version__='2.9.1+cu126', float32='float32', tensor=cuda_tensor,
+        arange=lambda count, **kwargs: Tensor((count,)), sin=lambda value: value,
+        isfinite=lambda value: SimpleNamespace(all=lambda: SimpleNamespace(item=lambda: True)),
+        cuda=SimpleNamespace(is_available=lambda: True, get_device_name=lambda index: 'fixture GPU',
+            get_device_properties=lambda index: SimpleNamespace(total_memory=12345),
+            synchronize=lambda: calls.append('cuda sync')))
+    fake_audio = SimpleNamespace(__version__=audio_version, functional=SimpleNamespace(resample=resample),
+                                 compliance=SimpleNamespace(kaldi=SimpleNamespace(fbank=fbank)))
     import importlib
     monkeypatch.setattr(importlib, 'import_module', lambda name: fake_torch if name == 'torch' else fake_audio)
+    return calls
+
+
+def test_explicit_pytorch_contract_records_verified_device_versions_and_operations(tmp_path, monkeypatch):
+    config = {'runtime_requirements': {'framework': 'pytorch', 'require_cuda': True, 'match_torchaudio': True,
+                                       'torch_version': '2.9.1+cu126', 'torchaudio_version': '2.9.1+cu126'}}
+    namespace, events = context(tmp_path, config, monkeypatch)
+    calls = install_framework_fixture(monkeypatch)
     exec(gate_source(config), namespace)
     evidence = events[-1]['preflight']['framework']
     assert evidence['status'] == 'passed' and evidence['cuda_available'] is True
     assert evidence['cuda_total_memory_bytes'] == 12345
-    assert evidence['torch_version'] == evidence['torchaudio_version'] == '2.6.0+cu124'
+    assert evidence['torch_version'] == evidence['torchaudio_version'] == '2.9.1+cu126'
+    assert evidence['cuda_smoke'] == {'status': 'passed', 'operation': 'float32_matmul', 'synchronized': True}
+    assert evidence['torchaudio_smoke']['feature_shape'] == [8, 80]
+    assert calls == ['cuda matmul', 'cuda sync', 'resample', 'fbank']
+
+
+@pytest.mark.parametrize(('fixture', 'stage', 'message'), [
+    ({'audio_version': '2.9.1+cu128'}, None, 'Expected TorchAudio 2.9.1'),
+    ({'cuda_result': [[7.0, 10.0], [15.0, 20.0]]}, 'cuda_smoke', 'CUDA matrix multiplication'),
+    ({'audio_shape': (8, 81)}, 'torchaudio_smoke', 'TorchAudio Kaldi fbank'),
+])
+def test_bad_pin_or_smoke_output_stops_before_project_preflight(tmp_path, monkeypatch, fixture, stage, message):
+    config = {'preflight_command': 'must not run', 'runtime_requirements':
+        {'framework': 'pytorch', 'require_cuda': True, 'match_torchaudio': True,
+         'torch_version': '2.9.1+cu126', 'torchaudio_version': '2.9.1+cu126'}}
+    namespace, events = context(tmp_path, config, monkeypatch)
+    install_framework_fixture(monkeypatch, **fixture)
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('Bad environment executed a child'))
+    with pytest.raises(RuntimeError, match=message):
+        exec(gate_source(config), namespace)
+    assert events[-1]['runtime_release_safe'] is True
+    evidence = events[-1]['preflight']['framework']
+    assert evidence['status'] == 'failed'
+    if stage:
+        assert evidence[stage]['status'] == 'failed'
 
 
 def test_insufficient_scratch_space_blocks_before_project_preflight(tmp_path, monkeypatch):
@@ -280,7 +355,7 @@ def test_passed_preflight_is_required_before_real_bulk_cell_executes(tmp_path, m
     (metadata / 'data_manifest.json').write_bytes(manifest)
     def upload():
         assert namespace['RUNTIME_PREFLIGHT']['status'] == 'passed'
-        assert events[-1]['phase'] == 'preflight'
+        assert events[-1]['phase'] == 'preparing_data'
         return {'000000.tar': payload}
     namespace['files'] = SimpleNamespace(upload=upload)
     cells = notebook_cells(config)
@@ -293,3 +368,75 @@ def test_passed_preflight_is_required_before_real_bulk_cell_executes(tmp_path, m
         os.chdir(before)
     assert (tmp_path / 'scratch/train/shards/000000.tar').read_bytes() == payload
     assert not any(event['status'] in {'running', 'completed'} for event in events)
+
+
+@pytest.mark.parametrize(('outcome', 'expected_status', 'release_safe'), [
+    ('scientific_completion', 'completed', True),
+    ('process_exit', 'completed', False),
+    ('fresh_checkpoint', 'disconnected', True),
+    ('stale_checkpoint', 'disconnected', False),
+    ('ordinary_failure', 'failed', False),
+])
+def test_release_requires_durable_result_or_current_checkpoint(tmp_path, monkeypatch, outcome, expected_status, release_safe):
+    config = {'run_command': 'run benchmark', 'checkpoint': {'files': ['resume.pt'], 'resume_command': 'resume benchmark',
+              'full_training_state': True, 'resume_supported': True, 'session_exit_code': 75}}
+    if outcome == 'scientific_completion':
+        config['success_criteria'] = {'validation': 'scientific_metrics', 'metrics_file': 'metrics.json',
+                                      'required_metrics': ['B0_eer_percent']}
+    namespace, events = context(tmp_path, config, monkeypatch)
+    namespace['validate_scientific_result'] = validate_scientific_result
+    exec(gate_source(config), namespace)
+    drive = namespace['DRIVE_PROJECT']
+    checkpoint = drive / 'checkpoints/resume.pt'
+    if outcome == 'stale_checkpoint':
+        checkpoint.write_bytes(b'old state')
+
+    def wait():
+        if outcome == 'scientific_completion':
+            report = {'status': 'campaign_complete', 'campaign_complete': True, 'acceptance_complete': False,
+                      'scientific_metrics_produced': True, 'metrics': {'B0_eer_percent': 5.0}}
+            (drive / 'results/metrics.json').write_text(json.dumps(report), encoding='utf-8')
+        if outcome in {'fresh_checkpoint', 'ordinary_failure'}:
+            checkpoint.write_bytes(b'new state')
+        if outcome in {'fresh_checkpoint', 'stale_checkpoint'}:
+            return 75
+        return 1 if outcome == 'ordinary_failure' else 0
+
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: SimpleNamespace(stdout=[], wait=wait))
+    experiment = notebook_cells(config)[-1]
+    if expected_status == 'completed':
+        exec(experiment, namespace)
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            exec(experiment, namespace)
+    assert events[-1]['status'] == expected_status
+    assert (events[-1].get('runtime_release_safe') is True) == release_safe
+
+
+def test_release_marker_is_published_only_after_drive_status_write(tmp_path, monkeypatch):
+    config = {}
+    emitted = []
+    target = tmp_path / 'session_status.json'
+
+    def capture(message, *, flush=False):
+        prefix = 'AUTORESEARCH_COLAB_STATUS '
+        if message.startswith(prefix):
+            record = json.loads(message[len(prefix):])
+            if record.get('runtime_release_safe'):
+                assert json.loads(target.read_text(encoding='utf-8')) == record
+                emitted.append(record)
+
+    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout='Fixture GPU'))
+    namespace = {'print': capture}
+    exec(notebook_cells(config)[0], namespace)
+    namespace['DRIVE_PROJECT'] = tmp_path
+    namespace['report']('completed', runtime_release_safe=True)
+    assert len(emitted) == 1
+
+    def failed_write(*args):
+        raise OSError('Drive write failed')
+
+    monkeypatch.setattr(os, 'replace', failed_write)
+    with pytest.raises(OSError, match='Drive write failed'):
+        namespace['report']('failed', runtime_release_safe=True)
+    assert len(emitted) == 1

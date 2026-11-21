@@ -22,6 +22,10 @@ METADATA_PATHS = {'train/shard.list', 'train/utt2spk', 'train/utt2lang', 'dev/sh
                   'dev/wav.scp', 'dev/utt2spk', 'dev/utt2lang'}
 MANIFEST_KINDS = {'data_manifest.json': 'tidyvoicex_full_train_dev',
                   'acceptance-manifest.json': 'tidyvoicex_acceptance_train_dev'}
+PAIRED_SEED_METRICS = {
+    'baseline': {'eer': 'B0_eer_percent', 'min_dcf': 'B0_min_dcf', 'cross_eer': 'B0_cross_language_eer_percent'},
+    'variant': {'eer': 'VQ_eer_percent', 'min_dcf': 'VQ_min_dcf', 'cross_eer': 'VQ_cross_language_eer_percent'},
+}
 
 
 def relative_data_path(value):
@@ -475,6 +479,8 @@ def validate_success_criteria(criteria):
         raise ValueError('Experiment success criteria must be an object')
     validation = criteria.get('validation', 'process_exit')
     if validation == 'process_exit':
+        if 'paired_seed_confirmation' in criteria:
+            raise ValueError('Paired-seed confirmation requires scientific validation')
         return
     if validation != 'scientific_metrics':
         raise ValueError('Unknown experiment success validation')
@@ -486,6 +492,70 @@ def validate_success_criteria(criteria):
             or any(not isinstance(name, str) or not re.fullmatch('[A-Za-z][A-Za-z0-9_]{0,99}', name) for name in required)
             or len(set(required)) != len(required)):
         raise ValueError('Scientific success requires explicit unique metric names')
+    if 'paired_seed_confirmation' not in criteria:
+        return
+
+    confirmation = criteria['paired_seed_confirmation']
+    if (not isinstance(confirmation, dict)
+            or confirmation.keys() != {'seeds', 'min_cross_eer_drop', 'max_min_dcf_increase'}):
+        raise ValueError('Paired-seed confirmation requires seeds and both metric thresholds')
+    seeds = confirmation['seeds']
+    if (not isinstance(seeds, list) or len(seeds) != 2
+            or any(type(seed) is not int or not 0 <= seed < 2**32 for seed in seeds)
+            or seeds[0] == seeds[1]):
+        raise ValueError('Paired-seed confirmation requires two distinct unsigned 32-bit seeds')
+    for key, limit in (('min_cross_eer_drop', 100), ('max_min_dcf_increase', 1)):
+        value = confirmation[key]
+        if type(value) not in (int, float) or not 0 <= value <= limit:
+            raise ValueError(f'Invalid paired-seed confirmation threshold: {key}')
+    if criteria.get('status_value', 'campaign_complete') != 'campaign_complete':
+        raise ValueError('Paired-seed confirmation requires full scientific completion')
+    if any(name not in required for metrics in PAIRED_SEED_METRICS.values() for name in metrics.values()):
+        raise ValueError('Paired-seed confirmation requires all six mean metrics')
+
+
+def validate_paired_seed_confirmation(details, confirmation, measured):
+    seeds = [str(seed) for seed in confirmation['seeds']]
+    paired = details.get('paired_seeds')
+    if not isinstance(paired, dict) or paired.keys() != set(seeds):
+        raise ValueError('Scientific result must contain exactly the declared confirmation seeds')
+
+    validated = {}
+    for seed in seeds:
+        row = paired[seed]
+        if not isinstance(row, dict):
+            raise ValueError(f'Seed {seed} must contain paired measurements')
+        scores = {}
+        for member in PAIRED_SEED_METRICS:
+            score = row.get(member)
+            if not isinstance(score, dict):
+                raise ValueError(f'Seed {seed} is missing {member} measurements')
+            values = {}
+            for name, limit in (('eer', 100), ('min_dcf', 1), ('cross_eer', 100)):
+                number = score.get(name)
+                if type(number) not in (int, float) or not 0 <= number <= limit:
+                    raise ValueError(f'Seed {seed} has an invalid {member} {name} measurement')
+                values[name] = number
+            scores[member] = values
+
+        baseline, variant = scores['baseline'], scores['variant']
+        passed = (baseline['cross_eer'] - variant['cross_eer'] >= confirmation['min_cross_eer_drop']
+                  and variant['eer'] < baseline['eer']
+                  and variant['min_dcf'] <= baseline['min_dcf'] + confirmation['max_min_dcf_increase'])
+        if row.get('passed') is not passed:
+            raise ValueError(f'Seed {seed} confirmation flag differs from the measured criteria')
+        validated[seed] = {**scores, 'passed': passed}
+
+    for member, fields in PAIRED_SEED_METRICS.items():
+        for name, metric in fields.items():
+            mean = sum(row[member][name] for row in validated.values()) / len(seeds)
+            if not math.isclose(measured[metric], mean, rel_tol=0, abs_tol=1e-9):
+                raise ValueError(f'Mean {metric} differs from the paired seed measurements')
+
+    effect = all(row['passed'] for row in validated.values())
+    if details.get('research_effect_validated') is not effect:
+        raise ValueError('Overall confirmation flag differs from the measured seed confirmations')
+    return {'paired_seeds': validated, 'research_effect_validated': effect}
 
 
 def validate_completion_details(details, criteria):
@@ -504,15 +574,18 @@ def validate_completion_details(details, criteria):
     measured = {}
     for name in criteria['required_metrics']:
         number = metrics.get(name)
-        if not isinstance(number, (int, float)) or isinstance(number, bool) or not math.isfinite(number):
+        if type(number) not in (int, float) or (isinstance(number, float) and not math.isfinite(number)):
             raise ValueError('Scientific result is missing a finite required metric')
         if name.endswith('_eer_percent') and not name.startswith('delta_') and not 0 <= number <= 100:
             raise ValueError('EER metric is outside its valid range')
         if name.endswith('_min_dcf') and not name.startswith('delta_') and not 0 <= number <= 1:
             raise ValueError('minDCF metric is outside its valid range')
         measured[name] = number
-    return {'completion_kind': expected, 'scientific_metrics_produced': full,
-            'metrics_file': criteria['metrics_file'], 'metrics': measured}
+    completion = {'completion_kind': expected, 'scientific_metrics_produced': full,
+                  'metrics_file': criteria['metrics_file'], 'metrics': measured}
+    if 'paired_seed_confirmation' in criteria:
+        completion.update(validate_paired_seed_confirmation(details, criteria['paired_seed_confirmation'], measured))
+    return completion
 
 
 def validate_scientific_result(results_dir, criteria):
@@ -530,6 +603,8 @@ def validate_scientific_result(results_dir, criteria):
     if path.is_symlink() or not path.resolve().is_relative_to(base) or not path.is_file() or path.stat().st_size > 20_000_000:
         raise ValueError('Scientific result file is missing or unsafe')
     value = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(value, dict):
+        raise ValueError('Scientific result must be an object')
     expected = criteria.get('status_value', 'campaign_complete')
     if expected not in {'campaign_complete', 'acceptance_passed'} or value.get('status') != expected:
         raise ValueError('Scientific campaign has not reached its required completion status')
@@ -537,13 +612,19 @@ def validate_scientific_result(results_dir, criteria):
     if (value.get('campaign_complete') is not full or value.get('acceptance_complete') is not (not full)
             or value.get('scientific_metrics_produced') is not full):
         raise ValueError('Acceptance and full-campaign completion flags differ')
-    return validate_completion_details({'completion_kind': expected, 'scientific_metrics_produced': full,
-        'metrics_file': relative, 'metrics': value.get('metrics')}, criteria)
+    details = {'completion_kind': expected, 'scientific_metrics_produced': full,
+               'metrics_file': relative, 'metrics': value.get('metrics')}
+    if 'paired_seed_confirmation' in criteria:
+        details.update(paired_seeds=value.get('paired_seeds'),
+                       research_effect_validated=value.get('research_effect_validated'))
+    return validate_completion_details(details, criteria)
 
 
 def notebook_helpers_source() -> str:
     imports = 'import hashlib, json, math, os, re, shutil, tarfile, tempfile\nfrom pathlib import Path\n'
-    return imports + '\n\n'.join(inspect.getsource(function) for function in (
+    constants = f'PAIRED_SEED_METRICS = {PAIRED_SEED_METRICS!r}\n'
+    return imports + constants + '\n\n'.join(inspect.getsource(function) for function in (
         relative_data_path, file_sha256, safe_extract_dev_archive, reconstruct_artifacts,
         estimate_ephemeral_disk_budget,
-        validate_success_criteria, validate_completion_details, validate_scientific_result))
+        validate_success_criteria, validate_paired_seed_confirmation,
+        validate_completion_details, validate_scientific_result))

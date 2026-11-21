@@ -95,6 +95,9 @@ def test_process_probe_does_not_terminate_child() -> None:
     "health_code,health_body,ready_code,ready_body,expected",
     [
         (200, {"status": "live"}, 200, {"status": "ready"}, (True, True)),
+        (200, "live\n", 200, "ready\n", (True, True)),
+        (200, "live\n", 503, "ready\n", (True, False)),
+        (200, "live\n", 200, "not ready\n", (True, False)),
         (200, {"status": "live"}, 503, {"status": "not_ready"}, (True, False)),
         (200, {"status": "live"}, 200, {"status": "not_ready"}, (True, False)),
         (200, {"unrelated": True}, 200, {"status": "ready"}, (False, True)),
@@ -110,6 +113,8 @@ def test_tunnel_health_requires_ready_response(
         visited.append(str(request.url))
         code, body = ((health_code, health_body) if request.url.path == "/healthz"
                       else (ready_code, ready_body))
+        if isinstance(body, str):
+            return httpx.Response(code, text=body)
         return httpx.Response(code, json=body)
 
     def client(**kwargs):

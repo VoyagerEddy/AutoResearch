@@ -160,6 +160,44 @@ async def test_chatgpt_mcp_code_wait_authorize_resume_result_analysis_roundtrip(
         assert decided
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passes", [True, False])
+async def test_mcp_preserves_validated_seed_confirmation(tmp_path, passes):
+    app = create_app(Settings.load(tmp_path))
+    bridge = app.state.autoresearch.chatgpt
+    pid = bridge.create_project(ChatGPTProjectRequest(topic="Paired confirmation fixture"))["project"]["id"]
+    experiment = manifest()
+    criteria = experiment["colab"]["success_criteria"]
+    criteria.update(paired_seed_confirmation={"seeds": [42, 43], "min_cross_eer_drop": 0.03,
+                                              "max_min_dcf_increase": 0.005})
+    metrics = {"B0_eer_percent": 5, "VQ_eer_percent": 4, "B0_min_dcf": 0.4, "VQ_min_dcf": 0.4,
+               "B0_cross_language_eer_percent": 6, "VQ_cross_language_eer_percent": 5 if passes else 5.995}
+    criteria["required_metrics"] = list(metrics)
+    bridge.save_code(pid, CodeSaveRequest(files=[CodeFile(path="train.py", content="pass\n")],
+                                          experiment_manifest=experiment))
+    bridge.save_research_plan(pid, research_plan())
+    bridge.prepare_colab(pid, ColabPrepareRequest())
+    baseline = {"eer": 5, "min_dcf": 0.4, "cross_eer": 6}
+    variant = {"eer": 4, "min_dcf": 0.4, "cross_eer": 5 if passes else 5.99}
+    pairs = {"42": {"baseline": baseline, "variant": {**variant, "cross_eer": 5 if passes else 6}, "passed": passes},
+             "43": {"baseline": baseline, "variant": variant, "passed": passes}}
+    bridge.colab.observe(pid, ColabObservationRequest(status="running", details={"runtime_id": "paired-vm"}))
+    bridge.colab.observe(pid, ColabObservationRequest(status="completed", details={
+        "runtime_id": "paired-vm", "returncode": 0, "completion_kind": "campaign_complete",
+        "scientific_metrics_produced": True, "metrics_file": criteria["metrics_file"], "metrics": metrics,
+        "paired_seeds": pairs, "research_effect_validated": passes,
+    }))
+    async with Client(app.state.mcp_server, raise_exceptions=True) as client:
+        result = (await client.call_tool("get_colab_experiment_result", {"project_id": pid})).structured_content
+        workflow = (await client.call_tool("get_research_workflow", {"project_id": pid})).structured_content
+    assert result["full_experiment_complete"] is True
+    assert result["research_effect_validated"] is passes
+    assert result["paired_seeds"] == pairs
+    assert workflow["evidence"]["paired_seeds"] == pairs
+    assert workflow["research_effect_validated"] is passes
+    assert workflow["analysis_required"] is True
+
+
 @pytest.mark.parametrize("fault", ["runtime", "code", "metrics", "contract"])
 def test_old_or_mismatched_colab_evidence_never_becomes_current_result(tmp_path, fault):
     _, bridge, pid = create_prepared(tmp_path)
