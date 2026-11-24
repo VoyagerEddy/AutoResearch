@@ -24,6 +24,7 @@ GOOGLE_SIGN_IN_REASON = "Complete Google sign-in in the visible browser"
 _LEGACY_GOOGLE_SIGN_IN_REASON = GOOGLE_SIGN_IN_REASON + ", then Resume in AutoResearch"
 GOOGLE_ORDINARY_LOGIN_REASON = "Google requires an ordinary browser for sign-in; opening the dedicated login window"
 DRIVE_CONSENT_REASON = "Colab is waiting for Google Drive authorization"
+HF_DATASET_AUTH_REASON = "Give this notebook access to the HF_TOKEN Colab Secret with read access to the private dataset, then Resume"
 _BOUND_NOTEBOOK_LOAD_REASON = "The bound Colab notebook did not display the prepared source checksum before the load timeout"
 STATUS_PREFIX = "AUTORESEARCH_COLAB_STATUS "
 UPLOAD_PREFIX = "AUTORESEARCH_COLAB_UPLOAD_BUNDLE"
@@ -183,7 +184,6 @@ def public_colab_url(url: str) -> str:
 
 def prepared_notebook_cells(job: Mapping[str, Any]) -> list[tuple[str, str]]:
     """Read the exported artifact and verify its source stamp before authoring."""
-    expected = str(job.get("bundle_sha256") or "")
     project_id = validate_project_id(str(job.get("project_id") or ""))
     path = Path(str(job.get("notebook_path") or "")).resolve(strict=True)
     if path.name != f"AutoResearch_{project_id}.ipynb":
@@ -205,7 +205,7 @@ def prepared_notebook_cells(job: Mapping[str, Any]) -> list[tuple[str, str]]:
             raise ColabBrowserError("The prepared notebook contains invalid source")
         result.append((cell["cell_type"], source))
     markdown = "\n".join(source for kind, source in result if kind == "markdown")
-    if not result or not source_stamp_matches(markdown, expected):
+    if not result or not notebook_stamp_matches(markdown, job):
         raise ColabBrowserError("The prepared notebook source checksum does not match this job")
     return result
 
@@ -363,6 +363,22 @@ def provider_cooldown_minutes(text: str) -> int | None:
     return max(1, math.ceil(amount * factor))
 
 
+def provider_retry_deadline(text: str, now: datetime | None = None) -> datetime | None:
+    """Read an explicit timezone-bearing provider deadline, without guessing local time."""
+    match = re.search(
+        r"(?:try again|retry|available again|reconnect|重试|恢复)[^\n]{0,80}?"
+        r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2}|\s+UTC))",
+        text, re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        deadline = datetime.fromisoformat(re.sub(r"\s+UTC$|Z$", "+00:00", match[1], flags=re.IGNORECASE))
+    except ValueError:
+        return None
+    return deadline if deadline > (now or datetime.now(timezone.utc)) else None
+
+
 def control_label(name: str) -> str:
     """Normalize observed menu labels without guessing their DOM selectors."""
     first_line = name.partition("\n")[0].strip()
@@ -412,6 +428,15 @@ def source_stamp_matches(rendered_markdown: str, expected_sha256: str) -> bool:
     return bool(stamps) and set(stamps) == {expected_sha256}
 
 
+def notebook_stamp_matches(markdown: str, job: Mapping[str, Any]) -> bool:
+    revision = job.get('notebook_revision')
+    if revision is not None:
+        revisions = re.findall(r"AUTORESEARCH_NOTEBOOK_REVISION\s+([0-9]+)", markdown)
+        if set(revisions) != {str(revision)}:
+            return False
+    return source_stamp_matches(markdown, str(job.get('bundle_sha256') or ''))
+
+
 def parse_aria_controls(snapshot: str) -> list[dict[str, str]]:
     """Read public role/name pairs from Playwright's accessibility snapshot."""
     result = []
@@ -448,7 +473,7 @@ def parse_status_markers(text: str, project_id: str) -> list[dict[str, Any]]:
     markers = []
     for line in text.splitlines():
         line = line.strip()
-        if not line.startswith(STATUS_PREFIX):
+        if not line.startswith(STATUS_PREFIX) or re.search(r'h[f]_[A-Za-z0-9]{16,}', line):
             continue
         try:
             value = json.loads(line[len(STATUS_PREFIX):])
@@ -456,7 +481,7 @@ def parse_status_markers(text: str, project_id: str) -> list[dict[str, Any]]:
             continue
         if not isinstance(value, dict) or value.get("project_id") != project_id:
             continue
-        if value.get("status") not in {"starting", "available", "auth", "running", "unavailable", "disconnected", "completed", "failed"}:
+        if value.get("status") not in {"starting", "available", "auth", "network", "running", "unavailable", "disconnected", "completed", "failed"}:
             continue
         if not isinstance(value.get("runtime_id"), str) or not value["runtime_id"]:
             continue
@@ -574,6 +599,7 @@ class ColabJobClient:
         self.project_id = validate_project_id(project_id)
         self.path = f"/api/projects/{self.project_id}/colab"
         self.client = httpx.AsyncClient(base_url=self.api_url, timeout=20, trust_env=False)
+        self.attempt_number: int | None = None
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -581,13 +607,17 @@ class ColabJobClient:
     async def status(self) -> dict[str, Any]:
         response = await self.client.get(self.path)
         response.raise_for_status()
-        return response.json()
+        job = response.json()
+        if self.attempt_number is None:
+            self.attempt_number = job.get("attempt_count")
+        return job
 
     async def claim(self) -> bool:
         response = await self.client.post(f"{self.path}/attempt", json={})
         if response.status_code == 409:
             return False
         response.raise_for_status()
+        self.attempt_number = response.json().get("attempt_count")
         return True
 
     async def resume(self) -> bool:
@@ -604,7 +634,8 @@ class ColabJobClient:
         return response.json()
 
     async def record_stage(self, stage: str) -> None:
-        response = await self.client.post(f"{self.path}/stage", json={"stage": stage})
+        response = await self.client.post(f"{self.path}/stage", json={
+            "stage": stage, "attempt_number": self.attempt_number})
         # A legacy service or a job that has just stopped cannot accept a new stage.
         if response.status_code not in {404, 409}:
             response.raise_for_status()
@@ -615,10 +646,15 @@ class ColabJobClient:
         })
         response.raise_for_status()
 
-    async def observe(self, status: str, *, retry_after_minutes: int | None = None, **details: Any) -> dict[str, Any]:
+    async def observe(self, status: str, *, retry_after_minutes: int | None = None,
+                      retry_not_before: datetime | None = None, **details: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {"status": status, "details": details}
+        if self.attempt_number is not None:
+            payload["attempt_number"] = self.attempt_number
         if retry_after_minutes is not None:
             payload["retry_after_minutes"] = retry_after_minutes
+        if retry_not_before is not None:
+            payload["retry_not_before"] = retry_not_before.isoformat()
         response = await self.client.post(
             f"{self.path}/observations", json=payload
         )
@@ -1336,12 +1372,12 @@ class ColabBrowserSession:
             response = await self._notebook_mcp.request("call_tool", name="get_cells", arguments={"includeOutputs": False}, timeout=30)
             actual = mcp_notebook_cells(response)
             if mcp_cells_match(actual, prepared_notebook_cells(job)):
-                if not source_stamp_matches(await self.rendered_markdown(), expected):
+                if not notebook_stamp_matches(await self.rendered_markdown(), job):
                     raise ManualColabAction("This browser tab does not display the prepared notebook source checksum; reconnect the official bridge to this notebook before running")
                 await self.ensure_mcp_registered_notebook(response)
                 return
             raise ColabBrowserError("The official Colab notebook source changed after import; execution was stopped")
-        if source_stamp_matches(await self.rendered_markdown(), expected):
+        if notebook_stamp_matches(await self.rendered_markdown(), job):
             return
         bound_notebook = bool(job.get("notebook_url")) and job.get("notebook_bundle_sha256") == expected
         if not bound_notebook:
@@ -1351,7 +1387,7 @@ class ColabBrowserSession:
         # A saved notebook's cells can render after DOMContentLoaded.
         deadline = asyncio.get_running_loop().time() + self.options.timeout_ms / 1000
         while True:
-            if source_stamp_matches(await self.rendered_markdown(), expected):
+            if notebook_stamp_matches(await self.rendered_markdown(), job):
                 return
             authorization = classify_colab_authorization(self.page.url, await self.visible_text())
             if authorization:
@@ -1801,18 +1837,25 @@ class ColabBrowserWorker:
             cells = await self.browser.authorization_continuation_snapshot(job)
             plan = plan_authorization_continuation(cells,prepared_notebook_cells(job),project_id=self.client.project_id,
                 runtime_id=self.runtime_id,expected_started_at=state['started_at'],auth_interrupted=True,
-                inflight_cell_id=state.get('inflight_cell_id'))
+                inflight_cell_id=state.get('inflight_cell_id'),
+                allow_hf_dataset=bool((job.get('prepared_config') or {}).get('hf_dataset_transfer')))
             if plan.action=='wait':
                 return
             if plan.action=='blocked':
                 self._authorization_resumed = False
-                await self._manual_observation(plan.reason,preserve_runtime=True)
+                if plan.reason == 'Hugging Face dataset authorization retry failed':
+                    state['inflight_cell_id'] = None
+                    await self._observation('auth', HF_DATASET_AUTH_REASON, auth_kind='hf_dataset',
+                        runtime_id=self.runtime_id, started_at=state['started_at'],
+                        runtime_active=True, manual_action=True, authorization_continuation=dict(state))
+                else:
+                    await self._manual_observation(plan.reason,preserve_runtime=True)
                 return
             if plan.action=='complete':
                 self._authorization_resumed = False
                 return
             state['inflight_cell_id'] = plan.cell_id
-            await self._observation('available','Continuing the verified notebook after Drive authorization',
+            await self._observation('available','Continuing the verified notebook after authorization',
                 runtime_id=self.runtime_id,started_at=state['started_at'],runtime_active=True,
                 authorization_continuation=dict(state))
             self._continuation_task = asyncio.create_task(self.browser.run_continuation_cell(job,plan.cell_id))
@@ -1881,16 +1924,12 @@ class ColabBrowserWorker:
             details["browser_url"] = public_colab_url(self.browser.page.url)
         except ValueError:
             pass
+        if self._reported_stage:
+            details.setdefault("stage", self._reported_stage)
         return await self.client.observe(status, reason=reason, retry_after_minutes=retry_after_minutes, **details)
 
     async def _provider_observation(self, status: str, text: str) -> None:
         cooldown = provider_cooldown_minutes(text)
-        if cooldown is not None:
-            cooldown = max(30, cooldown)
-        if status == "quota" and cooldown is None:
-            # Quotas are different from a temporarily busy GPU pool. A long
-            # default pause avoids repeated requests against an explicit limit.
-            cooldown = 12 * 60
         details: dict[str, Any] = {}
         if status in {"quota", "unavailable", "network"}:
             # The caller supplies visible_text(), which excludes notebook
@@ -1899,6 +1938,9 @@ class ColabBrowserWorker:
             details["provider_ui_text"] = sanitize_provider_ui_text(text)
         reason = "Colab displayed a provider message"
         if status == 'quota':
+            deadline = provider_retry_deadline(text)
+            if deadline is not None:
+                details['retry_not_before'] = deadline
             normalized = re.sub(r'\s+', ' ', text.casefold())
             capacity = _SESSION_CAPACITY_PATTERN.search(normalized) is not None
             details['provider_reason'] = 'session_capacity' if capacity else 'usage_quota'
@@ -2281,7 +2323,9 @@ class ColabBrowserWorker:
                     self._forget_owned_launch()
                     if is_browser_closed_error(exc):
                         raise
-                    await self._observation("network", safe_local_error_reason(exc, f"Colab connection failed while {stage}"))
+                    reason = safe_local_error_reason(exc, f"Colab connection failed while {stage}")
+                    timed_out = type(exc).__name__ == "TimeoutError" or "timeout" in reason.casefold()
+                    await self._observation("network", reason, **({"failure_kind": "notebook_timeout"} if timed_out else {}))
                     continue
             if self.attempt_started is not None and status not in {"waiting_for_gpu", "waiting_for_connection", "quota_exceeded"}:
                 try:
@@ -2303,11 +2347,13 @@ class ColabBrowserWorker:
             await asyncio.sleep(self.browser.options.poll_seconds)
 
     async def _monitor(self, job: Mapping[str, Any]) -> None:
+        hf_dataset = bool((job.get('prepared_config') or {}).get('hf_dataset_transfer'))
         await self._tick_authorization_continuation(job)
         text = await self.browser.visible_text()
         outputs = await self.browser.output_text()
         await self._confirm_input_submission(job,outputs)
-        await self._confirm_data_submissions(job,outputs)
+        if not hf_dataset:
+            await self._confirm_data_submissions(job,outputs)
         markers = [item for item in parse_status_markers(outputs, self.client.project_id)
                    if item["runtime_id"] not in self._ignored_runtime_ids]
         if self._recovering_runtime:
@@ -2338,6 +2384,8 @@ class ColabBrowserWorker:
         for marker in markers:
             if marker["status"] == "starting" and self.runtime_id is None and self.attempt_started is not None and marker_is_current(marker, self.attempt_started):
                 self.runtime_id = marker["runtime_id"]
+                if marker.get("phase") == "gpu_probe":
+                    await self._record_stage("gpu_probe")
             if (
                 marker["status"] == "available" and not self.available_reported
                 and marker["runtime_id"] == self.runtime_id
@@ -2346,6 +2394,10 @@ class ColabBrowserWorker:
                 marker_details = {key: value for key, value in marker.items() if key not in {"status", "reason", "project_id"}}
                 await self._observation("available", "Notebook verified a usable CUDA GPU", **marker_details)
                 self.available_reported = True
+            if (marker.get("phase") == "drive_mount" and self.available_reported
+                    and marker["runtime_id"] == self.runtime_id and not self.running_reported
+                    and self._reported_stage not in {"mounting_drive", "preparing_data", "runtime_setup"}):
+                await self._record_stage("mounting_drive")
         state = classify_colab_page(self.browser.page.url, text)
         if state:
             await self._provider_observation(state, text)
@@ -2372,18 +2424,30 @@ class ColabBrowserWorker:
                 if (self._authorization_resumed and self._authorization_continuation
                         and self._authorization_continuation.get('runtime_id')==self.runtime_id):
                     continue
-                missing_inputs = marker.get("reason") == "missing_inputs"
-                reason = "Required experiment inputs are missing in Drive" if missing_inputs else DRIVE_CONSENT_REASON
+                auth_kind, reason = "drive_consent", DRIVE_CONSENT_REASON
+                if marker.get("reason") == "missing_inputs":
+                    auth_kind, reason = "experiment_inputs", "Required experiment inputs are missing in Drive"
+                elif hf_dataset and marker.get("reason") == "hf_dataset_auth" and marker.get("phase") == "preparing_data":
+                    auth_kind, reason = "hf_dataset", HF_DATASET_AUTH_REASON
                 self._authorization_continuation = {'runtime_id':self.runtime_id,'started_at':marker['started_at'],'inflight_cell_id':None}
                 self._authorization_resumed = False
                 marker_details.update(runtime_active=True, manual_action=True,
-                    auth_kind="experiment_inputs" if missing_inputs else "drive_consent",
+                    auth_kind=auth_kind,
                     authorization_continuation=dict(self._authorization_continuation))
                 await self._observation("auth", reason, **marker_details)
                 return
             if marker_status == "unavailable":
                 await self._observation("unavailable", "Notebook GPU check reported no usable CUDA GPU", **marker_details)
                 self.attempt_started = None
+                return
+            if (hf_dataset and marker_status == "network" and marker.get("phase") == "preparing_data"
+                    and marker.get("reason") == "hf_dataset_network"):
+                await self._observation("network", "Hugging Face dataset download exhausted its network retries",
+                                        **{**marker_details, "failure_kind": "hf_dataset_network"})
+                self._ignored_runtime_ids.add(self.runtime_id)
+                self._forget_owned_launch()
+                self.attempt_started = None
+                self.runtime_id = None
                 return
             if marker_status == "disconnected":
                 await self._record_runtime_terminal("disconnected", "Experiment saved its checkpoint at the configured session budget",
@@ -2399,8 +2463,19 @@ class ColabBrowserWorker:
                 await self._observation("running", "The experiment subprocess started", **marker_details)
                 self.running_reported = True
             if marker_status == "failed":
-                await self._record_runtime_terminal("failed", "Notebook execution failed; inspect Drive results and saved checkpoints",
-                                                    job, marker, markers, marker_details)
+                if marker.get("phase") == "gpu_probe":
+                    await self._observation("network", "Notebook's first-cell GPU probe did not complete",
+                                            failure_kind="notebook_timeout", **marker_details)
+                    self.attempt_started = None
+                    return
+                reason = "Notebook execution failed; inspect Drive results and saved checkpoints"
+                if marker.get("reason") == "screening_failed":
+                    reason = "RSI screening ended because no healthy VQ candidate passed the B0 comparison"
+                    marker_details["failure_kind"] = "screening_failed"
+                elif hf_dataset and marker.get("reason") == "hf_dataset_config":
+                    reason = "Hugging Face private dataset configuration or pinned data verification failed"
+                    marker_details["failure_kind"] = "hf_dataset_config"
+                await self._record_runtime_terminal("failed", reason, job, marker, markers, marker_details)
                 self.attempt_started = None
                 return
             if marker_status == "completed":
@@ -2412,7 +2487,7 @@ class ColabBrowserWorker:
                                                         job, marker, markers, marker_details)
                 self.attempt_started = None
                 return
-        if self.runtime_id and DATA_UPLOAD_PREFIX in outputs:
+        if self.runtime_id and not hf_dataset and DATA_UPLOAD_PREFIX in outputs:
             from .colab_data import data_upload_path
 
             current_requests=[item for item in parse_data_upload_requests(outputs,self.client.project_id)

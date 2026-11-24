@@ -70,6 +70,49 @@ def test_preparation_is_not_an_attempt_and_source_export_excludes_inputs_and_sec
     assert "'_' + RUNTIME_ID" in code
 
 
+def test_hf_sidecar_replaces_browser_registry_and_pins_the_source_identity(tmp_path):
+    service, project_id, generated = project_service(tmp_path)
+    spec = config()
+    spec['full_data_transfer'] = {'pointer': 'inputs/absent-browser-pointer.json'}
+    spec['hf_dataset_transfer'] = {'pointer': 'inputs/hf_dataset_pointer.json', 'optional': True,
+                                   'online_augmentation': False, 'window_shards': 2}
+    (generated / 'experiment_manifest.json').write_text(json.dumps({'colab': spec}), encoding='utf-8')
+    assert service.prepare(project_id, ColabPrepareRequest())['status'] == 'blocked'
+    sidecar = generated / spec['hf_dataset_transfer']['pointer']
+    sidecar.parent.mkdir()
+    pointer = {'repo_id': 'fixture/private-corpus', 'revision': 'a' * 40,
+               'manifest_path': 'data_manifest.json', 'manifest_sha256': 'b' * 64}
+    sidecar.write_text(json.dumps(pointer), encoding='utf-8')
+    job = service.prepare(project_id, ColabPrepareRequest())
+    assert job['status'] == 'queued'
+    assert job['data_upload_files'] == [] and not job['input_bundle_path']
+    assert 'full_data_transfer' not in job['prepared_config']
+    prepared = job['prepared_config']['hf_dataset_transfer']
+    assert prepared == {**pointer, 'online_augmentation': False, 'window_shards': 2, 'window_bytes': 1536 * 1024**2}
+    assert job['approved_data_manifest']['source'] == 'hf_private_dataset'
+    with zipfile.ZipFile(service.export_path(project_id, 'bundle')) as bundle:
+        assert json.loads(bundle.read('autoresearch_hf_pointer.json')) == prepared
+        assert 'def validate_hf_pointer' in bundle.read('autoresearch_hf_dataset.py').decode()
+        assert 'inputs/hf_dataset_pointer.json' not in bundle.namelist()
+    assert service.status(project_id)['source_current'] is True
+    sidecar.write_text(json.dumps({**pointer, 'revision': 'c' * 40}), encoding='utf-8')
+    assert service.status(project_id)['source_current'] is False
+    updated = service.prepare(project_id, ColabPrepareRequest())
+    assert updated['bundle_sha256'] != job['bundle_sha256']
+
+
+@pytest.mark.parametrize('field,bad', [('revision', 'main'), ('manifest_path', '../data_manifest.json'),
+                                     ('manifest_sha256', '123'), ('window_shards', 9), ('token', 'invalid')])
+def test_hf_configuration_fails_before_allocation(tmp_path, field, bad):
+    service, project_id, generated = project_service(tmp_path)
+    pointer = {'repo_id': 'fixture/private-corpus', 'revision': 'a' * 40,
+               'manifest_path': 'data_manifest.json', 'manifest_sha256': 'b' * 64}
+    spec = {**config(), 'hf_dataset_transfer': {**pointer, field: bad}}
+    (generated / 'experiment_manifest.json').write_text(json.dumps({'colab': spec}), encoding='utf-8')
+    job = service.prepare(project_id, ColabPrepareRequest())
+    assert job['status'] == 'blocked' and not job['can_attempt']
+
+
 @pytest.mark.parametrize('change', ['source', 'contract', 'drive_root'])
 def test_reprepare_changed_export_invalidates_saved_notebook_url(tmp_path, change):
     service, project_id, generated = project_service(tmp_path)

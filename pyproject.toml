@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 research = ["PyYAML>=6,<7"]
+hf = ["huggingface_hub>=0.34,<2"]
 browser = [
   "Pillow>=10.4,<12",
   "playwright>=1.48,<2",

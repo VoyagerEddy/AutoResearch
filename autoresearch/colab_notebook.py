@@ -9,6 +9,9 @@ from typing import Any
 from .services.colab_data import notebook_helpers_source
 
 
+NOTEBOOK_REVISION = 3
+
+
 def build_notebook(project_id: str, config: dict[str, Any], *, drive_root: str,
                    bundle_sha256: str, bundle_bytes: bytes) -> dict[str, Any]:
     cells: list[dict[str, Any]] = []
@@ -21,39 +24,48 @@ def build_notebook(project_id: str, config: dict[str, Any], *, drive_root: str,
         if 'def report(' not in value:
             value = ('try:\n' + textwrap.indent(value, '    ') +
                      "except BaseException as notebook_error:\n"
-                     "    if globals().get('_last_report_status') not in {'auth', 'failed', 'unavailable', 'disconnected', 'completed'}:\n"
-                     "        report('failed', reason='Notebook cell failed: ' + str(notebook_error))\n"
+                     "    if globals().get('_last_report_status') not in {'auth', 'failed', 'network', 'unavailable', 'disconnected', 'completed'}:\n"
+                     "        report('failed', reason='Notebook cell failed: ' + globals().get('safe_text', str)(str(notebook_error)))\n"
                      "    raise\n")
         cells.append({"cell_type": "code", "metadata": {}, "source": value.splitlines(True),
                       "execution_count": None, "outputs": []})
 
-    markdown(f"""# AutoResearch · {project_id} · Colab 免费 GPU
+    introduction = f"""# AutoResearch · {project_id} · Colab 免费 GPU
 
 AUTORESEARCH_SOURCE_SHA256 {bundle_sha256}
+AUTORESEARCH_NOTEBOOK_REVISION {NOTEBOOK_REVISION}
 
 在 Colab 的 **运行时 → 更改运行时类型** 中选择免费的 GPU，再运行全部单元格。
 免费 GPU 不保证可用，会话时间和额度由 Colab 决定；本 notebook 不建立 SSH、后台保活或付费资源。
-首次运行需要正常登录并授权挂载自己的 Google Drive。代码已安全嵌入此 notebook；
-把实验数据和预训练权重放到 Drive 的 `{drive_root}/{project_id}/inputs/`。
+第一格先检查 GPU，成功后才挂载 Google Drive。首次挂载可能需要授权。代码已安全嵌入此 notebook；
+{('在左侧 Secrets 添加只读 HF_TOKEN 并为此 notebook 开启访问。数据从固定提交下载到临时盘。'
+  if config.get('hf_dataset_transfer') else f'把实验数据和预训练权重放到 Drive 的 `{drive_root}/{project_id}/inputs/`。')}
 checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执行项目声明的恢复命令。
 中断仍可能丢失最近一次 checkpoint 之后的步骤。
 
 规则：[Colab 官方 FAQ](https://research.google.com/colaboratory/faq.html)。
-""")
+"""
     payload = {"project_id": project_id, "drive_root": drive_root, "config": config,
                "bundle_sha256": bundle_sha256}
     code(f"""
-        import datetime, hashlib, json, os, pathlib, subprocess, time, uuid, zipfile
+        import datetime, hashlib, json, os, pathlib, re, subprocess, time, uuid, zipfile
         SETTINGS = json.loads({json.dumps(json.dumps(payload, ensure_ascii=False))})
         PROJECT_ID = SETTINGS['project_id']
         RUNTIME_ID = str(uuid.uuid4())
         STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
         DRIVE_PROJECT = None
+        GPU_PROBE_RUNTIME_ID = None
+        _hf_runtime_token = None
+        def safe_text(value):
+            if _hf_runtime_token:
+                value = value.replace(_hf_runtime_token, '[redacted]')
+            return re.sub(r'\\bhf_[A-Za-z0-9]{{16,}}\\b', '[redacted]', value)
         def report(status, **details):
             global _last_report_status
             _last_report_status = status
             record = dict(project_id=PROJECT_ID, runtime_id=RUNTIME_ID,
                           started_at=STARTED_AT, status=status, **details)
+            record = json.loads(safe_text(json.dumps(record)))
             marker = 'AUTORESEARCH_COLAB_STATUS ' + json.dumps(record)
             release_safe = details.get('runtime_release_safe') is True
             if not release_safe:
@@ -70,22 +82,29 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                 raise RuntimeError('A release-safe report requires persistent Drive evidence')
             if release_safe:
                 print(marker, flush=True)
-        report('starting')
+        report('starting', phase='gpu_probe')
         try:
             gpu = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            report('failed', phase='gpu_probe', reason='nvidia-smi timed out during the first-cell GPU probe')
+            raise
         except FileNotFoundError:
             gpu = subprocess.CompletedProcess(['nvidia-smi'], 1, '', 'nvidia-smi missing')
         if gpu.returncode != 0 or not gpu.stdout.strip():
-            report('unavailable', reason='This Colab runtime has no GPU')
+            report('unavailable', phase='gpu_probe', reason='This Colab runtime has no usable NVIDIA GPU')
             raise RuntimeError('GPU 不可用，请通过 Colab 标准 UI 重试。')
-        print(gpu.stdout)
-        report('available', gpu=gpu.stdout.strip())
+        GPU_PROBE_RUNTIME_ID = RUNTIME_ID
+        report('available', phase='gpu_probe', gpu=gpu.stdout.strip())
     """)
+    markdown(introduction)
     encoded = base64.b64encode(bundle_bytes).decode('ascii')
     code(f"import base64\nEMBEDDED_SOURCE = base64.b64decode({encoded!r})")
     code("""
+        if not globals().get('GPU_PROBE_RUNTIME_ID') or GPU_PROBE_RUNTIME_ID != RUNTIME_ID:
+            raise RuntimeError('Run the first-cell GPU probe successfully before mounting Drive')
         from google.colab import drive, files
+        report('starting', phase='drive_mount')
         try:
             drive.mount('/content/drive')
         except Exception as exc:
@@ -191,7 +210,7 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
     """)
     code("""
         # AUTORESEARCH_PREFLIGHT_GATE: no bulk data request precedes this cell.
-        import importlib, math, signal, tempfile
+        import importlib, signal, tempfile
         RUNTIME_PREFLIGHT = dict(schema_version=1, project_id=PROJECT_ID, runtime_id=RUNTIME_ID,
                                  phase='preflight', status='checking',
                                  scientific_metrics_produced=False)
@@ -206,27 +225,6 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                         filesystem_used_bytes=usage.used,
                         filesystem_available_bytes=usage.free,
                         filesystem_space_status='measured', cloud_quota_status='unknown')
-
-        def preflight_cuda(torch):
-            sample = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda:0', dtype=torch.float32)
-            product = sample @ sample
-            torch.cuda.synchronize()
-            if not torch.isfinite(product).all().item() or product.tolist() != [[7.0, 10.0], [15.0, 22.0]]:
-                raise RuntimeError('CUDA matrix multiplication failed its finite-value and expected-result check')
-            return dict(status='passed', operation='float32_matmul', synchronized=True)
-
-        def preflight_torchaudio(torch, torchaudio):
-            samples = torch.arange(800, dtype=torch.float32)
-            waveform = (torch.sin(samples * (2.0 * math.pi * 440.0 / 8000)) * 0.1).unsqueeze(0)
-            waveform = torchaudio.functional.resample(waveform, 8000, 16000)
-            if list(waveform.shape) != [1, 1600] or not torch.isfinite(waveform).all().item():
-                raise RuntimeError('TorchAudio resample produced unexpected or non-finite samples')
-            features = torchaudio.compliance.kaldi.fbank(waveform * (1 << 15),
-                num_mel_bins=80, frame_length=25.0, frame_shift=10.0, dither=0.0,
-                sample_frequency=16000.0, window_type='hamming', use_energy=False)
-            if list(features.shape) != [8, 80] or not torch.isfinite(features).all().item():
-                raise RuntimeError('TorchAudio Kaldi fbank produced unexpected or non-finite features')
-            return dict(status='passed', source_rate=8000, input_rate=16000, feature_shape=list(features.shape))
 
         def save_preflight_evidence(path):
             temporary = None
@@ -303,7 +301,8 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                     probe.unlink(missing_ok=True)
             RUNTIME_PREFLIGHT['drive'] = drive_evidence
             transfer = config.get('full_data_transfer')
-            scratch = pathlib.Path('/content/autoresearch-full-data') if transfer else SOURCE.parent
+            scratch = (pathlib.Path('/content/autoresearch-full-data')
+                       if transfer or config.get('hf_dataset_transfer') else SOURCE.parent)
             if scratch.is_symlink():
                 raise RuntimeError('Preflight scratch directory must not be linked')
             scratch.mkdir(parents=True, exist_ok=True)
@@ -412,7 +411,52 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                    preflight=RUNTIME_PREFLIGHT, log_path=str(preflight_log), **release)
             raise
     """)
-    code("""
+    if config.get('hf_dataset_transfer'):
+        code("""
+            import sys
+            sys.path.insert(0, str(SOURCE))
+            import autoresearch_hf_dataset as hf_data
+
+            if (RUNTIME_PREFLIGHT.get('status') != 'passed'
+                    or RUNTIME_PREFLIGHT.get('runtime_id') != RUNTIME_ID):
+                raise RuntimeError('Current-runtime preflight must pass before private Dataset downloads')
+            report('starting', phase='preparing_data', preflight=RUNTIME_PREFLIGHT)
+            hf_config = config['hf_dataset_transfer']
+            hf_pointer = {key: hf_config[key] for key in hf_data.POINTER_FIELDS}
+            data_root = pathlib.Path('/content/autoresearch-full-data')
+            try:
+                _hf_runtime_token = hf_data.read_token(colab_secrets=True)
+                hf_reader = hf_data.HubReader(_hf_runtime_token)
+                hf_manifest_bytes = hf_reader.manifest(hf_pointer)
+                inventory = validate_corpus_manifest(json.loads(hf_manifest_bytes), 'data_manifest.json')
+                transfer = dict(hf_config, **inventory, mode='hf_private_dataset',
+                                manifest_size_bytes=len(hf_manifest_bytes))
+                dataset = hf_data.Dataset(data_root, hf_config, transfer['files'], hf_reader)
+                dataset.clean_abandoned_slots()
+                disk_budget = estimate_ephemeral_disk_budget(data_root, transfer)
+                RUNTIME_PREFLIGHT['scratch']['corpus_budget'] = disk_budget
+                save_preflight_evidence(preflight_path)
+                if not disk_budget['enough']:
+                    raise hf_data.DatasetConfigurationError('Insufficient Colab ephemeral disk space for private Dataset')
+                hf_data.install_metadata(data_root, hf_manifest_bytes, transfer, hf_pointer, hf_reader)
+            except hf_data.DatasetAuthError:
+                report('auth', phase='preparing_data', reason='hf_dataset_auth')
+                raise RuntimeError('Enable notebook access to HF_TOKEN with read access to the private Dataset') from None
+            except hf_data.DatasetNetworkError:
+                report('network', phase='preparing_data', reason='hf_dataset_network')
+                raise RuntimeError('Private Dataset download failed after network retries') from None
+            except (ValueError, KeyError, TypeError) as err:
+                report('failed', phase='preparing_data', reason='hf_dataset_config',
+                       detail=safe_text(str(err)))
+                raise RuntimeError('Private Dataset configuration or integrity check failed') from None
+            os.environ['AUTORESEARCH_FULL_DATA_MANIFEST'] = str(data_root / 'data_manifest.json')
+            os.environ['AUTORESEARCH_AUGMENTATION_DIR'] = str(data_root / 'augmentation')
+            os.environ[hf_data.CONFIG_ENV] = json.dumps(dict(hf_config, root=str(data_root)))
+            report('starting', phase='data_ready', preflight=RUNTIME_PREFLIGHT, disk_budget=disk_budget,
+                   data_source='hf_private_dataset')
+        """)
+    else:
+        code("""
         transfer = config.get('full_data_transfer')
         if transfer:
             import gc
@@ -435,6 +479,15 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                     or RUNTIME_PREFLIGHT.get('runtime_id') != RUNTIME_ID):
                 raise RuntimeError('A successful current-runtime preflight is required before bulk upload')
             report('starting', phase='preparing_data', preflight=RUNTIME_PREFLIGHT)
+            cache_root = DRIVE_PROJECT / 'inputs' / 'verified-shards'
+            cache = dict(reused=0, persisted=0, write_status='available')
+            try:
+                if cache_root.is_symlink() or not cache_root.resolve().is_relative_to(DRIVE_PROJECT.resolve()):
+                    raise OSError('Unsafe durable shard cache directory')
+                cache_root.mkdir(exist_ok=True)
+            except OSError as exc:
+                cache.update(write_status='unavailable', error_type=type(exc).__name__)
+                cache_root = None
             for item in transfer['files']:
                 relative = relative_data_path(item['path'])
                 if item['kind'] == 'metadata':
@@ -467,7 +520,17 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.is_symlink() or not target.resolve().is_relative_to(data_root.resolve()):
                     raise RuntimeError('Unsafe full-data upload destination')
-                matches = target.is_file() and target.stat().st_size == item['size_bytes'] and file_sha256(target) == item['sha256']
+                matches = shard_matches(target, item)
+                cached = cache_root / item['sha256'] if cache_root is not None else None
+                try:
+                    cache_matches = cached is not None and shard_matches(cached, item)
+                    if cache_matches and not matches:
+                        copy_verified_shard(cached, target, item)
+                        matches = True
+                        cache['reused'] += 1
+                except (OSError, ValueError) as exc:
+                    cache_matches = False
+                    cache.update(write_status='unavailable', error_type=type(exc).__name__)
                 if not matches:
                     request = dict(project_id=PROJECT_ID, runtime_id=RUNTIME_ID, path=relative,
                                    size_bytes=item['size_bytes'], sha256=item['sha256'])
@@ -497,6 +560,14 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                         os.chdir(SOURCE)
                         if incoming.resolve().is_relative_to(SOURCE.resolve()):
                             shutil.rmtree(incoming)
+                if cached is not None and not cache_matches and cache['write_status'] == 'available':
+                    try:
+                        copy_verified_shard(target, cached, item)
+                        if not shard_matches(cached, item):
+                            raise ValueError('Persistent shard could not be verified after saving')
+                        cache['persisted'] += 1
+                    except (OSError, ValueError) as exc:
+                        cache.update(write_status='unavailable', error_type=type(exc).__name__)
                 print('AUTORESEARCH_COLAB_DATA_READY ' + json.dumps(dict(project_id=PROJECT_ID,
                     runtime_id=RUNTIME_ID,path=relative,size_bytes=item['size_bytes'],sha256=item['sha256'])),flush=True)
                 if owner and relative == owner['parts'][-1]:
@@ -509,13 +580,18 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
             os.environ['AUTORESEARCH_AUGMENTATION_DIR'] = str(
                 (data_root / transfer['augmentation']['musan']['path']).parents[2])
             os.environ['AUTORESEARCH_FULL_DATA_MANIFEST'] = str(data_root / 'data_manifest.json')
+            report('starting', phase='data_ready', data_cache=cache, preflight=RUNTIME_PREFLIGHT)
             print('Full train/dev corpus transferred and verified:', data_root, flush=True)
-    """)
+        """)
     code("""
         checkpoint_dir = DRIVE_PROJECT / 'checkpoints'
         results_dir = DRIVE_PROJECT / 'results'
         preflight_evidence = globals().get('RUNTIME_PREFLIGHT', dict(status='not_run'))
-        if (config.get('preflight_command') or config.get('runtime_requirements') or config.get('full_data_transfer')):
+        runtime_token = globals().get('_hf_runtime_token')
+        sanitize_output = globals().get('safe_text', str)
+
+        if (config.get('preflight_command') or config.get('runtime_requirements')
+                or config.get('full_data_transfer') or config.get('hf_dataset_transfer')):
             if preflight_evidence.get('status') != 'passed' or preflight_evidence.get('runtime_id') != RUNTIME_ID:
                 raise RuntimeError('A successful current-runtime preflight is required before experiment execution')
         drive_verified = (preflight_evidence.get('status') == 'passed'
@@ -547,7 +623,7 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
         prepare_command = config.get('prepare_command', '')
         steps = ([prepare_command] if prepare_command else []) + [command]
         report('running', checkpoint_dir=str(checkpoint_dir), results_dir=str(results_dir),
-               resumed=found_checkpoint, preflight=preflight_evidence)
+               resumed=found_checkpoint, preflight=preflight_evidence, data_cache=globals().get('cache'))
         log_path = results_dir / ('session_' + RUNTIME_ID + '.log')
         run_started = False
         try:
@@ -557,10 +633,14 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                         checkpoint_before_run = checkpoint_stamps() if check_resume_safety else {}
                         run_started = True
                     print('Executing:', step, flush=True)
-                    process = subprocess.Popen(step, shell=True, executable='/bin/bash',
+                    run_environment = os.environ.copy()
+                    if runtime_token is not None:
+                        run_environment['HF_TOKEN'] = runtime_token
+                    process = subprocess.Popen(step, shell=True, executable='/bin/bash', env=run_environment,
                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                text=True, bufsize=1)
                     for line in process.stdout:
+                        line = sanitize_output(line)
                         print(line, end='', flush=True)
                         log.write(line)
                     returncode = process.wait()
@@ -568,11 +648,21 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                     os.fsync(log.fileno())
                     if returncode:
                         raise subprocess.CalledProcessError(returncode, step)
-            validated = validate_scientific_result(results_dir, config.get('success_criteria'))
-            if drive_verified and validated.get('metrics_file'):
-                validated['runtime_release_safe'] = True
-            report('completed', returncode=0, checkpoint_dir=str(checkpoint_dir),
-                   results_dir=str(results_dir), log_path=str(log_path), preflight=preflight_evidence, **validated)
+            criteria = config.get('success_criteria')
+            screening_stop = None
+            if 'paired_seed_confirmation' in (criteria or {}):
+                transfer = config.get('hf_dataset_transfer') or config.get('full_data_transfer') or {}
+                screening_stop = validate_screening_stop(results_dir, criteria, transfer.get('manifest_sha256'))
+            if screening_stop:
+                report('failed', reason='screening_failed', runtime_release_safe=drive_verified,
+                       checkpoint_dir=str(checkpoint_dir), results_dir=str(results_dir),
+                       log_path=str(log_path), preflight=preflight_evidence, **screening_stop)
+            else:
+                validated = validate_scientific_result(results_dir, criteria)
+                if drive_verified and validated.get('metrics_file'):
+                    validated['runtime_release_safe'] = True
+                report('completed', returncode=0, checkpoint_dir=str(checkpoint_dir),
+                       results_dir=str(results_dir), log_path=str(log_path), preflight=preflight_evidence, **validated)
         except BaseException as exc:
             exitcode = getattr(exc, 'returncode', None)
             resumable = exitcode is not None and exitcode == session_exit_code
@@ -584,8 +674,15 @@ checkpoint 写入 Drive 的 `checkpoints/`；重连后运行此 notebook 会执�
                     current_checkpoints = {}
                 if any(checkpoint_before_run.get(path) != stamp for path, stamp in current_checkpoints.items()):
                     release = dict(runtime_release_safe=True)
+                    try:
+                        release['checkpoint_receipt'] = write_checkpoint_receipt(
+                            checkpoint_dir, current_checkpoints, SETTINGS['bundle_sha256'],
+                            (config.get('hf_dataset_transfer') or config.get('full_data_transfer') or {}).get('manifest_sha256'))
+                    except (OSError, ValueError) as receipt_error:
+                        print('Cross-runtime checkpoint checksum receipt could not be saved:',
+                              type(receipt_error).__name__, flush=True)
             report('disconnected' if resumable else 'failed', returncode=exitcode,
-                   reason=str(exc), checkpoint_dir=str(checkpoint_dir), log_path=str(log_path),
+                   reason=sanitize_output(str(exc)), checkpoint_dir=str(checkpoint_dir), log_path=str(log_path),
                    preflight=preflight_evidence, **release)
             raise
     """)

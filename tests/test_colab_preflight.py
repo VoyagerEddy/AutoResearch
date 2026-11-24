@@ -15,7 +15,10 @@ import uuid
 import pytest
 
 from autoresearch.colab_notebook import build_notebook
-from autoresearch.services.colab_data import validate_scientific_result
+from autoresearch.services.colab_data import (
+    copy_verified_shard, preflight_cuda, preflight_torchaudio, shard_matches,
+    validate_scientific_result, write_checkpoint_receipt,
+)
 
 
 def notebook_cells(config):
@@ -35,7 +38,7 @@ def context(tmp_path, config, monkeypatch):
     for path in (drive / 'results', drive / 'checkpoints', source, scratch):
         path.mkdir(parents=True, exist_ok=True)
     events = []
-    namespace = dict(SETTINGS={'config': config}, config=config, DRIVE_PROJECT=drive,
+    namespace = dict(SETTINGS={'config': config, 'bundle_sha256': 'a' * 64}, config=config, DRIVE_PROJECT=drive,
         SOURCE=source, RUNTIME_ID='runtime-preflight', PROJECT_ID='preflight-test',
         datetime=datetime, json=json, os=os, shutil=shutil, hashlib=hashlib,
         subprocess=subprocess, uuid=uuid,
@@ -43,6 +46,9 @@ def context(tmp_path, config, monkeypatch):
         estimate_ephemeral_disk_budget=lambda path, transfer: {'enough': True, 'required_bytes': 1, 'free_bytes': 100},
         file_sha256=lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest(),
         relative_data_path=lambda path: path,
+        copy_verified_shard=copy_verified_shard, shard_matches=shard_matches,
+        write_checkpoint_receipt=write_checkpoint_receipt, preflight_cuda=preflight_cuda,
+        preflight_torchaudio=preflight_torchaudio,
         reconstruct_artifacts=lambda *args: None,
         safe_extract_dev_archive=lambda *args, **kwargs: None)
     def report(status, **details):
@@ -368,6 +374,16 @@ def test_passed_preflight_is_required_before_real_bulk_cell_executes(tmp_path, m
         os.chdir(before)
     assert (tmp_path / 'scratch/train/shards/000000.tar').read_bytes() == payload
     assert not any(event['status'] in {'running', 'completed'} for event in events)
+    cached = metadata.parent / 'verified-shards' / hashlib.sha256(payload).hexdigest()
+    assert cached.read_bytes() == payload
+    new_runtime = tmp_path / 'new-runtime'
+    namespace.update(RUNTIME_ID='second-runtime',
+        pathlib=SimpleNamespace(Path=lambda value: new_runtime if str(value) == '/content/autoresearch-full-data' else Path(value)),
+        files=SimpleNamespace(upload=lambda: pytest.fail('A valid durable shard must not be uploaded again')))
+    exec(gate_source(config), namespace)
+    exec(bulk, namespace)
+    assert (new_runtime / 'train/shards/000000.tar').read_bytes() == payload
+    assert events[-1]['data_cache']['reused'] == 1
 
 
 @pytest.mark.parametrize(('outcome', 'expected_status', 'release_safe'), [

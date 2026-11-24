@@ -150,6 +150,8 @@ def build_resource_snapshot(
     status = status if isinstance(status, str) and status in JOB_STATUSES else "unknown"
     observation = source.get("last_observation")
     observation = observation if isinstance(observation, dict) else {}
+    if (observation.get("details") or {}).get("compute_provider") in {"local", "autodl"}:
+        observation = {}
     observed_status = observation.get("status")
     observed_status = observed_status if isinstance(observed_status, str) else "unknown"
     result = {"running": "available", "disconnected": "network"}.get(observed_status, observed_status)
@@ -198,8 +200,10 @@ def build_resource_snapshot(
     )
     availability = "available" if active_gpu and not stopped else "unavailable" if recent_denial else "unknown"
     message_key = "available" if availability == "available" else state
-    if state == "watching" and result in {"unavailable", "network"}:
-        message_key = result
+    if state == "watching" and status == "waiting_for_connection":
+        message_key = "network"
+    elif state == "watching" and status == "waiting_for_gpu" and result == "unavailable":
+        message_key = "unavailable"
     return {
         "project_id": project_id,
         "agent_name": AGENT_NAME,

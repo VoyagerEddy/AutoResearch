@@ -23,14 +23,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ..colab_notebook import build_notebook
+from ..colab_notebook import NOTEBOOK_REVISION, build_notebook
 from ..config import Settings
 from ..db import Database
 from ..domain import (
-    ColabNotebookBindingRequest, ColabObservationRequest, ColabPrepareRequest,
+    ColabFallbackTarget, ColabNotebookBindingRequest, ColabObservationRequest, ColabPrepareRequest,
     ColabRuntimeReleaseRequest,
 )
 from .artifacts import ArtifactStore
+from .colab_fallback import ACTIVE_BACKUP, validate_target
 
 
 class ColabConflict(ValueError):
@@ -48,9 +49,18 @@ EXCLUDED_NAMES = ArtifactStore.BLOCKED_NAMES | {
     'preparation_inputs.json', 'input_sources.json',
 }
 SECRET_PATTERN = re.compile(r'(?:sk-[A-Za-z0-9_-]{24,}|gh[pousr]_[A-Za-z0-9]{30,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)')
+HF_SECRET_PATTERN = re.compile(r'h[f]_[A-Za-z0-9]{16,}')
+HF_POINTER_ENTRY = 'autoresearch_hf_pointer.json'
+HF_RUNTIME_ENTRY = 'autoresearch_hf_dataset.py'
 RETRY_STATUSES = {'queued', 'waiting_for_gpu', 'waiting_for_connection', 'disconnected'}
 TERMINAL_STATUSES = {'completed', 'failed', 'cancelled', 'blocked'}
 FRAMEWORK_VERSION = re.compile(r'[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:\+(?:cu[0-9]{3,4}|cpu))?')
+ATTEMPT_RECEIPTS_IN_STATUS = 100
+BACKUP_WAIT = timedelta(hours=1)
+RECEIPT_STAGES = {'opening_notebook', 'verifying_notebook', 'loading_saved_notebook',
+                  'requesting_gpu', 'starting_notebook', 'gpu_probe', 'mounting_drive',
+                  'runtime_setup', 'preparing_data', 'training', 'drive_authorization',
+                  'google_sign_in', 'awaiting_action'}
 
 
 def _utc() -> datetime:
@@ -68,6 +78,20 @@ def _parse(value: str) -> datetime:
     return result.astimezone(timezone.utc)
 
 
+def _observation_code(request: ColabObservationRequest) -> str:
+    if request.status == 'unavailable':
+        return 'gpu_unavailable'
+    if request.status == 'quota':
+        return 'session_capacity' if request.details.get('provider_reason') == 'session_capacity' else 'quota'
+    if request.status == 'auth':
+        return {'drive_consent': 'drive_authorization', 'google_sign_in': 'google_sign_in',
+                'hf_dataset': 'hf_dataset_auth'}.get(
+            request.details.get('auth_kind'), 'authorization_required')
+    if request.status == 'network' and request.details.get('failure_kind') == 'notebook_timeout':
+        return 'notebook_timeout'
+    return request.status
+
+
 def _relative(value: str) -> str:
     return '/'.join(ArtifactStore._relative_parts(object.__new__(ArtifactStore), value))
 
@@ -81,7 +105,8 @@ def _colab_url(value: str) -> str:
     if not value:
         return ''
     parsed = urlparse(value)
-    if parsed.scheme != 'https' or parsed.hostname not in {'colab.research.google.com', 'colab.google'} or parsed.username or parsed.password:
+    if (parsed.scheme != 'https' or parsed.hostname not in {'colab.research.google.com', 'colab.google'}
+            or parsed.username or parsed.password or HF_SECRET_PATTERN.search(value)):
         raise ValueError('notebook_url must be an HTTPS Colab URL')
     return value
 
@@ -208,6 +233,9 @@ class ColabService:
     def _schedule(self, job: dict[str, Any], *, minimum: int | None = None) -> None:
         low = max(job.get('retry_min_minutes', 5), minimum or 5)
         high = max(job.get('retry_max_minutes', 10), low)
+        if job.get('consecutive_gpu_denials', 0) >= 3 and job['status'] == 'waiting_for_gpu':
+            low, high = max(low, 15), max(high, 30)
+        job['retry_delay_minutes'] = {'min': low, 'max': high}
         seconds = self._random.randint(low * 60, high * 60)
         next_at = _utc() + timedelta(seconds=seconds)
         provider_until = job.get('provider_retry_not_before')
@@ -215,6 +243,21 @@ class ColabService:
             next_at = max(next_at, _parse(provider_until))
         job['next_attempt_at'] = _stamp(next_at)
         job['lease_until'] = None
+
+    def _receipt(self, job: dict[str, Any], attempt: int, code: str, *, observed_at: str,
+                 stage: str | None = None, late: bool = False) -> None:
+        stage = stage if isinstance(stage, str) and stage in RECEIPT_STAGES else job.get('stage')
+        receipt = {'attempt_number': attempt, 'code': code, 'stage': stage,
+                   'observed_at': observed_at, 'late': late}
+        if job.get('next_attempt_at') and not late:
+            receipt['next_attempt_at'] = job['next_attempt_at']
+        history = job.setdefault('attempt_receipts', [])
+        identity = (attempt, code, receipt['stage'])
+        if any((row['attempt_number'], row['code'], row.get('stage')) == identity for row in history):
+            return
+        history.append(receipt)
+        del history[:-ATTEMPT_RECEIPTS_IN_STATUS]
+        self.db.add_event(job['project_id'], 'colab', f'Colab attempt {attempt}: {code}', details=receipt)
 
     def _read_profile_quota(self) -> dict[str,Any] | None:
         directory=self.settings.root/'data'/'colab-browser'
@@ -232,7 +275,8 @@ class ColabService:
         _parse(value['retry_not_before'])
         return value
 
-    def _publish_profile_quota(self, project_id: str, retry_after_minutes: int | None, job: dict[str,Any]) -> dict[str,Any]:
+    def _publish_profile_quota(self, project_id: str, retry_after_minutes: int | None, job: dict[str,Any],
+                               retry_not_before: datetime | None = None) -> dict[str,Any]:
         """Keep a single account-profile cooldown; repeated denials never slide it."""
         from ..colab_browser_cli import WorkerLock
 
@@ -256,16 +300,33 @@ class ColabService:
                 current={'scope':'default_browser_profile','observed_at':observed,'retry_not_before':until,
                          'retry_after_minutes':duration,'source_project_id':project_id}
             active=bool(current and _parse(current['retry_not_before'])>now)
-            if not active:
+            if retry_not_before is not None and retry_not_before > now:
+                # A timestamp is unambiguous and may replace a conservative
+                # estimate. Keep a concurrent, later explicit provider limit.
+                deadline = retry_not_before
+                if active and current.get('explicit_deadline'):
+                    deadline = max(deadline, _parse(current['retry_not_before']))
+                minutes = max(1, int((deadline - now).total_seconds() / 60) + 1)
+                current={'scope':'default_browser_profile','observed_at':_stamp(now),
+                         'retry_not_before':_stamp(deadline),'retry_after_minutes':minutes,
+                         'source_project_id':project_id,'explicit_deadline':True}
+            elif not active:
                 minutes=retry_after_minutes if retry_after_minutes is not None else 720
                 current={'scope':'default_browser_profile','observed_at':_stamp(now),
                          'retry_not_before':_stamp(now+timedelta(minutes=minutes)),
-                         'retry_after_minutes':minutes,'source_project_id':project_id}
+                         'retry_after_minutes':minutes,'source_project_id':project_id,
+                         'explicit_duration':retry_after_minutes is not None}
+            elif retry_after_minutes is not None and not any(
+                    current.get(key) for key in ('explicit_duration','explicit_deadline')):
+                current={**current,'retry_not_before':_stamp(now+timedelta(minutes=retry_after_minutes)),
+                         'observed_at':_stamp(now),'retry_after_minutes':retry_after_minutes,
+                         'explicit_duration':True,'source_project_id':project_id}
             elif retry_after_minutes is not None and retry_after_minutes>current['retry_after_minutes']:
                 # Only a newly observed, explicitly longer provider duration
                 # can extend an active barrier. Repeating it cannot extend it.
                 current={**current,'retry_not_before':_stamp(max(_parse(current['retry_not_before']),now+timedelta(minutes=retry_after_minutes))),
-                         'observed_at':_stamp(now),'retry_after_minutes':retry_after_minutes,'source_project_id':project_id}
+                         'observed_at':_stamp(now),'retry_after_minutes':retry_after_minutes,
+                         'explicit_duration':True,'source_project_id':project_id}
             path=directory/'gpu-quota.json'
             if path.exists() and _linked(path):
                 raise ValueError('Colab profile quota state must not be linked')
@@ -338,8 +399,14 @@ class ColabService:
             if shared and _parse(shared['retry_not_before'])>now:
                 deadline=shared['retry_not_before']
                 changed=False
-                if not job.get('provider_retry_not_before') or _parse(job['provider_retry_not_before'])<_parse(deadline):
+                previous_shared = job.get('shared_quota_retry_not_before')
+                replace_estimate = (previous_shared and previous_shared != deadline
+                    and job.get('provider_retry_not_before') == previous_shared
+                    and any(shared.get(key) for key in ('explicit_deadline', 'explicit_duration')))
+                if replace_estimate or not job.get('provider_retry_not_before') or _parse(job['provider_retry_not_before'])<_parse(deadline):
                     job['provider_retry_not_before']=deadline
+                    if replace_estimate and job.get('next_attempt_at') == previous_shared:
+                        job['next_attempt_at'] = deadline
                     changed=True
                 if job.get('shared_quota_retry_not_before')!=deadline:
                     job['shared_quota_retry_not_before']=deadline
@@ -353,12 +420,13 @@ class ColabService:
             except ImportError:
                 worker_pid = None
             release = job.get('runtime_release') or {}
+            backup_active = (job.get('backup') or {}).get('status') in ACTIVE_BACKUP
             if (release.get('status') == 'pending' and worker_pid is None
                     and (now - _parse(release['requested_at'])).total_seconds() >= 60):
                 release.update(status='unknown', reported_at=_stamp(now), reason='worker_exited')
                 self._write(project_id, job)
             if (job.get('prepared') and job.get('autorun_enabled')
-                    and job['status'] in {'running', 'gpu_available'} and worker_pid is None):
+                    and job['status'] in {'running', 'gpu_available'} and worker_pid is None and not backup_active):
                 # A new child needs time to replace the Windows venv-launcher
                 # PID. Fresh observations must not race that identity handoff.
                 observation = job.get('last_observation') or {}
@@ -398,7 +466,9 @@ class ColabService:
             if job.get('status') == 'attempting' and job.get('lease_until') and _parse(job['lease_until']) <= now:
                 job['status'] = 'waiting_for_connection'
                 job['blocked_reason'] = 'Browser attempt expired without an observation; a new attempt is scheduled.'
+                job['consecutive_gpu_denials'] = 0
                 self._schedule(job)
+                self._receipt(job, job['attempt_count'], 'notebook_timeout', observed_at=_stamp(now))
                 self._write(project_id, job)
             provider_until = job.get('provider_retry_not_before')
             if (job['status'] in RETRY_STATUSES and provider_until and _parse(provider_until) > now
@@ -408,12 +478,13 @@ class ColabService:
                 self._write(project_id, job)
             job['source_current'] = self.source_matches_prepared_bundle(project_id)
             job['can_attempt'] = bool(job.get('prepared') and job['source_current'] is not False and job['status'] in RETRY_STATUSES
-                and release.get('status') != 'pending'
+                and release.get('status') != 'pending' and not backup_active
                 and job.get('next_attempt_at') and _parse(job['next_attempt_at']) <= now)
             job['queue_only'] = job['status'] in RETRY_STATUSES
             job['rules_url'] = 'https://research.google.com/colaboratory/faq.html'
             job['worker_pid'] = worker_pid
             job['worker_running'] = worker_pid is not None
+            job['pending_notice'] = self._pending_notice(job)
             return job
 
     def due_jobs(self) -> list[dict[str, Any]]:
@@ -594,6 +665,8 @@ class ColabService:
                 relative = _relative(path.relative_to(generated).as_posix())
                 if relative in excluded:
                     continue
+                if relative.casefold() in {HF_POINTER_ENTRY, HF_RUNTIME_ENTRY}:
+                    raise ValueError('Generated source uses a reserved HF dataset runtime filename')
                 size = path.stat().st_size
                 if size > 5_000_000:
                     raise ValueError(f'Source file exceeds 5 MB: {relative}')
@@ -602,11 +675,26 @@ class ColabService:
                     raise ValueError('Source bundle exceeds the export size limit')
                 content = path.read_bytes()
                 decoded = content.decode('utf-8', errors='replace')
+                if HF_SECRET_PATTERN.search(relative) or HF_SECRET_PATTERN.search(decoded):
+                    raise ValueError('Colab source export refused a possible embedded Hugging Face credential')
                 if SECRET_PATTERN.search(decoded):
                     raise ValueError(f'Source export refused a possible embedded secret in {relative}')
                 pending.append((relative, content))
         if not pending:
             raise ValueError('No generated source files available for Colab export')
+        manifest = json.loads(dict(pending)['experiment_manifest.json'].decode('utf-8-sig'))
+        declaration = manifest.get('colab', {}).get('hf_dataset_transfer')
+        if declaration is not None:
+            from .colab_data import prepare_hf_dataset_transfer
+
+            pointer = prepare_hf_dataset_transfer(generated, declaration)
+            if pointer is not None:
+                payload = json.dumps(pointer, sort_keys=True)
+                if HF_SECRET_PATTERN.search(payload):
+                    raise ValueError('HF dataset pointer contains a possible Hugging Face credential')
+                runtime = Path(__file__).resolve().parents[1] / 'hf_dataset.py'
+                pending.extend([(HF_POINTER_ENTRY, payload.encode('utf-8')),
+                                (HF_RUNTIME_ENTRY, runtime.read_bytes())])
         return sorted(pending)
 
     @staticmethod
@@ -643,8 +731,7 @@ class ColabService:
         except (OSError, ValueError, zipfile.BadZipFile, KeyError, TypeError):
             return False
 
-    def _bundle(self, generated: Path, target: Path) -> dict[str, Any]:
-        pending = self._source_entries(generated)
+    def _bundle(self, pending: list[tuple[str, bytes]], target: Path) -> dict[str, Any]:
         temp = target.with_suffix('.zip.tmp')
         for path in (target, temp):
             if path.exists() and _linked(path):
@@ -671,6 +758,8 @@ class ColabService:
             job = self._read(project_id)
             if job['status'] in {'running', 'attempting', 'gpu_available'}:
                 raise ColabConflict('A Colab attempt or experiment is active; cancel before preparing again')
+            if (job.get('backup') or {}).get('status') in ACTIVE_BACKUP:
+                raise ColabConflict('An approved backup GPU is already checking or executing this experiment')
             if (job.get('runtime_release') or {}).get('status') == 'pending':
                 raise ColabConflict('Wait for the current Colab runtime release observation before preparing again')
             project = self.db.get_project(project_id)
@@ -681,6 +770,7 @@ class ColabService:
             previous_bundle_sha256 = job.get('bundle_sha256')
             previous_drive_root = job.get('drive_root')
             previous_notebook_url = job.get('notebook_url', '')
+            previous_revision = job.get('notebook_revision')
             job.update(project_id=project_id, retry_min_minutes=request.retry_min_minutes,
                        retry_max_minutes=request.retry_max_minutes, drive_root=drive_root,
                        drive_project_dir=f'/content/drive/MyDrive/{drive_root}/{project_id}',
@@ -689,12 +779,24 @@ class ColabService:
                 config = self._contract(generated)
                 from .colab_data import prepare_full_data_transfer
 
-                transfer = prepare_full_data_transfer(generated, config.get('full_data_transfer'), project_id=project_id)
-                if transfer['full_data_transfer'] is not None:
+                entries = self._source_entries(generated)
+                hf_pointer = dict(entries).get(HF_POINTER_ENTRY)
+                config.pop('hf_dataset_transfer', None)
+                if hf_pointer is not None:
+                    hf_transfer = json.loads(hf_pointer)
+                    config.pop('full_data_transfer', None)
+                    config['hf_dataset_transfer'] = hf_transfer
+                    transfer = {'data_upload_files': [],
+                                'approved_data_manifest': {'source': 'hf_private_dataset',
+                                    'path': hf_transfer['manifest_path'], 'sha256': hf_transfer['manifest_sha256'],
+                                    'repo_id': hf_transfer['repo_id'], 'revision': hf_transfer['revision']}}
+                else:
+                    transfer = prepare_full_data_transfer(generated, config.get('full_data_transfer'), project_id=project_id)
+                if transfer.get('full_data_transfer') is not None:
                     config = {**config, 'full_data_transfer': transfer['full_data_transfer'],
                               'input_archive': transfer['input_archive'],
                               'required_drive_paths': transfer['required_drive_paths']}
-                stats = self._bundle(generated, directory / 'source.zip')
+                stats = self._bundle(entries, directory / 'source.zip')
                 input_stats = {'input_bundle_path': '', 'input_bundle_url': '',
                                'input_bundle_sha256': '', 'input_bundle_bytes': 0}
                 input_stats.update(self._input_bundle(generated, config, directory / 'inputs.zip'))
@@ -716,26 +818,34 @@ class ColabService:
             previous_next = job.get('next_attempt_at')
             changed_source = previous_bundle_sha256 and previous_bundle_sha256 != stats['bundle_sha256']
             changed_drive_root = previous_drive_root and previous_drive_root != drive_root
-            if not url and (changed_source or changed_drive_root):
+            changed_revision = bool(previous_bundle_sha256 and previous_revision != NOTEBOOK_REVISION)
+            if not url and (changed_source or changed_drive_root or changed_revision):
                 # An existing Drive notebook embeds its own source/settings;
                 # opening its old URL would ignore this newly prepared export.
                 job['notebook_url'] = ''
                 job['browser_url'] = ''
-            if changed_source or changed_drive_root or (url and url != previous_notebook_url):
+            if changed_source or changed_drive_root or changed_revision or (url and url != previous_notebook_url):
                 job.pop('notebook_bundle_sha256', None)
                 job.pop('notebook_bound_at', None)
             keep_cooldown = previous_status in {'waiting_for_gpu', 'waiting_for_connection', 'disconnected'} and previous_next and _parse(previous_next) > _utc()
             job.update(prepared=True, status=previous_status if keep_cooldown else 'queued',
                        next_attempt_at=previous_next if keep_cooldown else now, lease_until=None,
                        blocked_reason='', notebook_path=str(notebook_path), bundle_path=str(directory / 'source.zip'),
+                       notebook_revision=NOTEBOOK_REVISION,
                        notebook_download_url=f'/api/projects/{project_id}/colab/notebook.ipynb',
                        bundle_url=f'/api/projects/{project_id}/colab/bundle.zip',
                        checkpoint_contract=config['checkpoint'], success_criteria=config.get('success_criteria'),
-                       runtime_requirements=config.get('runtime_requirements'),
+                       runtime_requirements=config.get('runtime_requirements'), prepared_config=config,
                        **stats, **input_stats)
             job.pop('completion', None)
+            job.setdefault('training_started', bool(job.get('running_at')))
             job['data_upload_files'] = transfer['data_upload_files']
-            if changed_source or changed_drive_root or previous_status in TERMINAL_STATUSES:
+            if job.get('approved_data_manifest') != transfer.get('approved_data_manifest'):
+                for key in ('waiting_data_check', 'waiting_checkpoint_check', 'checkpoint_receipt', 'data_cache',
+                            'backup_approval', 'backup'):
+                    job.pop(key, None)
+            job['approved_data_manifest'] = transfer.get('approved_data_manifest')
+            if changed_source or changed_drive_root or changed_revision or previous_status in TERMINAL_STATUSES:
                 # A runtime belongs to its embedded source and Drive scope.
                 # Reusing its auth/connection marker could attach an old smoke
                 # notebook after the project was prepared for a full campaign.
@@ -746,6 +856,11 @@ class ColabService:
                     job.pop(key, None)
                 job['last_observation'] = None
                 job['last_attempt_at'] = None
+                if changed_source or changed_drive_root:
+                    job.pop('checkpoint_receipt', None)
+                    job.pop('training_started', None)
+                    job.pop('backup_approval', None)
+                    job.pop('backup', None)
             self._write(project_id, job)
             self.db.add_event(project_id, 'colab', 'Colab notebook exported; GPU availability has not been checked.', details={'status': 'queued'})
             return self.status(project_id)
@@ -760,6 +875,8 @@ class ColabService:
                        last_attempt_at=_stamp(now), lease_until=_stamp(now + timedelta(minutes=10)),
                        stage='opening_notebook', stage_updated_at=_stamp(now),
                        next_attempt_at=None, blocked_reason='')
+            if job.get('autorun_enabled') and not job.get('gpu_wait_started_at') and not job.get('runtime_id'):
+                job['gpu_wait_started_at'] = _stamp(now)
             self._write(project_id, job)
             return self.status(project_id)
 
@@ -790,11 +907,13 @@ class ColabService:
             # This operation deliberately changes only the notebook metadata.
             return dict(job)
 
-    def record_stage(self, project_id: str, stage: str) -> dict[str, Any]:
+    def record_stage(self, project_id: str, stage: str, attempt_number: int | None = None) -> dict[str, Any]:
         with self._transaction(project_id):
             job = self._read(project_id)
             if job['status'] not in {'attempting', 'gpu_available', 'running'}:
                 raise ColabConflict('The Colab job is not executing a browser stage')
+            if attempt_number is not None and attempt_number != job['attempt_count']:
+                raise ColabConflict('This Colab stage belongs to another attempt')
             if job.get('stage') != stage:
                 job.update(stage=stage, stage_updated_at=_stamp(_utc()))
                 self._write(project_id, job)
@@ -837,12 +956,27 @@ class ColabService:
 
     def observe(self, project_id: str, request: ColabObservationRequest) -> dict[str, Any]:
         serialized = json.dumps(request.details, ensure_ascii=False)
+        if HF_SECRET_PATTERN.search(serialized):
+            raise ValueError('Colab observation contains a possible Hugging Face credential')
         if len(serialized) > 20_000:
             raise ValueError('Observation details exceed 20 KB')
         with self._transaction(project_id):
             job = self._read(project_id)
             if not job.get('prepared') or job['status'] in TERMINAL_STATUSES:
                 raise ColabConflict('The Colab job is not active')
+            current_attempt = job['attempt_count']
+            attempt = request.attempt_number if request.attempt_number is not None else current_attempt
+            code = _observation_code(request)
+            observed_at = _stamp(_utc())
+            if attempt > current_attempt:
+                raise ColabConflict('This Colab observation names an unclaimed attempt')
+            if attempt < current_attempt or (job.get('backup') or {}).get('status') in ACTIVE_BACKUP:
+                self._receipt(job, attempt, code, observed_at=observed_at, stage=request.details.get('stage'), late=True)
+                self._write(project_id, job)
+                return self.status(project_id)
+            if (request.status == 'unavailable' and job.get('last_gpu_denial_attempt') == attempt
+                    and job['status'] == 'waiting_for_gpu'):
+                return self.status(project_id)
             previous_quota_job=dict(job)
             if request.status == 'completed':
                 runtime_id = request.details.get('runtime_id')
@@ -855,18 +989,21 @@ class ColabService:
                 except ValueError as exc:
                     raise ColabConflict(str(exc)) from None
                 job['completion'] = completion
-            observed_at = _stamp(_utc())
             release = self._pending_release(job, request, observed_at)
+            timed_out = any(row['attempt_number'] == attempt and row['code'] == 'notebook_timeout'
+                            for row in job.get('attempt_receipts', []))
             # A local browser/network failure must not replace a provider GPU
             # cooldown with a shorter connection retry, including after restart.
             provider_until = job.get('provider_retry_not_before')
             if (request.status in {'network', 'disconnected'} and job['status'] == 'waiting_for_gpu'
                     and provider_until and _parse(provider_until) > _utc()):
                 job['last_connection_observation'] = {'status': request.status, 'details': request.details,
-                                                       'observed_at': observed_at}
+                                                       'observed_at': observed_at, 'attempt_number': attempt}
+                self._receipt(job, attempt, code, observed_at=observed_at, late=timed_out)
                 self._write(project_id, job)
                 return self.status(project_id)
-            job['last_observation'] = {'status': request.status, 'details': request.details, 'observed_at': observed_at}
+            job['last_observation'] = {'status': request.status, 'details': request.details,
+                                       'observed_at': observed_at, 'attempt_number': attempt}
             browser_url = request.details.get('browser_url')
             if isinstance(browser_url, str) and browser_url:
                 job['browser_url'] = _colab_url(browser_url)
@@ -881,7 +1018,9 @@ class ColabService:
                         'running': 'running', 'completed': 'completed', 'failed': 'failed'}
             job['status'] = statuses[request.status]
             stage = None
-            if request.status == 'available' and job.get('stage') not in {'preparing_data', 'training'}:
+            if request.status == 'unavailable' and request.details.get('phase') == 'gpu_probe':
+                stage = 'gpu_probe'
+            elif request.status == 'available' and job.get('stage') not in {'preparing_data', 'training'}:
                 stage = 'runtime_setup'
             elif request.status == 'running':
                 stage = 'training'
@@ -892,10 +1031,32 @@ class ColabService:
                 job.update(stage=stage, stage_updated_at=observed_at)
             if release:
                 job['runtime_release'] = release
+            checkpoint = request.details.get('checkpoint_receipt')
+            if (request.status == 'disconnected' and isinstance(checkpoint, dict)
+                    and request.details.get('runtime_id') == job.get('runtime_id')
+                    and re.fullmatch(r'[0-9a-f]{64}', str(checkpoint.get('sha256') or ''))
+                    and type(checkpoint.get('file_count')) is int and checkpoint['file_count'] > 0):
+                job['checkpoint_receipt'] = {'sha256': checkpoint['sha256'], 'file_count': checkpoint['file_count'],
+                                             'observed_at': observed_at, 'bundle_sha256': job['bundle_sha256']}
+            cache = request.details.get('data_cache')
+            if request.status == 'running' and isinstance(cache, dict):
+                job['data_cache'] = {key: cache[key] for key in ('reused', 'persisted')
+                                     if type(cache.get(key)) is int and cache[key] >= 0}
+                if cache.get('write_status') in {'available', 'unavailable'}:
+                    job['data_cache']['write_status'] = cache['write_status']
+            if request.status in {'unavailable', 'quota'}:
+                job['gpu_wait_started_at'] = job.get('gpu_wait_started_at') or observed_at
+            if request.status in {'available', 'running'}:
+                job.pop('gpu_wait_started_at', None)
+            if request.status != 'unavailable':
+                job['consecutive_gpu_denials'] = 0
+            elif job.get('last_gpu_denial_attempt') != attempt:
+                job['consecutive_gpu_denials'] = job.get('consecutive_gpu_denials', 0) + 1
+                job['last_gpu_denial_attempt'] = attempt
             if request.status in {'unavailable', 'quota', 'network', 'disconnected'}:
                 minimum = request.retry_after_minutes
                 if request.status=='quota':
-                    quota=self._publish_profile_quota(project_id,minimum,previous_quota_job)
+                    quota=self._publish_profile_quota(project_id,minimum,previous_quota_job,request.retry_not_before)
                     job.update(next_attempt_at=quota['retry_not_before'],provider_retry_not_before=quota['retry_not_before'],
                                shared_quota_retry_not_before=quota['retry_not_before'])
                 else:
@@ -938,12 +1099,188 @@ class ColabService:
                 job.pop('recovery', None)
             if request.status == 'running':
                 job['running_at'] = observed_at
+                job['training_started'] = True
             if request.status in {'completed', 'failed'}:
                 job['finished_at'] = observed_at
+            self._receipt(job, attempt, code, observed_at=observed_at,
+                          stage='gpu_probe' if request.details.get('phase') == 'gpu_probe' else None,
+                          late=timed_out)
             self._write(project_id, job)
             self.db.add_event(project_id, 'colab', f'Colab browser observation: {request.status}',
-                              details={'status': job['status'], 'next_attempt_at': job.get('next_attempt_at')})
+                              details={'status': job['status'], 'next_attempt_at': job.get('next_attempt_at'),
+                                       'attempt_number': attempt, 'stage': job.get('stage')})
             return self.status(project_id)
+
+    def verify_waiting_inputs(self, project_id: str) -> None:
+        from .colab_data import verify_waiting_data
+        from .colab_fallback_worker import verify_backup_checkpoint
+
+        with self._transaction(project_id):
+            job = self._read(project_id)
+            if job['status'] not in RETRY_STATUSES or not job.get('approved_data_manifest'):
+                return
+            previous = job.get('waiting_data_check') or {}
+            check_data = (previous.get('status') == 'checking' or not previous.get('checked_at')
+                          or _utc() - _parse(previous['checked_at']) >= timedelta(hours=1))
+            if check_data and previous.get('status') != 'checking':
+                previous = {}
+        checkpoint_receipt = job.get('checkpoint_receipt')
+        checkpoint_check = job.get('waiting_checkpoint_check') or {}
+        check_checkpoint = checkpoint_receipt and checkpoint_check.get('sha256') != checkpoint_receipt['sha256']
+        if not check_data and not check_checkpoint:
+            return
+        checked = verify_waiting_data(job, previous) if check_data else None
+        if check_checkpoint:
+            checkpoint_check = {'status': 'colab_receipt', 'sha256': checkpoint_receipt['sha256']}
+            approval = job.get('backup_approval') or {}
+            local = next((target for target in approval.get('targets', []) if target['provider'] == 'local'), None)
+            if local and approval.get('bundle_sha256') == job['bundle_sha256']:
+                try:
+                    root = Path(local['state_dir']).resolve(strict=True) / 'checkpoints'
+                    verify_backup_checkpoint(root, job['checkpoint_contract'], checkpoint_receipt,
+                                             job['bundle_sha256'], job['approved_data_manifest']['sha256'], True)
+                except (OSError, ValueError):
+                    checkpoint_check['status'] = 'mirror_not_verified'
+                else:
+                    checkpoint_check['status'] = 'mirror_verified'
+        with self._transaction(project_id):
+            current = self._read(project_id)
+            if (current['status'] in RETRY_STATUSES
+                    and current.get('approved_data_manifest') == job.get('approved_data_manifest')
+                    and current.get('bundle_sha256') == job.get('bundle_sha256')):
+                if checked is not None:
+                    current['waiting_data_check'] = {**checked, 'checked_at': _stamp(_utc())}
+                if checkpoint_check and current.get('checkpoint_receipt') == checkpoint_receipt:
+                    current['waiting_checkpoint_check'] = checkpoint_check
+                self._write(project_id, current)
+
+    @staticmethod
+    def _pending_notice(job: dict[str, Any]) -> dict[str, str] | None:
+        observation = job.get('last_observation') or {}
+        auth = (observation.get('details') or {}).get('auth_kind')
+        if job['status'] == 'auth_required' and auth in {'drive_consent', 'google_sign_in'}:
+            kind = 'drive_authorization' if auth == 'drive_consent' else 'google_sign_in'
+            message = ('Colab 已在专用窗口等待 Google Drive 授权。完成授权后，工作器会重新检查并接续。'
+                       if auth == 'drive_consent' else 'Colab 已进入 Google 登录环节，请在专用窗口完成登录。')
+        elif job['status'] in RETRY_STATUSES and (job.get('backup') or {}).get('status') == 'awaiting_approval':
+            kind = 'backup_gpu_approval'
+            message = 'Colab 等待 GPU 已超过一小时。启用备用 GPU 需要在聊天中批准目标与执行范围，Colab 队列会继续重试。'
+        else:
+            return None
+        data_sha256 = (job.get('approved_data_manifest') or {}).get('sha256')
+        identity = f"{job['project_id']}:{job.get('bundle_sha256')}:{data_sha256}:{job.get('drive_project_dir')}:{kind}"
+        notice_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
+        if notice_id in job.get('claimed_notices', []):
+            return None
+        return {'id': notice_id, 'kind': kind, 'message': message}
+
+    def claim_notice(self, project_id: str, notice_id: str) -> dict[str, str] | None:
+        with self._transaction(project_id):
+            job = self._read(project_id)
+            notice = self._pending_notice(job)
+            if not notice or notice['id'] != notice_id:
+                return None
+            job['claimed_notices'] = (job.get('claimed_notices', []) + [notice_id])[-100:]
+            self._write(project_id, job)
+            return notice
+
+    def authorize_backup(self, project_id: str, targets: list[ColabFallbackTarget]) -> None:
+        if not 1 <= len(targets) <= 2 or len({target.provider for target in targets}) != len(targets):
+            raise ValueError('Approve one target per backup provider')
+        validated = sorted((validate_target(target) for target in targets), key=lambda target: target['provider'] != 'local')
+        with self._transaction(project_id):
+            job = self.status(project_id)
+            if (not job.get('prepared_config') or not job.get('prepared') or job['source_current'] is not True
+                    or job['status'] in TERMINAL_STATUSES):
+                raise ColabConflict('Prepare the current Colab source before approving a backup GPU')
+            if (job.get('backup') or {}).get('status') in ACTIVE_BACKUP:
+                raise ColabConflict('A backup GPU is already checking or executing this experiment')
+            job['backup_approval'] = {'bundle_sha256': job['bundle_sha256'], 'targets': validated,
+                                      'data_manifest_sha256': (job.get('approved_data_manifest') or {}).get('sha256'),
+                                      'approved_at': _stamp(_utc())}
+            job['backup'] = {'status': 'authorized'}
+            job.pop('waiting_checkpoint_check', None)
+            self._write(project_id, job)
+
+    def reserve_backup(self, project_id: str) -> dict[str, Any] | None:
+        with self._transaction(project_id):
+            job = self.status(project_id)
+            now = _utc()
+            waited_since = job.get('gpu_wait_started_at')
+            if (job['status'] not in {'waiting_for_gpu', 'waiting_for_connection'} or not job.get('autorun_enabled')
+                    or not waited_since or now - _parse(waited_since) < BACKUP_WAIT
+                    or job['worker_running'] or job['source_current'] is not True
+                    or (job.get('runtime_release') or {}).get('status') == 'pending'
+                    or job.get('authorization_continuation')
+                    or (job.get('recovery') or {}).get('mode') == 'attach'):
+                return None
+            backup = job.get('backup') or {}
+            if backup.get('status') in ACTIVE_BACKUP:
+                return None
+            approval = job.get('backup_approval') or {}
+            if (not job.get('prepared_config') or approval.get('bundle_sha256') != job.get('bundle_sha256')
+                    or approval.get('data_manifest_sha256') != (job.get('approved_data_manifest') or {}).get('sha256')
+                    or not approval.get('targets')):
+                if backup.get('status') != 'awaiting_approval':
+                    job['backup'] = {'status': 'awaiting_approval'}
+                    self._write(project_id, job)
+                return None
+            if backup.get('next_check_at') and _parse(backup['next_check_at']) > now:
+                return None
+            index = backup.get('target_index', 0)
+            target = approval['targets'][index]
+            job['backup'] = {'status': 'launching', 'provider': target['provider'], 'target': target,
+                             'target_index': index, 'run_id': uuid.uuid4().hex, 'started_at': _stamp(now)}
+            self._write(project_id, job)
+            return job
+
+    def record_backup(self, project_id: str, run_id: str, receipt: dict[str, Any], *, launched: bool = False) -> None:
+        with self._transaction(project_id):
+            job = self._read(project_id)
+            backup = job.get('backup') or {}
+            if backup.get('run_id') != run_id or backup.get('status') not in ACTIVE_BACKUP:
+                return
+            status, previous_status = receipt.get('status'), backup.get('status')
+            if not launched and receipt.get('run_id') != run_id and status != 'unknown':
+                return
+            if not launched and 'run_id' in receipt and receipt.get('bundle_sha256') != job.get('bundle_sha256'):
+                return
+            if status not in {*ACTIVE_BACKUP, 'not_ready', 'completed', 'failed'}:
+                return
+            now = _utc()
+            backup.update(status=status, observed_at=_stamp(now))
+            if isinstance(receipt.get('reason'), str):
+                backup['reason'] = receipt['reason'][:400]
+            else:
+                backup.pop('reason', None)
+            if launched and type(receipt.get('pid')) is int:
+                backup['pid'] = receipt['pid']
+            if status == 'not_ready':
+                count = len(job['backup_approval']['targets'])
+                following = backup['target_index'] + 1
+                backup.update(target_index=following % count,
+                              next_check_at=_stamp(now if following < count else now + timedelta(minutes=15)))
+            if status in {'running', 'completed', 'failed'}:
+                details = {'runtime_id': run_id, 'compute_provider': backup['provider']}
+                if status == 'failed' and receipt.get('failure_kind') == 'screening_failed':
+                    details.update(failure_kind='screening_failed', scientific_metrics_produced=False)
+                if status == 'completed':
+                    from .colab_data import validate_completion_details
+
+                    if not isinstance(receipt.get('result'), dict):
+                        raise ValueError('Backup completion has no current-run metrics receipt')
+                    job['completion'] = validate_completion_details(receipt['result'], job.get('success_criteria'))
+                    details.update(job['completion'], returncode=0)
+                job.update(status=status, runtime_id=run_id, stage='training', stage_updated_at=_stamp(now),
+                           next_attempt_at=None, lease_until=None, training_started=True,
+                           blocked_reason=backup.get('reason', ''),
+                           last_observation={'status': status, 'details': details, 'observed_at': _stamp(now)})
+                if status in TERMINAL_STATUSES:
+                    job['finished_at'] = _stamp(now)
+            self._write(project_id, job)
+            if status != previous_status:
+                self.db.add_event(project_id, 'colab', f"Approved {backup['provider']} backup: {status}",
+                                  details={'provider': backup['provider'], 'status': status, 'run_id': run_id})
 
     def resume(self, project_id: str) -> dict[str, Any]:
         with self._transaction(project_id):
@@ -987,6 +1324,10 @@ class ColabService:
     def cancel(self, project_id: str) -> dict[str, Any]:
         with self._transaction(project_id):
             job = self._read(project_id)
+            if (job.get('backup') or {}).get('status') in ACTIVE_BACKUP:
+                job.update(autorun_enabled=False, next_attempt_at=None)
+                self._write(project_id, job)
+                return self.status(project_id)
             job.update(status='cancelled', next_attempt_at=None, lease_until=None, autorun_enabled=False,
                        blocked_reason='Local retry queue stopped. Stop an active Colab runtime in its browser UI.')
             job.pop('recovery', None)

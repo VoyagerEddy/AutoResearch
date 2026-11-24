@@ -12,6 +12,7 @@ from .domain import (
     AutoDLExperimentRequest,
     ChatGPTAnalysisRequest,
     ChatGPTProjectRequest,
+    ColabFallbackTarget,
     ColabNotebookBindingRequest,
     ColabPrepareRequest,
     CodeGenerationRequest,
@@ -62,6 +63,16 @@ class ChatGPTBridge:
         from .services.colab_resource_monitor import resource_monitor_status
 
         return resource_monitor_status(self.settings.root, project_id)
+
+    def authorize_colab_backup(self, project_id: str, targets: list[ColabFallbackTarget], *,
+                               confirm_execute: bool) -> dict[str, Any]:
+        if not confirm_execute:
+            raise ValueError("Confirm the exact source, commands, target, data access and any existing-instance costs")
+        self.colab.authorize_backup(project_id, targets)
+        return self.colab_status(project_id)
+
+    def claim_colab_notice(self, project_id: str, notice_id: str) -> dict[str, Any]:
+        return {"project_id": project_id, "notice": self.colab.claim_notice(project_id, notice_id)}
 
     def save_research_plan(self, project_id: str, plan: dict[str, Any]) -> dict[str, Any]:
         from .services.research_workflow import ResearchWorkflowService
@@ -132,6 +143,9 @@ class ChatGPTBridge:
             raise ValueError("Prepare the Colab experiment notebook first")
         if job.get("status") in {"completed", "failed", "cancelled"}:
             raise ValueError("Prepare the Colab notebook again before starting another run")
+        if (job.get("backup") or {}).get("status") in {"launching", "checking", "running", "unknown"}:
+            return {"project_id": project_id, "status": "observing_backup",
+                    "next_action": self._colab_next_action(job)}
         if self.colab.source_matches_prepared_bundle(project_id) is not True:
             raise ValueError("Prepared Colab source is missing or changed; prepare the notebook again before execution")
         job = self.colab.enable_autorun(project_id, browser or job.get("browser", "auto"))
@@ -202,6 +216,7 @@ class ChatGPTBridge:
         job = self.colab.status(project_id)
         observation = job.get("last_observation") or {}
         details = observation.get("details") or {}
+        platform = details.get("compute_provider") or "colab"
         runtime_id = job.get("runtime_id")
         current_runtime = bool(runtime_id and details.get("runtime_id") == runtime_id)
         source_current = self.colab.source_matches_prepared_bundle(project_id)
@@ -209,7 +224,7 @@ class ChatGPTBridge:
         completion = None
         if job.get("status") == "completed":
             if not current_runtime or observation.get("status") != "completed" or details.get("returncode") != 0:
-                issues.append("No successful completion observation from the currently tracked Colab runtime")
+                issues.append("No successful completion observation from the currently tracked run")
             elif source_current is not True:
                 issues.append("The current code does not match the source prepared for this Colab run")
             else:
@@ -226,7 +241,7 @@ class ChatGPTBridge:
         return {
             "project_id": project_id,
             "experiment_id": f"colab:{project_id}:{runtime_id}" if runtime_id else None,
-            "platform": "colab",
+            "platform": platform,
             "status": job.get("status"),
             "result_status": "validated" if completion else "pending_evidence" if job.get("status") == "completed" else "failed" if job.get("status") == "failed" else "pending",
             "execution_completed": completion is not None,
@@ -250,7 +265,7 @@ class ChatGPTBridge:
                 "prepared_bundle_sha256": job.get("bundle_sha256"),
                 "source_current": source_current,
                 "metrics_file": completion.get("metrics_file") if completion else None,
-                "origin": "current_notebook_observation" if completion else "not_verified",
+                "origin": ("current_notebook_observation" if platform == "colab" else "current_backup_observation") if completion else "not_verified",
             },
             "blocking_issues": issues,
             "next_action": {"action": "analyze_results", "message": "ChatGPT should analyze these measured results and save the analysis and next research decision."} if completion else self._colab_next_action(job),
@@ -281,8 +296,15 @@ class ChatGPTBridge:
                   "runtime_id", "bundle_sha256", "source_current", "source_file_count", "source_bytes",
                   "input_bundle_bytes", "drive_project_dir", "success_criteria", "source_manifest_sha256",
                   "notebook_download_url", "bundle_url", "input_bundle_url", "stage", "stage_updated_at",
-                  "runtime_release", "runtime_requirements")
+                  "runtime_release", "runtime_requirements", "notebook_revision", "attempt_receipts",
+                  "retry_delay_minutes", "gpu_wait_started_at", "consecutive_gpu_denials",
+                  "waiting_data_check", "waiting_checkpoint_check", "data_cache", "checkpoint_receipt", "pending_notice")
         public = {key: job[key] for key in fields if key in job}
+        backup = job.get("backup")
+        if isinstance(backup, dict):
+            public["backup"] = {key: backup[key] for key in ("status", "provider", "observed_at", "next_check_at") if key in backup}
+            if isinstance(backup.get("reason"), str):
+                public["backup"]["reason"] = cls._public_text(backup["reason"])
         public["blocked_reason"] = cls._public_text(str(job.get("blocked_reason") or ""))
         public["action_required"] = job.get("status") == "auth_required"
         public["diagnostics"] = cls._colab_diagnostics(job)
@@ -291,7 +313,7 @@ class ChatGPTBridge:
                 public[key] = cls._public_url(job[key])
         observed = job.get("last_observation")
         if isinstance(observed, dict):
-            public["last_observation"] = {key: observed.get(key) for key in ("status", "observed_at")}
+            public["last_observation"] = {key: observed.get(key) for key in ("status", "observed_at", "attempt_number")}
             details = observed.get("details") or {}
             public["last_observation"]["reason"] = cls._public_text(str(details.get("reason") or ""))
             if details.get("auth_kind") in {"google_sign_in", "drive_consent", "authorization"}:
@@ -348,13 +370,18 @@ class ChatGPTBridge:
                 action, message = "complete_google_sign_in", "Complete Google sign-in in the dedicated Colab window. The worker will detect successful sign-in and continue automatically."
             else:
                 action, message = "complete_browser_authorization", "Complete the indicated notebook or Drive action in the dedicated window, then call resume_colab_experiment using the existing authorization."
+        elif (job.get("backup") or {}).get("status") in {"launching", "checking", "running", "unknown"}:
+            action, message = "observe_backup_gpu", "AutoResearch is checking or observing the approved backup host."
         elif status in {"queued", "waiting_for_gpu", "waiting_for_connection", "disconnected"}:
             action, message = ("wait_for_retry", "Keep the local AutoResearch service running; its persistent scheduler respects the saved retry deadline.") if job.get("autorun_enabled") else ("start_experiment", "Call start_colab_experiment after the user has authorized this code and command.")
         elif status == "completed":
             action, message = "read_current_results", "Call get_colab_experiment_result to validate current-run evidence before analyzing or iterating."
         else:
             action, message = "observe_experiment", "The browser worker is checking resources or executing the notebook; poll status and current-run results."
-        return {"action": action, "message": message, "next_attempt_at": job.get("next_attempt_at")}
+        result = {"action": action, "message": message, "next_attempt_at": job.get("next_attempt_at")}
+        if job.get("pending_notice"):
+            result["notice_id"] = job["pending_notice"]["id"]
+        return result
 
     def create_project(self, request: ChatGPTProjectRequest) -> dict[str, Any]:
         project = self.db.create_project(

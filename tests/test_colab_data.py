@@ -77,6 +77,20 @@ def test_metadata_export_and_upload_registry_are_separate(tmp_path, monkeypatch)
         data.data_upload_path(job, request)
 
 
+def test_browser_corpus_root_uses_runtime_configuration(tmp_path, monkeypatch):
+    root, generated, _, _ = prepared_corpus(tmp_path, monkeypatch)
+    monkeypatch.setattr(data, 'APPROVED_DATA_ROOT', tmp_path / 'elsewhere')
+    monkeypatch.setenv('AUTORESEARCH_COLAB_DATA_ROOT', str(root))
+    prepared = data.prepare_full_data_transfer(generated, {'pointer': 'inputs/full-data-pointer.json'}, project_id='speaker')
+    item = prepared['data_upload_files'][0]
+    job = {'project_id': 'speaker', 'runtime_id': 'test', **prepared}
+    request = {**item, 'project_id': 'speaker', 'runtime_id': 'test'}
+    assert data.data_upload_path(job, request) == Path(item['local_path'])
+    monkeypatch.setenv('AUTORESEARCH_COLAB_DATA_ROOT', str(tmp_path / 'another-root'))
+    with pytest.raises(ValueError, match='not approved'):
+        data.data_upload_path(job, request)
+
+
 @pytest.mark.parametrize('suffix',['.tar.gz','.tar.zip','.tar.gz.exe'])
 def test_train_upload_allows_only_declared_uncompressed_or_gzip_shards(tmp_path,monkeypatch,suffix):
     root,generated,pointer,manifest = prepared_corpus(tmp_path,monkeypatch)
@@ -213,6 +227,27 @@ def test_scientific_success_requires_metrics_and_does_not_promote_acceptance(tmp
         data.validate_scientific_result(tmp_path, criteria())
 
 
+def test_screening_stop_requires_current_corpus_provenance_and_only_rejected_candidates(tmp_path):
+    spec = {'metrics_file': 'rsi/metrics.json', 'paired_seed_confirmation': {}}
+    path = tmp_path / spec['metrics_file']
+    path.parent.mkdir()
+    report = {'status': 'screening_failed', 'schema_version': 1,
+              'scope': 'speaker_disjoint_development_selection', 'metrics': {},
+              'campaign_complete': False, 'acceptance_complete': False,
+              'scientific_metrics_produced': False, 'research_effect_validated': False,
+              'screening_passed': False, 'data_manifest_sha256': 'a' * 64,
+              'screening_decisions': {'VQ': {'eligible': False, 'reasons': ['baseline not improved']}}}
+    path.write_text(json.dumps(report), encoding='utf-8')
+    assert data.validate_screening_stop(tmp_path, spec, 'a' * 64) == {
+        'screening_report': 'rsi/metrics.json', 'scientific_metrics_produced': False}
+    with pytest.raises(ValueError, match='screening stop evidence'):
+        data.validate_screening_stop(tmp_path, spec, 'b' * 64)
+    report['screening_decisions']['VQ']['eligible'] = True
+    path.write_text(json.dumps(report), encoding='utf-8')
+    with pytest.raises(ValueError, match='rejection for every candidate'):
+        data.validate_screening_stop(tmp_path, spec, 'a' * 64)
+
+
 def test_generated_notebook_is_standalone_and_zero_exit_cannot_fake_scientific_completion(tmp_path):
     config = {'run_command':'test runner','checkpoint':{'files':[],'resume_command':'test resume'},'success_criteria':criteria()}
     notebook = build_notebook('speaker', config, drive_root='AutoResearch', bundle_sha256='a'*64, bundle_bytes=b'zip')
@@ -336,6 +371,33 @@ def test_disk_budget_credits_only_receipted_dev_audio_and_size_matched_files(tmp
     assert after['existing_bytes'] == before['existing_bytes'] + 3
     (tmp_path/'dev/audio/speaker/a.wav').write_bytes(b'bad-size')
     assert data.estimate_ephemeral_disk_budget(tmp_path,transfer,free_bytes=10**15)['existing_bytes'] == before['existing_bytes']
+
+
+@pytest.mark.parametrize('online_augmentation', [False, True])
+def test_hf_disk_budget_only_counts_one_assembly_chunk_and_the_stream_window(tmp_path, monkeypatch, online_augmentation):
+    _, _, _, manifest = prepared_corpus(tmp_path, monkeypatch)
+    inventory = data.validate_corpus_manifest(manifest, 'data_manifest.json')
+    inventory['files'].extend({'kind': 'train_shard', 'path': f'train/shards/train-{i:06d}.tar.gz',
+                               'size_bytes': 12, 'sha256': 'f' * 64} for i in range(1, 20))
+    transfer = dict(inventory, mode='hf_private_dataset', online_augmentation=online_augmentation,
+                    manifest_size_bytes=123, window_shards=2, window_bytes=24)
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    result = data.estimate_ephemeral_disk_budget(runtime, transfer, free_bytes=10**15)
+    metadata_bytes = sum(item['size_bytes'] for item in inventory['files'] if item['kind'] == 'metadata') + 123
+    assemblies = inventory['assemblies'] + (list(inventory['augmentation'].values()) if online_augmentation else [])
+    peak = 0
+    retained = metadata_bytes
+    for item in assemblies:
+        # Each fixture assembly contains exactly one part, equal to the output size.
+        peak = max(peak, retained + 2 * item['size_bytes'])
+        retained += item['size_bytes']
+    assert result['final_bytes'] == retained
+    assert result['assembly_peak_bytes'] == peak
+    assert result['window_bytes'] == 24
+    assert result['required_bytes'] == max(peak, retained + 24) + 10 * 1024**3
+    exact = data.estimate_ephemeral_disk_budget(runtime, transfer, free_bytes=result['required_bytes'] - 1)
+    assert exact['enough'] is False
 
 
 def test_notebook_insufficient_disk_fails_before_any_bulk_upload(tmp_path, monkeypatch):

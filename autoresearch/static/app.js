@@ -339,14 +339,37 @@ function renderColab() {
     ? (job.status === "completed" && completionLabels[completed.completion_kind]) || labels[job.status] || job.status || "Checking status"
     : "Code changed / 准备版本已过期";
   const lines = [];
+  const backup = job.backup || {};
+  const backupLabels = {
+    awaiting_approval: "备用 GPU 等待聊天授权", authorized: "备用 GPU 已授权",
+    launching: "正在连接备用 GPU", checking: "正在预检备用 GPU", running: "备用 GPU 训练中",
+    not_ready: "备用 GPU 未通过预检", unknown: "备用 GPU 等待回执",
+    completed: "备用 GPU 实验已完成", failed: "备用 GPU 实验失败"
+  };
+  if (backupLabels[backup.status]) {
+    const provider = {local: "本机", autodl: "AutoDL"}[backup.provider];
+    lines.push([backupLabels[backup.status], provider, backup.reason].filter(Boolean).join(" · "));
+  }
   if (!currentSource) lines.push("项目代码已更新，已准备的 Notebook 对应此前版本。");
   const stageLabels = {
     opening_notebook: "打开 Notebook", verifying_notebook: "校验并保存 Notebook", loading_saved_notebook: "打开已保存的 Notebook",
-    requesting_gpu: "申请免费 GPU", starting_notebook: "启动 Notebook", runtime_setup: "安装依赖和运行时预检",
+    requesting_gpu: "申请免费 GPU", starting_notebook: "启动 Notebook", gpu_probe: "检查 GPU",
+    mounting_drive: "挂载 Google Drive", runtime_setup: "安装依赖和运行时预检",
     preparing_data: "准备实验数据", training: "训练与评测", drive_authorization: "等待 Drive 授权",
     google_sign_in: "等待 Google 登录", awaiting_action: "等待浏览器操作"
   };
-  if (stageLabels[job.stage]) lines.push(`阶段 · ${stageLabels[job.stage]}`);
+  if (stageLabels[job.stage]) lines.push(`第 ${job.attempt_count || 0} 次 · ${stageLabels[job.stage]}`);
+  const receiptLabels = {
+    gpu_unavailable: "GPU 不可用", quota: "额度限制", session_capacity: "Colab 活跃会话已满",
+    notebook_timeout: "Notebook 启动超时", drive_authorization: "等待 Drive 授权",
+    google_sign_in: "等待 Google 登录", authorization_required: "等待浏览器授权",
+    available: "GPU 检查通过", running: "训练已启动", completed: "实验已完成",
+    network: "连接异常", disconnected: "会话已断开", failed: "Notebook 执行失败"
+  };
+  for (const receipt of (job.attempt_receipts || []).slice(-6)) {
+    if (!receiptLabels[receipt.code]) continue;
+    lines.push(`第 ${receipt.attempt_number} 次 · ${receiptLabels[receipt.code]}${receipt.late ? "（迟到回执）" : ""} · ${colabResourceTime(receipt.observed_at)}`);
+  }
   const diagnostics = job.diagnostics || {};
   const providerReasons = {session_capacity: "Colab 活跃会话已满", usage_quota: "Colab GPU 用量达到限制"};
   if (providerReasons[diagnostics.provider_reason]) lines.push(providerReasons[diagnostics.provider_reason]);
@@ -370,14 +393,28 @@ function renderColab() {
     const authStatus = {
       google_sign_in: "Waiting for Google sign-in / 等待 Google 登录",
       drive_consent: "Waiting for Google Drive authorization / 等待 Google Drive 授权",
-      experiment_inputs: "Waiting for experiment inputs / 等待实验输入"
+      experiment_inputs: "Waiting for experiment inputs / 等待实验输入",
+      hf_dataset: "请在 Colab Secrets 中配置 HF_TOKEN，允许当前笔记本访问私有数据集，再点继续。"
     };
     lines.push(authStatus[authKind] || "Waiting for Colab browser / 等待 Colab 浏览器状态");
   } else {
     if (job.blocked_reason) lines.push(job.blocked_reason);
     if (job.last_observation?.message) lines.push(job.last_observation.message);
   }
-  if (job.next_attempt_at) lines.push(`Next attempt / 下次申请 · ${colabResourceTime(job.next_attempt_at)}`);
+  if (job.next_attempt_at && !["launching", "checking", "running", "unknown"].includes(backup.status)) {
+    lines.push(`Next attempt / 下次申请 · ${colabResourceTime(job.next_attempt_at)}`);
+  }
+  if (job.retry_delay_minutes && job.status === "waiting_for_gpu" && job.last_observation?.status === "unavailable") {
+    lines.push(`随机退避 · ${job.retry_delay_minutes.min}–${job.retry_delay_minutes.max} 分钟`);
+  }
+  const dataCheck = job.waiting_data_check;
+  if (dataCheck?.status === "remote_pinned") lines.push("Hugging Face 私有数据集 · 已固定清单，Colab 将校验远端内容");
+  else if (dataCheck?.status === "manifest_mismatch") lines.push("本地数据清单校验失败");
+  else if (dataCheck) lines.push(`本地分片核对 · ${dataCheck.checked_shards}/${dataCheck.total_shards}${dataCheck.failed_shards ? `，${dataCheck.failed_shards} 个校验失败` : ""}`);
+  if (job.checkpoint_receipt) lines.push(`最近一次 Colab 断点校验 · ${job.checkpoint_receipt.file_count} 个文件 · ${colabResourceTime(job.checkpoint_receipt.observed_at)}`);
+  if (job.waiting_checkpoint_check?.status === "mirror_verified") lines.push("本机镜像的断点 SHA-256 校验通过");
+  if (job.waiting_checkpoint_check?.status === "mirror_not_verified") lines.push("本机镜像的断点待同步或校验");
+  if (job.data_cache) lines.push(`分片缓存 · 恢复 ${job.data_cache.reused || 0} 个，持久保存 ${job.data_cache.persisted || 0} 个${job.data_cache.write_status === "unavailable" ? "，持久存储写入受限" : ""}`);
   if (job.attempt_count) lines.push(`Browser attempts / 浏览器连接次数 · ${job.attempt_count}`);
   if (job.drive_project_dir) lines.push(`Persistent files / 持久保存 · ${job.drive_project_dir}`);
   $("colabDetails").textContent = lines.join("\n") || (job.prepared ? "已准备 Colab 实验。" : state.colab ? "尚无 Colab 实验。" : "正在读取 Colab 状态。");

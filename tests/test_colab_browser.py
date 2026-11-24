@@ -295,13 +295,13 @@ async def test_auth_marker_does_not_log_provider_authorization_url(capsys) -> No
 
 
 @pytest.mark.asyncio
-async def test_quota_default_is_longer_than_gpu_pool_retry() -> None:
+async def test_quota_duration_is_forwarded_without_rounding_up() -> None:
     client = FakeClient()
     worker = ColabBrowserWorker(client, FakeBrowser())
     await worker._provider_observation("quota", "Usage limit reached. Try again later")
-    assert client.observations[0][1]["retry_after_minutes"] == 720
+    assert client.observations[0][1]["retry_after_minutes"] is None
     await worker._provider_observation("quota", "Usage limit reached. Reconnect in 20 minutes")
-    assert client.observations[1][1]["retry_after_minutes"] == 30
+    assert client.observations[1][1]["retry_after_minutes"] == 20
 
 
 @pytest.mark.asyncio
@@ -2118,6 +2118,42 @@ async def test_full_data_uploads_ignore_other_runtimes_and_do_not_repeat(tmp_pat
     await worker._monitor(client.job)
     await worker._monitor(client.job)
     assert uploads == [approved]
+
+
+@pytest.mark.asyncio
+async def test_hf_mode_ignores_browser_shard_picker_markers():
+    request = dict(project_id='project-1', runtime_id='runtime-1', path='train/shards/train-000001.tar',
+                   size_bytes=1024, sha256='a' * 64)
+    client = FakeClient({'prepared_config': {'hf_dataset_transfer': {'repo_id': 'fixture/private-corpus'}}})
+    browser = FakeBrowser('AUTORESEARCH_COLAB_UPLOAD_DATA ' + json.dumps(request))
+    worker = ColabBrowserWorker(client, browser)
+    worker.runtime_id, worker.attempt_started = 'runtime-1', datetime.now(timezone.utc)
+    await worker._monitor(client.job)
+    assert client.observations == []
+    assert worker._data_submissions == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure,status,reason', [
+    ('hf_dataset_auth', 'auth', 'HF_TOKEN Colab Secret'),
+    ('hf_dataset_network', 'network', 'network retries'),
+    ('hf_dataset_config', 'failed', 'dataset configuration'),
+    ('screening_failed', 'failed', 'no healthy VQ candidate'),
+])
+async def test_hf_notebook_failure_markers_map_to_the_correct_observation(failure, status, reason):
+    client = FakeClient({'prepared_config': {'hf_dataset_transfer': {'repo_id': 'fixture/private-corpus'}}})
+    started = datetime.now(timezone.utc)
+    browser = FakeBrowser(marker(status, started=started, reason=failure, phase='preparing_data'))
+    worker = ColabBrowserWorker(client, browser)
+    worker.runtime_id, worker.attempt_started = 'runtime-1', started
+    await worker._monitor(client.job)
+    [(observed, details)] = client.observations
+    assert observed == status and reason in details['reason']
+    if status == 'auth':
+        assert details['auth_kind'] == 'hf_dataset'
+        assert details['authorization_continuation']['runtime_id'] == 'runtime-1'
+    else:
+        assert details['failure_kind'] == failure
 
 
 @pytest.mark.asyncio

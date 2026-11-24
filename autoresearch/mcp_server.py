@@ -12,6 +12,7 @@ from .domain import (
     AutoDLExperimentRequest,
     ChatGPTAnalysisRequest,
     ChatGPTProjectRequest,
+    ColabFallbackTarget,
     ColabPrepareRequest,
     CodeFile,
     CodeGenerationRequest,
@@ -67,6 +68,8 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
             "Before using AutoDL, call check_autodl_readiness; it never creates billable resources. "
             "For free Colab GPUs, call prepare_colab_experiment then start_colab_experiment with user authorization. Google login or Drive consent can require user action; a retry deadline is not GPU allocation. "
             "Use get_colab_status and get_colab_resources to distinguish live observations from old results. After manual consent call resume_colab_experiment; bind_colab_notebook saves the public Drive recovery link. "
+            "When get_colab_status returns a pending_notice, call claim_colab_notice and relay its message only if the claim returns it. The dashboard is read-only. "
+            "Use authorize_colab_backup only after explicit approval of the reviewed commands, the exact GPU target, its data access and any costs of an existing AutoDL instance. "
             "Use get_colab_experiment_result for current-run Colab metrics and returned log evidence. Missing remote logs or metrics remain unknown, and acceptance does not count as full-data completion. "
             "Save an explicit hypothesis/dataset/experiment coverage plan using save_research_plan, inspect get_research_workflow, then record_research_decision against the latest evidence after ChatGPT analysis. AutoResearch never substitutes its own model reasoning in this mode. "
             "Then call check_experiment_readiness to inspect entry points, data, and metric declarations; a passing static check does not validate scientific results. "
@@ -432,6 +435,22 @@ def create_mcp_server(bridge: ChatGPTBridge) -> MCPServer:
     )
     def resume_colab_experiment(project_id: str, confirm_execute: bool) -> dict[str, Any]:
         return bridge.resume_colab(project_id, confirm_execute=confirm_execute)
+
+    @server.tool(
+        name="authorize_colab_backup", title="Approve an Existing Backup GPU",
+        description="Bind a local GPU or already running AutoDL instance to the prepared source. Review the code/commands, approved paths and existing-instance costs with the user before setting confirm_execute. Dispatch occurs automatically after one hour of waiting if the host passes preflight. Never provisions or powers on an instance.",
+        annotations=REMOTE_EXECUTION, structured_output=True,
+    )
+    def authorize_colab_backup(project_id: str, targets: list[ColabFallbackTarget], confirm_execute: bool) -> dict[str, Any]:
+        return bridge.authorize_colab_backup(project_id, targets, confirm_execute=confirm_execute)
+
+    @server.tool(
+        name="claim_colab_notice", title="Claim a One-Time Colab Notice",
+        description="Returns a pending authorization notice at most once. Use the ID returned by get_colab_status, then relay the claimed message to the user in ChatGPT.",
+        annotations=LOCAL_WRITE, structured_output=True,
+    )
+    def claim_colab_notice(project_id: str, notice_id: str) -> dict[str, Any]:
+        return bridge.claim_colab_notice(project_id, notice_id)
 
     @server.tool(
         name="cancel_colab_retries", title="Stop Colab GPU Retries",

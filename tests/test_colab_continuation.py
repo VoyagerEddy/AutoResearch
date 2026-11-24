@@ -16,9 +16,9 @@ EXPECTED = [('markdown','# prepared source'),
             ('code','define_helpers()'),('code','upload_verified_data()'),('code','run_experiment()')]
 
 
-def stream(status):
+def stream(status, **details):
     return {'output_type':'stream','name':'stdout','text':'AUTORESEARCH_COLAB_STATUS '+json.dumps({
-        'project_id':'speaker','runtime_id':'runtime-1','started_at':STARTED,'status':status})+'\n'}
+        'project_id':'speaker','runtime_id':'runtime-1','started_at':STARTED,'status':status, **details})+'\n'}
 
 
 def cells():
@@ -101,3 +101,17 @@ def test_terminal_result_stops_continuation_and_complete_cells_only_monitor_resu
 def test_normal_run_all_is_never_rescheduled_by_authorization_planner():
     assert plan_authorization_continuation(cells(),EXPECTED,project_id='speaker',runtime_id='runtime-1',
         expected_started_at=STARTED,auth_interrupted=False).action == 'wait'
+
+
+def test_hf_auth_continuation_retries_only_the_explicitly_interrupted_cell():
+    actual = cells()
+    actual[3]['outputs'] = []
+    actual[4]['execution_count'] = 10
+    actual[5]['outputs'] = [stream('auth', reason='hf_dataset_auth', phase='preparing_data'),
+                            {'output_type': 'error', 'ename': 'RuntimeError'}]
+    assert plan(actual).action == 'blocked'
+    result = plan(actual, allow_hf_dataset=True)
+    assert (result.action, result.cell_id) == ('run', 'cell-5')
+    assert plan(actual, allow_hf_dataset=True, inflight_cell_id='cell-5').action == 'blocked'
+    actual[5]['outputs'][0] = stream('auth', reason='hf_dataset_auth', phase='preparing_data', runtime_id='other')
+    assert plan(actual, allow_hf_dataset=True).action == 'blocked'

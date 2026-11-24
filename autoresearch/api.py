@@ -43,6 +43,7 @@ from .services.autodl import AutoDLClient, AutoDLCreateUncertain, AutoDLError, e
 from .services.colab import ColabConflict
 from .services.colab_browser import ColabBrowserError
 from .services.desktop import DesktopBridge
+from .services.colab_fallback import ACTIVE_BACKUP, run_backup_step
 from .services.github_sync import GitSync, GitSyncError
 from .services.llm import LLMError, OpenRouterClient
 
@@ -56,6 +57,14 @@ class AppState:
         self.chatgpt = ChatGPTBridge(self.db, settings, self.experiments)
         self.colab = self.chatgpt.colab
         self._colab_launch_lock = asyncio.Lock()
+        self._colab_input_verification: asyncio.Task[None] | None = None
+        self._colab_backup_task: asyncio.Task[None] | None = None
+
+    async def _observe_backup(self, job: dict[str, Any], *, launch: bool) -> None:
+        receipt = await run_backup_step(self.settings, job, launch=launch)
+        if receipt:
+            await asyncio.to_thread(self.colab.record_backup, job['project_id'],
+                                    job['backup']['run_id'], receipt, launched=launch)
 
     def reload_settings(self) -> Settings:
         self.settings = Settings.load(self.settings.root)
@@ -104,6 +113,45 @@ class AppState:
 
         async with self._colab_launch_lock:
             jobs = await asyncio.to_thread(lambda: [self.colab.status(project.id) for project in self.db.list_projects(limit=10000)])
+            check = self._colab_input_verification
+            if check is None or check.done():
+                if check is not None:
+                    self._colab_input_verification = None
+                    try:
+                        check.result()
+                    except Exception:
+                        logging.getLogger(__name__).exception('Colab input verification failed')
+                pending = [job for job in jobs if job.get('autorun_enabled') and job.get('approved_data_manifest')
+                           and job['status'] in {'queued', 'waiting_for_gpu', 'waiting_for_connection', 'disconnected'}]
+                if pending:
+                    oldest = min(pending, key=lambda job: (job.get('waiting_data_check') or {}).get('checked_at', ''))
+                    self._colab_input_verification = asyncio.create_task(
+                        asyncio.to_thread(self.colab.verify_waiting_inputs, oldest['project_id']))
+                else:
+                    self._colab_input_verification = None
+            backup_project = None
+            backup_task = self._colab_backup_task
+            if backup_task is None or backup_task.done():
+                if backup_task is not None:
+                    self._colab_backup_task = None
+                    try:
+                        backup_task.result()
+                    except Exception:
+                        logging.getLogger(__name__).exception('Colab backup observation failed')
+                active = [job for job in jobs if (job.get('backup') or {}).get('status') in ACTIVE_BACKUP]
+                if active:
+                    current = active[0]
+                    self._colab_backup_task = asyncio.create_task(
+                        self._observe_backup(current, launch=current['backup']['status'] == 'launching'))
+                else:
+                    for job in jobs:
+                        if job['status'] not in {'waiting_for_gpu', 'waiting_for_connection'} or job.get('worker_running'):
+                            continue
+                        reserved = await asyncio.to_thread(self.colab.reserve_backup, job['project_id'])
+                        if reserved:
+                            backup_project = job['project_id']
+                            self._colab_backup_task = asyncio.create_task(self._observe_backup(reserved, launch=True))
+                            break
             if any(job['worker_running'] for job in jobs):
                 return []
             if login_browser_is_running(self.settings.root) is not None:
@@ -127,7 +175,7 @@ class AppState:
                     await asyncio.to_thread(self.colab.ordinary_login_opened, project_id, pid)
                     return [{'status': 'login_browser_opened', 'pid': pid, 'project_id': project_id}]
             for job in sorted(jobs, key=lambda item: item.get('next_attempt_at') or ''):
-                if not job.get('autorun_enabled') or not job['can_attempt']:
+                if job['project_id'] == backup_project or not job.get('autorun_enabled') or not job['can_attempt']:
                     continue
                 try:
                     return [await self._launch_colab_worker(job)]
@@ -197,6 +245,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 scheduler.cancel()
                 with suppress(asyncio.CancelledError):
                     await scheduler
+                for task in (state._colab_input_verification, state._colab_backup_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
 
     app = FastAPI(title="AutoResearch", version="0.3.0", lifespan=lifespan)
     app.state.autoresearch = state
@@ -394,7 +447,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/projects/{project_id}/colab/stage")
     async def record_colab_stage(project_id: str, request: ColabStageRequest) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(state.colab.record_stage, project_id, request.stage)
+            return await asyncio.to_thread(state.colab.record_stage, project_id, request.stage, request.attempt_number)
         except (LookupError, ValueError, OSError) as exc:
             raise colab_error(exc) from exc
 

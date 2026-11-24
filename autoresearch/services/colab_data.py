@@ -1,4 +1,4 @@
-"""Bounded, allowlisted full-corpus transfers through normal Colab uploads."""
+"""Bounded, allowlisted corpus transfers for Colab."""
 from __future__ import annotations
 
 import hashlib
@@ -15,7 +15,7 @@ from typing import Any
 import zipfile
 
 
-APPROVED_DATA_ROOT = Path('C:/Users/lenovo/Documents/datasets/TidyVoiceX_ASV/autoresearch-full-data')
+APPROVED_DATA_ROOT = Path.home() / 'Documents' / 'datasets' / 'TidyVoiceX_ASV' / 'autoresearch-full-data'
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_FILES = 2048
 METADATA_PATHS = {'train/shard.list', 'train/utt2spk', 'train/utt2lang', 'dev/shard.list',
@@ -50,11 +50,94 @@ def file_sha256(path):
     return checksum.hexdigest()
 
 
+def preflight_cuda(torch):
+    sample = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device='cuda:0', dtype=torch.float32)
+    product = sample @ sample
+    torch.cuda.synchronize()
+    if not torch.isfinite(product).all().item() or product.tolist() != [[7.0, 10.0], [15.0, 22.0]]:
+        raise RuntimeError('CUDA matrix multiplication failed its finite-value and expected-result check')
+    return dict(status='passed', operation='float32_matmul', synchronized=True)
+
+
+def preflight_torchaudio(torch, torchaudio):
+    samples = torch.arange(800, dtype=torch.float32)
+    waveform = (torch.sin(samples * (2.0 * math.pi * 440.0 / 8000)) * 0.1).unsqueeze(0)
+    waveform = torchaudio.functional.resample(waveform, 8000, 16000)
+    if list(waveform.shape) != [1, 1600] or not torch.isfinite(waveform).all().item():
+        raise RuntimeError('TorchAudio resample produced unexpected or non-finite samples')
+    features = torchaudio.compliance.kaldi.fbank(waveform * (1 << 15),
+        num_mel_bins=80, frame_length=25.0, frame_shift=10.0, dither=0.0,
+        sample_frequency=16000.0, window_type='hamming', use_energy=False)
+    if list(features.shape) != [8, 80] or not torch.isfinite(features).all().item():
+        raise RuntimeError('TorchAudio Kaldi fbank produced unexpected or non-finite features')
+    return dict(status='passed', source_rate=8000, input_rate=16000, feature_shape=list(features.shape))
+
+
+def shard_matches(path, item):
+    path = Path(path)
+    return (not path.is_symlink() and path.is_file() and path.stat().st_size == item['size_bytes']
+            and file_sha256(path) == item['sha256'])
+
+
+def copy_verified_shard(source, target, item):
+    """Publish one verified shard atomically to runtime disk or durable storage."""
+    source, target = Path(source), Path(target)
+    if source.is_symlink() or target.is_symlink():
+        raise ValueError('Verified shard paths must not be symlinks')
+    temporary = None
+    try:
+        with source.open('rb') as original, tempfile.NamedTemporaryFile(
+            mode='wb', dir=target.parent, prefix='.shard-', delete=False
+        ) as output:
+            temporary = Path(output.name)
+            shutil.copyfileobj(original, output, length=4_194_304)
+            output.flush()
+            os.fsync(output.fileno())
+        if not shard_matches(temporary, item):
+            raise ValueError('Copied data shard size or checksum mismatch')
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_checkpoint_receipt(root, files, bundle_sha256, data_sha256):
+    """Hash the checkpoint files from a quiescent, successfully saved run."""
+    root = Path(root).resolve()
+    records = []
+    for path in sorted(set(files)):
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root):
+            raise ValueError('Checkpoint receipt must contain regular files inside the checkpoint root')
+        records.append({'path': path.resolve().relative_to(root).as_posix(),
+                        'size_bytes': path.stat().st_size, 'sha256': file_sha256(path)})
+    if not records:
+        raise ValueError('A resume receipt requires a saved checkpoint')
+    receipt = {'schema_version': 1, 'bundle_sha256': bundle_sha256,
+               'data_manifest_sha256': data_sha256, 'files': records}
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root,
+                                         prefix='.resume-', delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(receipt, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        target = root / 'autoresearch-checkpoint-receipt.json'
+        digest = file_sha256(temporary)
+        os.replace(temporary, target)
+        if file_sha256(target) != digest:
+            raise ValueError('Checkpoint receipt could not be verified after saving')
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return {'sha256': digest, 'file_count': len(records)}
+
+
 def _no_links(path: Path, boundary: Path) -> None:
     for candidate in (path, *path.parents):
         if candidate == boundary.parent:
             break
-        if candidate.exists() and (candidate.is_symlink() or bool(getattr(candidate, 'is_junction', lambda: False)())):
+        if candidate.is_symlink() or bool(getattr(candidate, 'is_junction', lambda: False)()):
             raise ValueError('Full-data transfer paths must not contain links or junctions')
 
 
@@ -75,9 +158,61 @@ def _read_object(path: Path, maximum: int = 2_000_000) -> dict[str, Any]:
     return result
 
 
+def approved_data_root() -> Path:
+    configured = os.environ.get('AUTORESEARCH_COLAB_DATA_ROOT', '').strip()
+    root = Path(configured).expanduser() if configured else APPROVED_DATA_ROOT
+    if not root.is_absolute():
+        raise ValueError('AUTORESEARCH_COLAB_DATA_ROOT must be an absolute path')
+    return root
+
+
+def prepare_hf_dataset_transfer(generated: Path, declaration: Any) -> dict[str, Any] | None:
+    """Resolve a direct or local sidecar pointer for a private dataset."""
+    from ..hf_dataset import DEFAULT_WINDOW_SHARDS, MAX_WINDOW_BYTES, validate_hf_pointer
+
+    if declaration is None:
+        return None
+    if not isinstance(declaration, dict):
+        raise ValueError('HF dataset configuration must be an object')
+    setting_keys = {'online_augmentation', 'window_shards', 'window_bytes'}
+    pointer_keys = {'repo_id', 'revision', 'manifest_path', 'manifest_sha256', 'schema_version'}
+    if 'pointer' in declaration:
+        if set(declaration) - setting_keys - {'pointer', 'optional'}:
+            raise ValueError('HF dataset sidecar configuration has unexpected fields')
+        optional = declaration.get('optional', False)
+        if type(optional) is not bool:
+            raise ValueError('HF dataset sidecar optional must be a boolean')
+        relative = relative_data_path(declaration['pointer'])
+        if not relative.startswith('inputs/'):
+            raise ValueError('HF dataset sidecar must be under generated/inputs')
+        sidecar = generated / relative
+        _no_links(sidecar, generated)
+        if optional and not sidecar.exists():
+            return None
+        pointer = _read_object(_safe_file(generated, relative), 16_000)
+    else:
+        pointer = {key: value for key, value in declaration.items() if key not in setting_keys}
+    if set(pointer) - pointer_keys:
+        raise ValueError('HF dataset pointer has unexpected fields')
+    if 'schema_version' in pointer and (type(pointer['schema_version']) is not int or pointer['schema_version'] != 1):
+        raise ValueError('Unsupported HF dataset pointer schema version')
+    normalized = validate_hf_pointer({key: value for key, value in pointer.items() if key != 'schema_version'})
+    online_augmentation = declaration.get('online_augmentation', True)
+    window_shards = declaration.get('window_shards', DEFAULT_WINDOW_SHARDS)
+    window_bytes = declaration.get('window_bytes', MAX_WINDOW_BYTES)
+    if type(online_augmentation) is not bool:
+        raise ValueError('HF dataset online_augmentation must be a boolean')
+    if type(window_shards) is not int or not 1 <= window_shards <= 8:
+        raise ValueError('HF dataset window_shards must be between 1 and 8')
+    if type(window_bytes) is not int or not 1 <= window_bytes <= MAX_WINDOW_BYTES:
+        raise ValueError('HF dataset window_bytes must be between 1 byte and 1.5 GiB')
+    return {**normalized, 'online_augmentation': online_augmentation, 'window_shards': window_shards,
+            'window_bytes': window_bytes}
+
+
 def prepare_full_data_transfer(generated: Path, declaration: Any, *, project_id: str) -> dict[str, Any]:
     if declaration is None:
-        return {'data_upload_files': [], 'full_data_transfer': None}
+        return {'data_upload_files': [], 'full_data_transfer': None, 'approved_data_manifest': None}
     if not isinstance(declaration, dict) or set(declaration) != {'pointer'}:
         raise ValueError('full_data_transfer must name its explicit local pointer')
     generated = generated.resolve(strict=True)
@@ -85,7 +220,7 @@ def prepare_full_data_transfer(generated: Path, declaration: Any, *, project_id:
     pointer = _read_object(pointer_path, 16_000)
     root = Path(pointer.get('data_root', ''))
     if (pointer.get('schema_version') != 1 or pointer.get('project_id') != project_id
-            or not root.is_absolute() or root.absolute() != APPROVED_DATA_ROOT.absolute()):
+            or not root.is_absolute() or root.absolute() != approved_data_root().absolute()):
         raise ValueError('Full-data pointer does not name this project and the approved corpus root')
     _no_links(root, root)
     if not root.is_dir():
@@ -97,64 +232,19 @@ def prepare_full_data_transfer(generated: Path, declaration: Any, *, project_id:
     manifest_sha = pointer.get('manifest_sha256')
     if not isinstance(manifest_sha, str) or not re.fullmatch('[0-9a-f]{64}', manifest_sha) or file_sha256(manifest_path) != manifest_sha:
         raise ValueError('Full-data manifest SHA256 does not match the approved pointer')
-    manifest = _read_object(manifest_path)
-    if manifest.get('schema_version') != 1 or manifest.get('kind') != MANIFEST_KINDS[manifest_relative] or manifest.get('ready') is not True:
-        raise ValueError('Full train/dev data preparation is not complete')
-    records = manifest.get('files')
-    if not isinstance(records, list) or not records or len(records) > MAX_FILES:
-        raise ValueError('Full-data manifest needs a bounded, explicit file inventory')
-    prefix = 'acceptance/' if manifest_relative == 'acceptance-manifest.json' else ''
-    public, private, metadata, seen = [], [], [('data_manifest.json', manifest_path)], set()
-    for record in records:
-        if not isinstance(record, dict):
-            raise ValueError('Invalid full-data file record')
-        relative = relative_data_path(record.get('path'))
-        if relative.casefold() in seen:
-            raise ValueError('Duplicate full-data file inventory path')
-        seen.add(relative.casefold())
-        if not relative.startswith(prefix) or (not prefix and relative.startswith('acceptance/')):
-            raise ValueError('Corpus artifact belongs to another experiment scope')
-        local = relative[len(prefix):]
-        if re.fullmatch(r'train/shards/train-[0-9]+\.tar(?:\.gz)?', local):
-            kind = 'train_shard'
-        elif re.fullmatch(r'dev/shards/dev-[0-9]+\.tar', local):
-            kind = 'dev_archive'
-        elif re.fullmatch(r'augmentation/(?:musan|rirs)/data\.mdb\.part-[0-9]{6}', local):
-            kind = 'augmentation_chunk'
-        elif re.fullmatch(r'dev/trials\.kaldi\.part-[0-9]{6}', local):
-            kind = 'trials_chunk'
-        elif (local in METADATA_PATHS or (prefix and local == 'dev/trials.kaldi')
-              or (local.startswith('source_metadata/') and Path(local).suffix == '.txt')):
-            kind = 'metadata'
-        else:
-            raise ValueError('Unapproved artifact in full-data transfer manifest')
-        if 'kind' in record and record['kind'] != kind:
-            raise ValueError('Full-data transfer kind differs from its approved path')
-        size, checksum = record.get('size_bytes'), record.get('sha256')
-        if type(size) is not int or not 0 < size <= MAX_FILE_BYTES or not isinstance(checksum, str) or not re.fullmatch('[0-9a-f]{64}', checksum):
-            raise ValueError('Invalid full-data transfer size or checksum')
+    inventory = validate_corpus_manifest(_read_object(manifest_path), manifest_relative)
+    private, metadata = [], [('data_manifest.json', manifest_path)]
+    for item in inventory['files']:
+        relative, size, checksum = item['path'], item['size_bytes'], item['sha256']
         path = _safe_file(root, relative)
         if path.stat().st_size != size:
             raise ValueError('Full-data transfer file size changed after preparation')
-        item = {'path': relative, 'size_bytes': size, 'sha256': checksum, 'kind': kind}
-        if kind == 'metadata':
+        if item['kind'] == 'metadata':
             if file_sha256(path) != checksum:
                 raise ValueError('Full-data metadata checksum mismatch')
             metadata.append((relative, path))
         else:
             private.append({**item, 'local_path': str(path), 'approved_root': str(root)})
-            if kind == 'dev_archive':
-                for key in ('audio_bytes', 'utterances'):
-                    value = record.get(key)
-                    if type(value) is not int or value <= 0:
-                        raise ValueError('Dev archives require exact audio-byte and utterance bounds')
-                    item[key] = value
-        public.append(item)
-    if not {prefix + name for name in METADATA_PATHS}.issubset(seen) or not any(r['kind'] == 'train_shard' for r in public) or not any(r['kind'] == 'dev_archive' for r in public):
-        raise ValueError('Full-data corpus is missing required train/dev artifacts')
-    augmentation = validate_augmentation_inventory(manifest.get('augmentation'), public,
-        require_full=manifest_relative == 'data_manifest.json', prefix=prefix)
-    assemblies = validate_assemblies(manifest.get('assemblies', []), public, prefix=prefix)
     if sum(path.stat().st_size for _, path in metadata) > 250_000_000:
         raise ValueError('Full-data metadata ZIP would exceed the 250 MB input limit')
     archive_name = 'full-data-metadata.zip' if manifest_relative == 'data_manifest.json' else 'acceptance-data-metadata.zip'
@@ -174,15 +264,72 @@ def prepare_full_data_transfer(generated: Path, declaration: Any, *, project_id:
         Path(temporary).unlink(missing_ok=True)
     return {
         'data_upload_files': private,
-        'full_data_transfer': {'schema_version': 1, 'mode': 'browser_upload', 'files': public,
+        'approved_data_manifest': {'path': manifest_relative, 'sha256': manifest_sha, 'root': str(root)},
+        'full_data_transfer': {'schema_version': 1, 'mode': 'browser_upload', **inventory,
                                'manifest_path': 'data_manifest.json', 'manifest_sha256': manifest_sha,
-                               'metadata_directory': 'full-data', 'max_file_bytes': MAX_FILE_BYTES,
-                               'augmentation': augmentation, 'assemblies': assemblies},
+                               'metadata_directory': 'full-data', 'max_file_bytes': MAX_FILE_BYTES},
         'input_archive': {'path': archive.relative_to(generated).as_posix(),
                           'sha256': file_sha256(archive),
                           'members': ['full-data/' + relative for relative, _ in sorted(metadata)]},
         'required_drive_paths': ['inputs/full-data/' + relative for relative, _ in sorted(metadata)],
     }
+
+
+def validate_corpus_manifest(manifest, manifest_relative):
+    """Validate the allowlist and integrity records before opening any artifact."""
+    if not isinstance(manifest, dict) or manifest_relative not in MANIFEST_KINDS:
+        raise ValueError('Invalid full-data manifest')
+    if manifest.get('schema_version') != 1 or manifest.get('kind') != MANIFEST_KINDS[manifest_relative] or manifest.get('ready') is not True:
+        raise ValueError('Full train/dev data preparation is not complete')
+    records = manifest.get('files')
+    if not isinstance(records, list) or not records or len(records) > MAX_FILES:
+        raise ValueError('Full-data manifest needs a bounded, explicit file inventory')
+    prefix = 'acceptance/' if manifest_relative == 'acceptance-manifest.json' else ''
+    public, seen = [], set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError('Invalid full-data file record')
+        relative = relative_data_path(record.get('path'))
+        if relative.casefold() in seen:
+            raise ValueError('Duplicate full-data file inventory path')
+        seen.add(relative.casefold())
+        if not relative.startswith(prefix) or (not prefix and relative.startswith('acceptance/')):
+            raise ValueError('Corpus artifact belongs to another experiment scope')
+        local = relative[len(prefix):]
+        if re.fullmatch(r'train/shards/train-[0-9]+\.tar(?:\.gz)?', local):
+            kind = 'train_shard'
+        elif re.fullmatch(r'dev/shards/dev-[0-9]+\.tar', local):
+            kind = 'dev_archive'
+        elif re.fullmatch(r'augmentation/(?:musan|rirs)/data\.mdb\.part-[0-9]{6}', local):
+            kind = 'augmentation_chunk'
+        elif re.fullmatch(r'dev/trials\.kaldi\.part-[0-9]{6}', local):
+            kind = 'trials_chunk'
+        elif (local in METADATA_PATHS or local == 'dev/trials.kaldi'
+              or (local.startswith('source_metadata/') and Path(local).suffix == '.txt')):
+            kind = 'metadata'
+        else:
+            raise ValueError('Unapproved artifact in full-data transfer manifest')
+        if 'kind' in record and record['kind'] != kind:
+            raise ValueError('Full-data transfer kind differs from its approved path')
+        size, checksum = record.get('size_bytes'), record.get('sha256')
+        if type(size) is not int or not 0 < size <= MAX_FILE_BYTES or not isinstance(checksum, str) or not re.fullmatch('[0-9a-f]{64}', checksum):
+            raise ValueError('Invalid full-data transfer size or checksum')
+        item = {'path': relative, 'size_bytes': size, 'sha256': checksum, 'kind': kind}
+        if kind == 'dev_archive':
+            for key in ('audio_bytes', 'utterances'):
+                value = record.get(key)
+                if type(value) is not int or value <= 0:
+                    raise ValueError('Dev archives require exact audio-byte and utterance bounds')
+                item[key] = value
+            if item['audio_bytes'] > size:
+                raise ValueError('Dev audio-byte bounds exceed the archive size')
+        public.append(item)
+    if not {prefix + name for name in METADATA_PATHS}.issubset(seen) or not any(r['kind'] == 'train_shard' for r in public) or not any(r['kind'] == 'dev_archive' for r in public):
+        raise ValueError('Full-data corpus is missing required train/dev artifacts')
+    augmentation = validate_augmentation_inventory(manifest.get('augmentation'), public,
+        require_full=manifest_relative == 'data_manifest.json', prefix=prefix)
+    assemblies = validate_assemblies(manifest.get('assemblies', []), public, prefix=prefix)
+    return {'files': public, 'augmentation': augmentation, 'assemblies': assemblies}
 
 
 def validate_augmentation_inventory(augmentation, records, *, require_full, prefix=''):
@@ -218,7 +365,9 @@ def validate_assemblies(assemblies, records, *, prefix=''):
         raise ValueError('Invalid official trials assembly inventory')
     chunks = {item['path']: item for item in records if item['kind'] == 'trials_chunk'}
     direct = any(item['path'] == prefix + 'dev/trials.kaldi' and item['kind'] == 'metadata' for item in records)
-    if direct and prefix and not assemblies and not chunks:
+    if direct:
+        if assemblies or chunks:
+            raise ValueError('Direct official trials cannot also declare transport chunks')
         return []
     if len(assemblies) != 1:
         raise ValueError('Corpus must declare its complete official trials assembly')
@@ -308,6 +457,43 @@ def estimate_ephemeral_disk_budget(data_root, transfer, *, free_bytes=None):
             raise ValueError('Disk-budget file escapes the approved corpus directory')
         return expected if path.is_file() and path.stat().st_size == expected else 0
 
+    if transfer.get('mode') == 'hf_private_dataset':
+        records = transfer['files']
+        metadata = [item for item in records if item['kind'] == 'metadata']
+        if transfer.get('manifest_size_bytes'):
+            metadata.append({'path': 'data_manifest.json', 'size_bytes': transfer['manifest_size_bytes']})
+        assemblies = list(transfer.get('assemblies', []))
+        if transfer['online_augmentation']:
+            assemblies.extend(transfer['augmentation'].values())
+        final_bytes = sum(item['size_bytes'] for item in metadata + assemblies)
+        retained_bytes = sum(existing_bytes(item['path'], item['size_bytes']) for item in metadata + assemblies)
+        missing_metadata = sum(item['size_bytes'] - existing_bytes(item['path'], item['size_bytes']) for item in metadata)
+        by_path = {item['path']: item for item in records}
+        assembly_peak = 0
+        missing_total = missing_metadata
+        # Assemblies consume and delete a single verified chunk as they grow.
+        for item in assemblies:
+            size = item['size_bytes']
+            if existing_bytes(item['path'], size):
+                continue
+            largest_chunk = max(by_path[part]['size_bytes'] for part in item['parts'])
+            assembly_peak = max(assembly_peak, missing_total + size + largest_chunk)
+            missing_total += size
+        train_sizes = sorted((item['size_bytes'] for item in records if item['kind'] == 'train_shard'), reverse=True)
+        if train_sizes and train_sizes[0] > transfer['window_bytes'] // transfer['window_shards']:
+            raise ValueError('HF dataset training shard exceeds one cache slot')
+        train_window = sum(train_sizes[:transfer['window_shards']])
+        dev_archive = max((item['size_bytes'] for item in records if item['kind'] == 'dev_archive'), default=0)
+        if dev_archive > transfer['window_bytes']:
+            raise ValueError('HF dataset dev archive exceeds the cache limit')
+        window_bytes = max(train_window, dev_archive)
+        reserve_bytes = 10 * 1024**3
+        required_bytes = max(assembly_peak, missing_total + window_bytes) + reserve_bytes
+        available = shutil.disk_usage(root).free if free_bytes is None else free_bytes
+        return {'final_bytes': final_bytes, 'existing_bytes': retained_bytes, 'missing_final_bytes': missing_total,
+                'assembly_peak_bytes': assembly_peak, 'window_bytes': window_bytes, 'reserve_bytes': reserve_bytes,
+                'required_bytes': required_bytes, 'free_bytes': available, 'enough': available >= required_bytes}
+
     final_bytes, retained_bytes = 0, 0
     records = transfer['files']
     for item in records:
@@ -369,6 +555,8 @@ def estimate_ephemeral_disk_budget(data_root, transfer, *, free_bytes=None):
 
 
 def data_upload_path(job: dict[str, Any], request: dict[str, Any]) -> Path:
+    if (job.get('prepared_config') or {}).get('hf_dataset_transfer'):
+        raise ValueError('HF dataset mode has no browser upload registry')
     if request.get('project_id') != job.get('project_id') or request.get('runtime_id') != job.get('runtime_id'):
         raise ValueError('Full-data upload request belongs to another project or runtime')
     relative = relative_data_path(request.get('path'))
@@ -381,12 +569,44 @@ def data_upload_path(job: dict[str, Any], request: dict[str, Any]) -> Path:
             or type(item.get('size_bytes')) is not int or not 0 < item['size_bytes'] <= MAX_FILE_BYTES):
         raise ValueError('Full-data upload request differs from the prepared registry')
     root = Path(item.get('approved_root', ''))
-    if not root.is_absolute() or root.absolute() != APPROVED_DATA_ROOT.absolute():
+    if not root.is_absolute() or root.absolute() != approved_data_root().absolute():
         raise ValueError('Full-data registry root is not approved')
     path = _safe_file(root, relative)
     if str(path) != item.get('local_path') or path.stat().st_size != item['size_bytes'] or file_sha256(path) != item['sha256']:
         raise ValueError('Full-data upload file changed since preparation')
     return path
+
+
+def verify_waiting_data(job: dict[str, Any], previous: dict[str, Any], *, batch_size: int = 4) -> dict[str, Any]:
+    """Check a bounded batch of source shards while the retry scheduler stays idle."""
+    manifest = job.get('approved_data_manifest')
+    files = job.get('data_upload_files') or []
+    if not manifest:
+        return {'status': 'not_declared'}
+    if manifest.get('source') == 'hf_private_dataset':
+        return {'status': 'remote_pinned', 'manifest_sha256': manifest['sha256']}
+    root = Path(manifest['root'])
+    result = {'manifest_sha256': manifest['sha256'], 'total_shards': len(files)}
+    try:
+        if (root.absolute() != approved_data_root().absolute()
+                or file_sha256(_safe_file(root, manifest['path'])) != manifest['sha256']):
+            raise ValueError('Manifest checksum differs')
+    except (OSError, ValueError):
+        return {**result, 'status': 'manifest_mismatch', 'checked_shards': 0, 'failed_shards': 0}
+    same_inventory = (previous.get('manifest_sha256') == manifest['sha256']
+                      and previous.get('total_shards') == len(files))
+    offset = previous.get('checked_shards', 0) if same_inventory else 0
+    failed = previous.get('failed_shards', 0) if same_inventory else 0
+    for item in files[offset:offset + batch_size]:
+        try:
+            path = _safe_file(root, item['path'])
+            valid = str(path) == item['local_path'] and shard_matches(path, item)
+        except (OSError, ValueError):
+            valid = False
+        failed += int(not valid)
+        offset += 1
+    status = 'checking' if offset < len(files) else 'mismatch' if failed else 'verified'
+    return {**result, 'status': status, 'checked_shards': offset, 'failed_shards': failed}
 
 
 def safe_extract_dev_archive(archive, destination, *, expected_audio_bytes, expected_utterances):
@@ -620,11 +840,46 @@ def validate_scientific_result(results_dir, criteria):
     return validate_completion_details(details, criteria)
 
 
+def validate_screening_stop(root, criteria, manifest_sha256):
+    """Check a terminal RSI screening report without granting campaign completion."""
+    if not isinstance(criteria, dict) or 'paired_seed_confirmation' not in criteria:
+        return None
+    relative = relative_data_path(criteria['metrics_file'])
+    base = Path(root).resolve()
+    report_path = base / relative
+    if (report_path.is_symlink() or not report_path.resolve().is_relative_to(base)
+            or not report_path.is_file() or report_path.stat().st_size > 20_000_000):
+        return None
+    result = json.loads(report_path.read_text(encoding='utf-8'))
+    if not isinstance(result, dict) or result.get('status') != 'screening_failed':
+        return None
+    if (result.get('schema_version') != 1
+            or result.get('scope') != 'speaker_disjoint_development_selection'
+            or any(result.get(field) is not False for field in
+                   ('campaign_complete', 'acceptance_complete', 'scientific_metrics_produced',
+                    'research_effect_validated', 'screening_passed'))
+            or result.get('metrics') != {}
+            or (manifest_sha256 and result.get('data_manifest_sha256') != manifest_sha256)):
+        raise ValueError('Invalid RSI screening stop evidence')
+    decisions = result.get('screening_decisions')
+    if (not isinstance(decisions, dict) or not decisions
+            or any(not isinstance(decision, dict) or decision.get('eligible') is not False
+                   or not decision.get('reasons') for decision in decisions.values())):
+        raise ValueError('RSI screening stop lacks a rejection for every candidate')
+    return dict(screening_report=relative, scientific_metrics_produced=False)
+
+
 def notebook_helpers_source() -> str:
     imports = 'import hashlib, json, math, os, re, shutil, tarfile, tempfile\nfrom pathlib import Path\n'
-    constants = f'PAIRED_SEED_METRICS = {PAIRED_SEED_METRICS!r}\n'
+    constants = (f'PAIRED_SEED_METRICS = {PAIRED_SEED_METRICS!r}\n'
+                 f'MANIFEST_KINDS = {MANIFEST_KINDS!r}\n'
+                 f'METADATA_PATHS = {sorted(METADATA_PATHS)!r}\n'
+                 f'MAX_FILES = {MAX_FILES!r}\nMAX_FILE_BYTES = {MAX_FILE_BYTES!r}\n')
     return imports + constants + '\n\n'.join(inspect.getsource(function) for function in (
-        relative_data_path, file_sha256, safe_extract_dev_archive, reconstruct_artifacts,
+        relative_data_path, file_sha256, preflight_cuda, preflight_torchaudio,
+        shard_matches, copy_verified_shard, write_checkpoint_receipt,
+        safe_extract_dev_archive, validate_corpus_manifest, validate_augmentation_inventory,
+        validate_assemblies, reconstruct_artifacts,
         estimate_ephemeral_disk_budget,
         validate_success_criteria, validate_paired_seed_confirmation,
-        validate_completion_details, validate_scientific_result))
+        validate_completion_details, validate_scientific_result, validate_screening_stop))

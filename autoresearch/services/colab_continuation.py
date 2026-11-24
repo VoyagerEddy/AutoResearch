@@ -1,4 +1,4 @@
-"""Pure continuation planning for a verified notebook interrupted by Drive auth.
+"""Pure continuation planning for a verified notebook interrupted by authorization.
 
 The browser must still bind the returned native cell ID to its current tab and
 dispatch it through Google's normal notebook interface. This module neither
@@ -54,11 +54,11 @@ def _stream_markers(cell: Mapping[str, Any]) -> list[dict[str, Any]]:
 def plan_authorization_continuation(
     actual_cells: Sequence[Mapping[str, Any]], expected_cells: Sequence[tuple[str,str]], *,
     project_id: str, runtime_id: str, expected_started_at: str,
-    auth_interrupted: bool, inflight_cell_id: str | None = None,
+    auth_interrupted: bool, inflight_cell_id: str | None = None, allow_hf_dataset: bool = False,
 ) -> AuthorizationContinuation:
     """Select at most one pending cell; never replay runtime initialization.
 
-    Activate this only after a recorded Drive auth failure halted Run all. Keep
+    Activate this after a recorded Drive or HF dataset auth failure halted Run all. Keep
     ``inflight_cell_id`` until that cell finishes; a poll with no output is not
     permission to dispatch it again. An unrelated failure requires user review.
     """
@@ -115,13 +115,22 @@ def plan_authorization_continuation(
         if running:
             return AuthorizationContinuation('wait',cell_id,'The pending cell is already executing')
         if failed:
-            if index != mount_index:
+            auth_markers = [marker for marker in _stream_markers(cell)
+                            if marker in markers and marker.get('status') == 'auth']
+            hf_auth = allow_hf_dataset and index > mount_index and any(
+                marker.get('reason') == 'hf_dataset_auth' and marker.get('phase') == 'preparing_data'
+                for marker in auth_markers)
+            drive_auth = index == mount_index and bool(auth_markers)
+            if not drive_auth and not hf_auth and index != mount_index:
                 return AuthorizationContinuation('blocked',cell_id,'A later experiment cell failed; do not replay it automatically')
-            if not any(marker.get('status') == 'auth' and marker.get('project_id') == project_id
-                       and marker.get('runtime_id') == runtime_id for marker in _stream_markers(cell)):
+            if not drive_auth and not hf_auth:
                 return AuthorizationContinuation('blocked',cell_id,'Drive setup failed outside its authorization step')
             if cell_id == inflight_cell_id:
-                return AuthorizationContinuation('blocked',cell_id,'Drive authorization retry failed; user action is required')
+                if hf_auth:
+                    return AuthorizationContinuation('blocked',cell_id,'Hugging Face dataset authorization retry failed')
+                return AuthorizationContinuation('blocked',cell_id,'Authorization retry failed; user action is required')
+            if hf_auth:
+                return AuthorizationContinuation('run',cell_id,'Retry the verified Hugging Face dataset authorization step')
             return AuthorizationContinuation('run',cell_id,'Retry the interrupted Drive mount without resetting runtime identity')
         if cell.get('execution_count') is None and (outputs or cell_id == inflight_cell_id):
             return AuthorizationContinuation('wait',cell_id,'The pending cell is already executing')

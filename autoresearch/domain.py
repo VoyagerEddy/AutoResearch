@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, Field, field_validator
 
 
 def utc_now() -> str:
@@ -82,7 +82,9 @@ class ColabObservationRequest(BaseModel):
         "running", "completed", "failed",
     ]
     details: dict[str, Any] = Field(default_factory=dict)
-    retry_after_minutes: int | None = Field(default=None, ge=5, le=525600)
+    retry_after_minutes: int | None = Field(default=None, ge=1, le=525600)
+    retry_not_before: AwareDatetime | None = None
+    attempt_number: int | None = Field(default=None, ge=0)
 
 
 class ColabNotebookBindingRequest(BaseModel):
@@ -93,8 +95,10 @@ class ColabNotebookBindingRequest(BaseModel):
 class ColabStageRequest(BaseModel):
     stage: Literal[
         "opening_notebook", "verifying_notebook", "loading_saved_notebook",
-        "requesting_gpu", "starting_notebook", "runtime_setup", "preparing_data",
+        "requesting_gpu", "starting_notebook", "gpu_probe", "mounting_drive",
+        "runtime_setup", "preparing_data",
     ]
+    attempt_number: int | None = Field(default=None, ge=0)
 
 
 class ColabRuntimeReleaseRequest(BaseModel):
@@ -105,6 +109,14 @@ class ColabRuntimeReleaseRequest(BaseModel):
 
 class ColabBrowserLaunchRequest(BaseModel):
     browser: Literal["auto", "chrome", "edge"] = "auto"
+
+
+class ColabFallbackTarget(BaseModel):
+    provider: Literal["local", "autodl"]
+    state_dir: str = Field(min_length=1, max_length=1000)
+    data_root: str = Field(default="", max_length=1000)
+    python: str = Field(default="", max_length=1000)
+    instance_uuid: str = Field(default="", max_length=100)
 
 
 class Project(BaseModel):
